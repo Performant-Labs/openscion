@@ -41,18 +41,21 @@ CREATE TABLE refs (
     FOREIGN KEY (repo_id, target) REFERENCES repo_changesets (repo_id, cs)
 ) STRICT, WITHOUT ROWID;
 
+-- One row per land request. A retry with the same (repo, caller, key) finds
+-- this row. `conflict_paths` is a list of u32be-length-prefixed paths.
 CREATE TABLE lands (
-    land_id      INTEGER PRIMARY KEY,
-    repo_id      INTEGER NOT NULL REFERENCES repos (repo_id),
-    caller       TEXT NOT NULL,
-    request_key  TEXT NOT NULL,
-    request_hash BLOB NOT NULL,
-    target_ref   TEXT NOT NULL,
-    input_cs     BLOB NOT NULL REFERENCES changesets (id),
-    result_cs    BLOB REFERENCES changesets (id),
-    state        TEXT NOT NULL CHECK (state IN ('pending', 'landed', 'conflict', 'rejected')),
-    detail       TEXT,
-    UNIQUE (repo_id, caller, request_key)
+    land_id        INTEGER PRIMARY KEY,
+    repo_id        INTEGER NOT NULL REFERENCES repos (repo_id),
+    caller         TEXT NOT NULL,
+    request_key    TEXT NOT NULL,
+    target_ref     TEXT NOT NULL,
+    input_cs       BLOB NOT NULL REFERENCES changesets (id),
+    state          TEXT NOT NULL CHECK (state IN ('pending', 'landed', 'conflict', 'rejected')),
+    result_cs      BLOB REFERENCES changesets (id),
+    detail         TEXT NOT NULL DEFAULT '',
+    conflict_paths BLOB NOT NULL DEFAULT x'',
+    UNIQUE (repo_id, caller, request_key),
+    CHECK ((state = 'landed') = (result_cs IS NOT NULL))
 ) STRICT;
 
 -- TreeV1 objects (docs/format-v1.md), keyed by TreeId.

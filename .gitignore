@@ -3,3 +3,4 @@ target/
 /crates/scion-core/fuzz/corpus/
 /crates/scion-core/fuzz/artifacts/
 /crates/scion-core/fuzz/coverage/
+/.claude/
