@@ -1,0 +1,17 @@
+[package]
+name = "scion-core"
+description = "Object model and canonical byte format for the Scion version control system"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+blake3 = "1.8"
+
+[dev-dependencies]
+proptest = "1.12"
+
+[lints]
+workspace = true

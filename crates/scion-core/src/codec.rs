@@ -1,0 +1,336 @@
+//! v1 encoder and strict decoder. See `docs/format-v1.md`.
+
+use std::collections::BTreeMap;
+use std::fmt;
+
+use crate::{
+    BlobId, Changeset, ChangesetId, Entry, FileState, GitOid, IdentityTime, PathElem, PathError,
+    RepoPath, Tree, TreeId,
+};
+
+const VERSION: u8 = 1;
+
+const TAG_DELETE: u8 = 0;
+const TAG_REGULAR: u8 = 1;
+const TAG_SYMLINK: u8 = 2;
+const TAG_GITLINK: u8 = 3;
+const TAG_DIR: u8 = 4;
+
+const GIT_SHA1: u8 = 1;
+const GIT_SHA256: u8 = 2;
+
+/// Why bytes are not a canonical v1 object.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum DecodeError {
+    /// The input ends before the object does, or a length points past the end.
+    UnexpectedEnd,
+    /// Bytes remain after the object.
+    TrailingBytes,
+    /// The version byte is not 1.
+    BadVersion(u8),
+    /// An entry tag is unknown here.
+    BadTag(u8),
+    /// A flag byte is not 0 or 1.
+    BadFlag(u8),
+    /// A git hash algorithm byte is unknown.
+    BadGitAlgo(u8),
+    /// Paths or names are out of order, or repeated.
+    Unsorted,
+    /// A path or name breaks the path rules.
+    BadPath(PathError),
+}
+
+impl fmt::Display for DecodeError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnexpectedEnd => f.write_str("object ends early"),
+            Self::TrailingBytes => f.write_str("bytes after the end of the object"),
+            Self::BadVersion(v) => write!(f, "unknown format version {v}"),
+            Self::BadTag(t) => write!(f, "unknown tag {t}"),
+            Self::BadFlag(b) => write!(f, "flag byte {b} is not 0 or 1"),
+            Self::BadGitAlgo(a) => write!(f, "unknown git hash algorithm {a}"),
+            Self::Unsorted => f.write_str("paths are not strictly increasing"),
+            Self::BadPath(e) => write!(f, "bad path: {e}"),
+        }
+    }
+}
+
+impl std::error::Error for DecodeError {}
+
+impl Changeset {
+    /// Encodes the changeset in the v1 canonical format.
+    ///
+    /// # Panics
+    ///
+    /// If a field is longer than `u32::MAX` bytes or items.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = vec![VERSION];
+        put_len(&mut w, self.parents.len());
+        for parent in &self.parents {
+            w.extend_from_slice(parent.as_bytes());
+        }
+        put_identity(&mut w, &self.author);
+        match &self.committer {
+            None => w.push(0),
+            Some(committer) => {
+                w.push(1);
+                put_identity(&mut w, committer);
+            }
+        }
+        put_bytes(&mut w, &self.message);
+        put_len(&mut w, self.changes.len());
+        for (path, change) in &self.changes {
+            put_bytes(&mut w, path.as_bytes());
+            match change {
+                None => w.push(TAG_DELETE),
+                Some(file) => put_file(&mut w, file),
+            }
+        }
+        w
+    }
+
+    /// Decodes a v1 changeset.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] unless `bytes` is exactly the canonical encoding
+    /// of some changeset.
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader(bytes);
+        r.version()?;
+        let mut parents = Vec::new();
+        for _ in 0..r.u32()? {
+            parents.push(ChangesetId::from_bytes(r.array()?));
+        }
+        let author = r.identity()?;
+        let committer = if r.flag()? { Some(r.identity()?) } else { None };
+        let message = r.bytes()?.to_vec();
+        let mut changes = Vec::new();
+        for _ in 0..r.u32()? {
+            let path = RepoPath::new(r.bytes()?).map_err(DecodeError::BadPath)?;
+            ensure_after(&changes, &path)?;
+            let change = match r.u8()? {
+                TAG_DELETE => None,
+                tag => Some(r.file(tag)?),
+            };
+            changes.push((path, change));
+        }
+        r.finish()?;
+        Ok(Self {
+            parents,
+            author,
+            committer,
+            message,
+            changes: BTreeMap::from_iter(changes),
+        })
+    }
+
+    /// The content address of this changeset.
+    #[must_use]
+    pub fn id(&self) -> ChangesetId {
+        ChangesetId::hash(&self.encode())
+    }
+}
+
+impl Tree {
+    /// Encodes the tree in the v1 canonical format.
+    ///
+    /// # Panics
+    ///
+    /// If a field is longer than `u32::MAX` bytes or items.
+    #[must_use]
+    pub fn encode(&self) -> Vec<u8> {
+        let mut w = vec![VERSION];
+        put_len(&mut w, self.entries.len());
+        for (name, entry) in &self.entries {
+            put_bytes(&mut w, name.as_bytes());
+            match entry {
+                Entry::File(file) => put_file(&mut w, file),
+                Entry::Dir(id) => {
+                    w.push(TAG_DIR);
+                    w.extend_from_slice(id.as_bytes());
+                }
+            }
+        }
+        w
+    }
+
+    /// Decodes a v1 tree.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`DecodeError`] unless `bytes` is exactly the canonical encoding
+    /// of some tree.
+    pub fn decode(bytes: &[u8]) -> Result<Self, DecodeError> {
+        let mut r = Reader(bytes);
+        r.version()?;
+        let mut entries = Vec::new();
+        for _ in 0..r.u32()? {
+            let name = PathElem::new(r.bytes()?).map_err(DecodeError::BadPath)?;
+            ensure_after(&entries, &name)?;
+            let entry = match r.u8()? {
+                TAG_DIR => Entry::Dir(TreeId::from_bytes(r.array()?)),
+                tag => Entry::File(r.file(tag)?),
+            };
+            entries.push((name, entry));
+        }
+        r.finish()?;
+        Ok(Self {
+            entries: BTreeMap::from_iter(entries),
+        })
+    }
+
+    /// The content address of this tree.
+    #[must_use]
+    pub fn id(&self) -> TreeId {
+        TreeId::hash(&self.encode())
+    }
+}
+
+// ---- encode helpers ----
+
+fn put_len(w: &mut Vec<u8>, len: usize) {
+    // SHORTCUT: panics past u32::MAX. Every ingest path caps object size far
+    // below that. Switch to a `try_encode -> Result` if one ever does not.
+    let len = u32::try_from(len).expect("object field longer than u32::MAX");
+    w.extend_from_slice(&len.to_be_bytes());
+}
+
+fn put_bytes(w: &mut Vec<u8>, bytes: &[u8]) {
+    put_len(w, bytes.len());
+    w.extend_from_slice(bytes);
+}
+
+fn put_identity(w: &mut Vec<u8>, who: &IdentityTime) {
+    put_bytes(w, &who.name);
+    put_bytes(w, &who.email);
+    w.extend_from_slice(&who.unix_secs.to_be_bytes());
+    w.extend_from_slice(&who.tz_offset_minutes.to_be_bytes());
+}
+
+fn put_file(w: &mut Vec<u8>, file: &FileState) {
+    match file {
+        FileState::Regular {
+            content,
+            executable,
+        } => {
+            w.push(TAG_REGULAR);
+            w.extend_from_slice(content.as_bytes());
+            w.push(u8::from(*executable));
+        }
+        FileState::Symlink { target } => {
+            w.push(TAG_SYMLINK);
+            w.extend_from_slice(target.as_bytes());
+        }
+        FileState::Gitlink { commit } => {
+            let (algo, oid): (u8, &[u8]) = match commit {
+                GitOid::Sha1(oid) => (GIT_SHA1, oid),
+                GitOid::Sha256(oid) => (GIT_SHA256, oid),
+            };
+            w.extend_from_slice(&[TAG_GITLINK, algo]);
+            w.extend_from_slice(oid);
+        }
+    }
+}
+
+// ---- decode helpers ----
+
+/// Keys must be strictly increasing, which also rules out repeats.
+fn ensure_after<K: Ord, V>(items: &[(K, V)], key: &K) -> Result<(), DecodeError> {
+    match items.last() {
+        Some((last, _)) if last >= key => Err(DecodeError::Unsorted),
+        _ => Ok(()),
+    }
+}
+
+/// Reads from the front of a slice. Nothing is allocated ahead of the bytes
+/// that back it: a count loop stops at the first read past the end.
+struct Reader<'a>(&'a [u8]);
+
+impl<'a> Reader<'a> {
+    fn take(&mut self, n: usize) -> Result<&'a [u8], DecodeError> {
+        let (head, rest) = self
+            .0
+            .split_at_checked(n)
+            .ok_or(DecodeError::UnexpectedEnd)?;
+        self.0 = rest;
+        Ok(head)
+    }
+
+    fn array<const N: usize>(&mut self) -> Result<[u8; N], DecodeError> {
+        let (head, rest) = self
+            .0
+            .split_first_chunk::<N>()
+            .ok_or(DecodeError::UnexpectedEnd)?;
+        self.0 = rest;
+        Ok(*head)
+    }
+
+    fn u8(&mut self) -> Result<u8, DecodeError> {
+        let [b] = self.array()?;
+        Ok(b)
+    }
+
+    fn u32(&mut self) -> Result<usize, DecodeError> {
+        Ok(u32::from_be_bytes(self.array()?) as usize)
+    }
+
+    fn bytes(&mut self) -> Result<&'a [u8], DecodeError> {
+        let len = self.u32()?;
+        self.take(len)
+    }
+
+    fn flag(&mut self) -> Result<bool, DecodeError> {
+        match self.u8()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            b => Err(DecodeError::BadFlag(b)),
+        }
+    }
+
+    fn version(&mut self) -> Result<(), DecodeError> {
+        match self.u8()? {
+            VERSION => Ok(()),
+            v => Err(DecodeError::BadVersion(v)),
+        }
+    }
+
+    fn identity(&mut self) -> Result<IdentityTime, DecodeError> {
+        Ok(IdentityTime {
+            name: self.bytes()?.to_vec(),
+            email: self.bytes()?.to_vec(),
+            unix_secs: i64::from_be_bytes(self.array()?),
+            tz_offset_minutes: i32::from_be_bytes(self.array()?),
+        })
+    }
+
+    fn file(&mut self, tag: u8) -> Result<FileState, DecodeError> {
+        match tag {
+            TAG_REGULAR => Ok(FileState::Regular {
+                content: BlobId::from_bytes(self.array()?),
+                executable: self.flag()?,
+            }),
+            TAG_SYMLINK => Ok(FileState::Symlink {
+                target: BlobId::from_bytes(self.array()?),
+            }),
+            TAG_GITLINK => {
+                let commit = match self.u8()? {
+                    GIT_SHA1 => GitOid::Sha1(self.array()?),
+                    GIT_SHA256 => GitOid::Sha256(self.array()?),
+                    algo => return Err(DecodeError::BadGitAlgo(algo)),
+                };
+                Ok(FileState::Gitlink { commit })
+            }
+            tag => Err(DecodeError::BadTag(tag)),
+        }
+    }
+
+    fn finish(self) -> Result<(), DecodeError> {
+        if self.0.is_empty() {
+            Ok(())
+        } else {
+            Err(DecodeError::TrailingBytes)
+        }
+    }
+}
