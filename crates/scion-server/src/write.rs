@@ -13,7 +13,7 @@ use crate::store::Store;
 /// [`crate::Error::NotFound`] if the repo does not exist.
 pub fn put_blob(store: &Store, repo: &str, data: &[u8]) -> Result<BlobId> {
     store.read(|c| db::repo_id(c, repo))?;
-    store.objects().put_blob(data)
+    store.blobs().put(data)
 }
 
 /// Stores a changeset sent as `ChangesetV1` bytes. Safe to repeat: the ID is the

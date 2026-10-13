@@ -1,5 +1,6 @@
 -- Scion metadata schema, version 1.
--- Objects (blobs, trees) live in the object folder, not here.
+-- Blobs live in the object folder. Trees live here, so a derivation that
+-- writes many trees commits them in one transaction.
 
 CREATE TABLE repos (
     repo_id INTEGER PRIMARY KEY,
@@ -53,6 +54,12 @@ CREATE TABLE lands (
     detail       TEXT,
     UNIQUE (repo_id, caller, request_key)
 ) STRICT;
+
+-- TreeV1 objects (docs/format-v1.md), keyed by TreeId.
+CREATE TABLE trees (
+    id   BLOB PRIMARY KEY CHECK (length(id) = 32),
+    body BLOB NOT NULL
+) STRICT, WITHOUT ROWID;
 
 -- Derived data: one value per (kind, version, changeset). Rebuildable.
 CREATE TABLE derived (

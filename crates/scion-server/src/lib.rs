@@ -2,7 +2,7 @@
 //!
 //! Modules from the bottom up:
 //!
-//! - [`store`] and [`db`]: `SQLite` metadata plus a folder of immutable objects.
+//! - [`store`] and [`db`]: `SQLite` for metadata and trees, a folder for blobs.
 //! - [`tree`]: apply changesets to trees and derive each changeset's root tree.
 //! - [`read`], [`write`], [`land`]: the operations behind the RPCs.
 //! - [`import`]: one-way import from a git repository.

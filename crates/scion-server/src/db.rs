@@ -2,7 +2,7 @@
 //! outside a transaction (a `Transaction` derefs to a `Connection`).
 
 use rusqlite::{Connection, OptionalExtension, params};
-use scion_core::{Changeset, ChangesetId};
+use scion_core::{Changeset, ChangesetId, Tree, TreeId};
 
 use crate::error::{Error, Result};
 
@@ -220,6 +220,37 @@ pub fn put_derived(
         )));
     }
     Ok(())
+}
+
+/// Stores a tree. Safe to repeat.
+///
+/// # Errors
+///
+/// Database errors.
+pub fn put_tree(c: &Connection, tree: &Tree) -> Result<TreeId> {
+    let (body, id) = tree.encode_with_id();
+    c.prepare_cached("INSERT OR IGNORE INTO trees (id, body) VALUES (?1, ?2)")?
+        .execute(params![id.as_bytes(), body])?;
+    Ok(id)
+}
+
+/// Reads a tree and checks it against its ID.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if absent, [`Error::Corrupt`] if it does not decode or
+/// match.
+pub fn get_tree(c: &Connection, id: TreeId) -> Result<Tree> {
+    let body: Vec<u8> = c
+        .prepare_cached("SELECT body FROM trees WHERE id = ?1")?
+        .query_row([id.as_bytes()], |row| row.get(0))
+        .optional()?
+        .ok_or_else(|| Error::NotFound(format!("tree {id}")))?;
+    let tree = Tree::decode(&body).map_err(|e| Error::Corrupt(format!("tree {id}: {e}")))?;
+    if tree.id() != id {
+        return Err(Error::Corrupt(format!("tree {id} does not match its ID")));
+    }
+    Ok(tree)
 }
 
 fn to_id(bytes: &[u8]) -> Result<ChangesetId> {

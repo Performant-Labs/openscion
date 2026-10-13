@@ -2,6 +2,7 @@
 //! (`SQLite` and the object folder are synchronous), and maps errors to status
 //! codes.
 
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
@@ -13,10 +14,13 @@ use scion_proto::v1::{
     LogResponse, PutBlobRequest, PutBlobResponse, ReadFileRequest, ReadFileResponse,
     ResolveRefRequest, ResolveRefResponse,
 };
+use tokio::net::TcpListener;
+use tokio_stream::wrappers::TcpListenerStream;
 use tokio_stream::{Stream, StreamExt};
+use tonic::service::interceptor::InterceptedService;
 use tonic::{Request, Response, Status, Streaming};
 
-use crate::auth::Caller;
+use crate::auth::{Auth, Caller};
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
 use crate::store::{MAX_OBJECT_BYTES, Store};
@@ -28,6 +32,24 @@ pub const MAX_MESSAGE_BYTES: usize = 64 << 20;
 const CHUNK_BYTES: usize = 1 << 20;
 /// Most changesets one `Log` call returns.
 const MAX_LOG: usize = 1000;
+
+/// Serves the API on `listener`, requiring `token`, until `shutdown` resolves.
+///
+/// # Errors
+///
+/// Transport errors.
+pub async fn serve(
+    store: Store,
+    listener: TcpListener,
+    token: &str,
+    shutdown: impl Future<Output = ()>,
+) -> Result<(), tonic::transport::Error> {
+    let service = InterceptedService::new(ScionService::new(store).into_server(), Auth::new(token));
+    tonic::transport::Server::builder()
+        .add_service(service)
+        .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
+        .await
+}
 
 /// Implements the Scion RPCs.
 pub struct ScionService {

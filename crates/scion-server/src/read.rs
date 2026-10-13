@@ -42,10 +42,10 @@ pub fn get_changeset(store: &Store, repo: &str, id: ChangesetId) -> Result<Chang
 pub fn read_file(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) -> Result<Vec<u8>> {
     let repo = store.read(|c| db::repo_id(c, repo))?;
     let root = tree::root_tree(store, repo, cs)?;
-    match tree::lookup(store.objects(), root, path)? {
+    match store.read(|c| tree::lookup(c, root, path))? {
         Some(Entry::File(
             FileState::Regular { content: blob, .. } | FileState::Symlink { target: blob },
-        )) => store.objects().get_blob(blob),
+        )) => store.blobs().get(blob),
         Some(Entry::File(FileState::Gitlink { .. })) => {
             Err(Error::InvalidArgument(format!("{path:?} is a submodule")))
         }
@@ -68,14 +68,16 @@ pub fn list_dir(
 ) -> Result<Tree> {
     let repo = store.read(|c| db::repo_id(c, repo))?;
     let root = tree::root_tree(store, repo, cs)?;
-    let Some(path) = path else {
-        return store.objects().get_tree(root);
-    };
-    match tree::lookup(store.objects(), root, path)? {
-        Some(Entry::Dir(id)) => store.objects().get_tree(id),
-        Some(Entry::File(_)) => Err(Error::InvalidArgument(format!("{path:?} is a file"))),
-        None => Err(Error::NotFound(format!("path {path:?}"))),
-    }
+    store.read(|c| {
+        let Some(path) = path else {
+            return db::get_tree(c, root);
+        };
+        match tree::lookup(c, root, path)? {
+            Some(Entry::Dir(id)) => db::get_tree(c, id),
+            Some(Entry::File(_)) => Err(Error::InvalidArgument(format!("{path:?} is a file"))),
+            None => Err(Error::NotFound(format!("path {path:?}"))),
+        }
+    })
 }
 
 /// Up to `limit` changesets, walking first parents from `cs`, newest first.

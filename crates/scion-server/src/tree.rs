@@ -1,13 +1,17 @@
 //! Snapshots: apply a changeset to a tree, look up paths, and derive the
 //! root tree of any changeset.
+//!
+//! Every function takes a `&Connection`. Callers that write pass a
+//! transaction, so all trees from one apply or derivation commit together.
 
 use std::collections::BTreeMap;
 
+use rusqlite::Connection;
 use scion_core::{ChangesetId, Entry, FileState, PathElem, RepoPath, Tree, TreeId};
 
 use crate::db::{self, RepoId};
 use crate::error::{ApplyError, Error, Result};
-use crate::store::{Objects, Store};
+use crate::store::Store;
 
 /// Derived-data kind for the root tree of a changeset.
 const ROOT_TREE: &str = "root_tree";
@@ -21,39 +25,37 @@ const ROOT_TREE_VERSION: u32 = 1;
 ///
 /// # Errors
 ///
-/// [`Error::Apply`] if a change does not fit the tree. Store errors otherwise.
+/// [`Error::Apply`] if a change does not fit the tree. Database errors
+/// otherwise.
 pub fn apply(
-    objects: &Objects,
+    c: &Connection,
     base: Option<TreeId>,
     changes: &BTreeMap<RepoPath, Option<FileState>>,
 ) -> Result<TreeId> {
-    let mut root = Dir::Loaded(BTreeMap::new());
-    if let Some(id) = base {
-        root = Dir::Stored(id);
-    }
+    let mut root = base.map_or_else(|| Dir::Loaded(BTreeMap::new()), Dir::Stored);
     for (path, _) in changes.iter().filter(|(_, change)| change.is_none()) {
-        root.delete(objects, path, &parts(path))?;
+        root.delete(c, path, &parts(path))?;
     }
     for (path, state) in changes {
         if let Some(state) = state {
-            root.put(objects, path, &parts(path), 0, *state)?;
+            root.put(c, path, &parts(path), 0, *state)?;
         }
     }
-    root.store(objects)
+    root.store(c)
 }
 
 /// Finds the entry at `path` under `root`.
 ///
 /// # Errors
 ///
-/// Store errors.
-pub fn lookup(objects: &Objects, root: TreeId, path: &RepoPath) -> Result<Option<Entry>> {
+/// Database errors.
+pub fn lookup(c: &Connection, root: TreeId, path: &RepoPath) -> Result<Option<Entry>> {
     let mut entry = Entry::Dir(root);
     for name in parts(path) {
         let Entry::Dir(id) = entry else {
             return Ok(None);
         };
-        match objects.get_tree(id)?.entries.remove(&name) {
+        match db::get_tree(c, id)?.entries.remove(&name) {
             Some(next) => entry = next,
             None => return Ok(None),
         }
@@ -63,6 +65,23 @@ pub fn lookup(objects: &Objects, root: TreeId, path: &RepoPath) -> Result<Option
 
 /// The root tree of a changeset that `repo` may see, deriving it if needed.
 ///
+/// # Errors
+///
+/// [`Error::NotFound`] if `repo` does not have `cs`. [`Error::Corrupt`] if a
+/// stored changeset does not apply to its parent tree.
+pub fn root_tree(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
+    let known = store.read(|c| {
+        db::generation(c, repo, cs)?;
+        db::get_derived(c, ROOT_TREE, ROOT_TREE_VERSION, cs)
+    })?;
+    match known {
+        Some(tree) => Ok(TreeId::from_bytes(tree)),
+        None => store.write(|tx| derive_root_tree(tx, repo, cs)),
+    }
+}
+
+/// Derives the root tree of `cs` inside the caller's transaction.
+///
 /// Walks first parents back to the nearest changeset with a known root tree,
 /// then applies changes forward, oldest first. No recursion, so a long
 /// underived history is safe.
@@ -71,41 +90,28 @@ pub fn lookup(objects: &Objects, root: TreeId, path: &RepoPath) -> Result<Option
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. [`Error::Corrupt`] if a
 /// stored changeset does not apply to its parent tree.
-///
-/// # Panics
-///
-/// Never: the walk either finds `cs` already derived or derives it.
-pub fn root_tree(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
-    let (mut base, pending) = store.read(|c| {
-        db::generation(c, repo, cs)?;
-        let mut pending = Vec::new();
-        let mut cur = Some(cs);
-        while let Some(id) = cur {
-            if let Some(tree) = db::get_derived(c, ROOT_TREE, ROOT_TREE_VERSION, id)? {
-                return Ok((Some(TreeId::from_bytes(tree)), pending));
-            }
-            pending.push(id);
-            cur = db::first_parent(c, id)?;
+pub fn derive_root_tree(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
+    let mut pending = Vec::new();
+    let mut cur = Some(cs);
+    let mut base = None;
+    while let Some(id) = cur {
+        if let Some(tree) = db::get_derived(c, ROOT_TREE, ROOT_TREE_VERSION, id)? {
+            base = Some(TreeId::from_bytes(tree));
+            break;
         }
-        Ok((None, pending))
-    })?;
-    let mut derived = Vec::with_capacity(pending.len());
+        pending.push(id);
+        cur = db::first_parent(c, id)?;
+    }
     for id in pending.into_iter().rev() {
-        let changeset = store.read(|c| db::get_changeset(c, repo, id))?;
-        let tree = apply(store.objects(), base, &changeset.changes).map_err(|e| match e {
+        let changeset = db::get_changeset(c, repo, id)?;
+        let tree = apply(c, base, &changeset.changes).map_err(|e| match e {
             Error::Apply(e) => Error::Corrupt(format!("stored changeset {id} does not apply: {e}")),
             other => other,
         })?;
-        derived.push((id, tree));
+        record_root_tree(c, id, tree)?;
         base = Some(tree);
     }
-    // One transaction for the whole chain: one fsync, not one per changeset.
-    store.write(|c| {
-        derived
-            .iter()
-            .try_for_each(|&(id, tree)| record_root_tree(c, id, tree))
-    })?;
-    Ok(base.expect("the walk ends at a derived tree or derives at least `cs`"))
+    base.ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
 }
 
 /// Records the root tree of a changeset computed elsewhere (for example by a
@@ -114,7 +120,7 @@ pub fn root_tree(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<TreeId>
 /// # Errors
 ///
 /// [`Error::Corrupt`] if a different tree is already recorded.
-pub fn record_root_tree(c: &rusqlite::Connection, cs: ChangesetId, tree: TreeId) -> Result<()> {
+pub fn record_root_tree(c: &Connection, cs: ChangesetId, tree: TreeId) -> Result<()> {
     db::put_derived(c, ROOT_TREE, ROOT_TREE_VERSION, cs, *tree.as_bytes())
 }
 
@@ -142,10 +148,9 @@ enum Node {
 }
 
 impl Dir {
-    fn entries(&mut self, objects: &Objects) -> Result<&mut BTreeMap<PathElem, Node>> {
+    fn entries(&mut self, c: &Connection) -> Result<&mut BTreeMap<PathElem, Node>> {
         if let Self::Stored(id) = *self {
-            let tree = objects.get_tree(id)?;
-            let entries = tree
+            let entries = db::get_tree(c, id)?
                 .entries
                 .into_iter()
                 .map(|(name, entry)| {
@@ -165,13 +170,13 @@ impl Dir {
     }
 
     /// Deletes the file at `parts`. Returns whether this directory is now empty.
-    fn delete(&mut self, objects: &Objects, path: &RepoPath, parts: &[PathElem]) -> Result<bool> {
-        let entries = self.entries(objects)?;
+    fn delete(&mut self, c: &Connection, path: &RepoPath, parts: &[PathElem]) -> Result<bool> {
+        let entries = self.entries(c)?;
         let (name, rest) = parts.split_first().expect("a path has at least one part");
         let remove = match (entries.get_mut(name), rest.is_empty()) {
             (Some(Node::File(_)), true) => true,
             (Some(Node::Dir(_)), true) => return Err(ApplyError::NotAFile(path.clone()).into()),
-            (Some(Node::Dir(child)), false) => child.delete(objects, path, rest)?,
+            (Some(Node::Dir(child)), false) => child.delete(c, path, rest)?,
             (Some(Node::File(_)) | None, _) => {
                 return Err(ApplyError::DeleteMissing(path.clone()).into());
             }
@@ -184,13 +189,13 @@ impl Dir {
 
     fn put(
         &mut self,
-        objects: &Objects,
+        c: &Connection,
         path: &RepoPath,
         parts: &[PathElem],
         depth: usize,
         state: FileState,
     ) -> Result<()> {
-        let entries = self.entries(objects)?;
+        let entries = self.entries(c)?;
         let name = &parts[depth];
         if depth + 1 == parts.len() {
             if matches!(entries.get(name), Some(Node::Dir(_))) {
@@ -203,7 +208,7 @@ impl Dir {
             .entry(name.clone())
             .or_insert_with(|| Node::Dir(Self::Loaded(BTreeMap::new())));
         match child {
-            Node::Dir(dir) => dir.put(objects, path, parts, depth + 1, state),
+            Node::Dir(dir) => dir.put(c, path, parts, depth + 1, state),
             Node::File(_) => Err(ApplyError::FileInTheWay {
                 path: path.clone(),
                 file: prefix(&parts[..=depth]),
@@ -213,7 +218,7 @@ impl Dir {
     }
 
     /// Stores every loaded directory, bottom up, and returns this one's ID.
-    fn store(self, objects: &Objects) -> Result<TreeId> {
+    fn store(self, c: &Connection) -> Result<TreeId> {
         match self {
             Self::Stored(id) => Ok(id),
             Self::Loaded(entries) => {
@@ -221,11 +226,11 @@ impl Dir {
                 for (name, node) in entries {
                     let entry = match node {
                         Node::File(state) => Entry::File(state),
-                        Node::Dir(dir) => Entry::Dir(dir.store(objects)?),
+                        Node::Dir(dir) => Entry::Dir(dir.store(c)?),
                     };
                     tree.entries.insert(name, entry);
                 }
-                objects.put_tree(&tree)
+                db::put_tree(c, &tree)
             }
         }
     }
@@ -234,7 +239,7 @@ impl Dir {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use scion_core::BlobId;
+    use scion_core::{BlobId, Changeset, IdentityTime};
 
     /// `(path, Some(content))` puts a regular file; `(path, None)` deletes.
     type Edits<'a> = &'a [(&'a str, Option<&'a str>)];
@@ -253,17 +258,21 @@ mod tests {
             .collect()
     }
 
-    fn objects() -> (tempfile::TempDir, Store) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        (dir, store)
+    fn path(p: &str) -> RepoPath {
+        RepoPath::new(p).unwrap()
     }
 
-    fn files(objects: &Objects, root: TreeId) -> Vec<String> {
+    /// Runs `f` in one write transaction on a fresh store.
+    fn with_db<T>(f: impl FnOnce(&Connection) -> Result<T>) -> T {
+        let dir = tempfile::tempdir().unwrap();
+        Store::open(dir.path()).unwrap().write(f).unwrap()
+    }
+
+    fn files(c: &Connection, root: TreeId) -> Vec<String> {
         let mut out = Vec::new();
         let mut stack = vec![(String::new(), root)];
         while let Some((prefix, id)) = stack.pop() {
-            for (name, entry) in objects.get_tree(id).unwrap().entries {
+            for (name, entry) in db::get_tree(c, id).unwrap().entries {
                 let path = format!("{prefix}{}", String::from_utf8_lossy(name.as_bytes()));
                 match entry {
                     Entry::File(_) => out.push(path),
@@ -277,104 +286,102 @@ mod tests {
 
     #[test]
     fn puts_and_deletes_build_the_expected_tree() {
-        let (_dir, store) = objects();
-        let o = store.objects();
-        let t1 = apply(
-            o,
-            None,
-            &changes(&[("a/b/c", Some("1")), ("a/d", Some("2")), ("e", Some("3"))]),
-        )
-        .unwrap();
-        assert_eq!(files(o, t1), ["a/b/c", "a/d", "e"]);
-        let t2 = apply(
-            o,
-            Some(t1),
-            &changes(&[("a/b/c", None), ("f/g", Some("4"))]),
-        )
-        .unwrap();
-        assert_eq!(files(o, t2), ["a/d", "e", "f/g"], "empty a/b is pruned");
-        assert_eq!(
-            lookup(o, t2, &RepoPath::new("a/d").unwrap()).unwrap(),
-            Some(Entry::File(regular("2")))
-        );
-        assert_eq!(lookup(o, t2, &RepoPath::new("a/b").unwrap()).unwrap(), None);
+        with_db(|c| {
+            let t1 = apply(
+                c,
+                None,
+                &changes(&[("a/b/c", Some("1")), ("a/d", Some("2")), ("e", Some("3"))]),
+            )?;
+            assert_eq!(files(c, t1), ["a/b/c", "a/d", "e"]);
+            let t2 = apply(
+                c,
+                Some(t1),
+                &changes(&[("a/b/c", None), ("f/g", Some("4"))]),
+            )?;
+            assert_eq!(files(c, t2), ["a/d", "e", "f/g"], "empty a/b is pruned");
+            assert_eq!(
+                lookup(c, t2, &path("a/d"))?,
+                Some(Entry::File(regular("2")))
+            );
+            assert_eq!(lookup(c, t2, &path("a/b"))?, None);
+            assert_eq!(lookup(c, t2, &path("e/x"))?, None, "a file has no children");
+            Ok(())
+        });
     }
 
     #[test]
     fn same_content_gives_same_tree_id() {
-        let (_dir, store) = objects();
-        let o = store.objects();
-        let direct = apply(o, None, &changes(&[("x/y", Some("1"))])).unwrap();
-        let t = apply(o, None, &changes(&[("x/y", Some("1")), ("z", Some("2"))])).unwrap();
-        let via_delete = apply(o, Some(t), &changes(&[("z", None)])).unwrap();
-        assert_eq!(direct, via_delete);
+        with_db(|c| {
+            let direct = apply(c, None, &changes(&[("x/y", Some("1"))]))?;
+            let t = apply(c, None, &changes(&[("x/y", Some("1")), ("z", Some("2"))]))?;
+            let via_delete = apply(c, Some(t), &changes(&[("z", None)]))?;
+            assert_eq!(direct, via_delete);
+            Ok(())
+        });
     }
 
     #[test]
     fn file_and_directory_swap_in_one_changeset() {
-        let (_dir, store) = objects();
-        let o = store.objects();
-        let t = apply(o, None, &changes(&[("a", Some("1"))])).unwrap();
-        let t = apply(o, Some(t), &changes(&[("a", None), ("a/b", Some("2"))])).unwrap();
-        assert_eq!(files(o, t), ["a/b"]);
-        let t = apply(o, Some(t), &changes(&[("a", Some("3")), ("a/b", None)])).unwrap();
-        assert_eq!(files(o, t), ["a"]);
+        with_db(|c| {
+            let t = apply(c, None, &changes(&[("a", Some("1"))]))?;
+            let t = apply(c, Some(t), &changes(&[("a", None), ("a/b", Some("2"))]))?;
+            assert_eq!(files(c, t), ["a/b"]);
+            let t = apply(c, Some(t), &changes(&[("a", Some("3")), ("a/b", None)]))?;
+            assert_eq!(files(c, t), ["a"]);
+            Ok(())
+        });
     }
 
     #[test]
     fn structural_conflicts_are_rejected() {
-        let (_dir, store) = objects();
-        let o = store.objects();
-        let t = apply(o, None, &changes(&[("a", Some("1")), ("d/x", Some("2"))])).unwrap();
-        let cases: [(Edits<'_>, ApplyError); 5] = [
-            (
-                &[("a/b", Some("x"))],
-                ApplyError::FileInTheWay {
-                    path: RepoPath::new("a/b").unwrap(),
-                    file: RepoPath::new("a").unwrap(),
-                },
-            ),
-            (
-                &[("d", Some("x"))],
-                ApplyError::DirInTheWay(RepoPath::new("d").unwrap()),
-            ),
-            (
-                &[("nope", None)],
-                ApplyError::DeleteMissing(RepoPath::new("nope").unwrap()),
-            ),
-            (
-                &[("a/b", None)],
-                ApplyError::DeleteMissing(RepoPath::new("a/b").unwrap()),
-            ),
-            (
-                &[("d", None)],
-                ApplyError::NotAFile(RepoPath::new("d").unwrap()),
-            ),
-        ];
-        for (change, expected) in cases {
-            match apply(o, Some(t), &changes(change)) {
-                Err(Error::Apply(e)) => assert_eq!(e, expected),
-                other => panic!("expected {expected:?}, got {other:?}"),
+        with_db(|c| {
+            let t = apply(c, None, &changes(&[("a", Some("1")), ("d/x", Some("2"))]))?;
+            let cases: [(Edits<'_>, ApplyError); 6] = [
+                (
+                    &[("a/b", Some("x"))],
+                    ApplyError::FileInTheWay {
+                        path: path("a/b"),
+                        file: path("a"),
+                    },
+                ),
+                (&[("d", Some("x"))], ApplyError::DirInTheWay(path("d"))),
+                (&[("nope", None)], ApplyError::DeleteMissing(path("nope"))),
+                (&[("a/b", None)], ApplyError::DeleteMissing(path("a/b"))),
+                (&[("d", None)], ApplyError::NotAFile(path("d"))),
+                (
+                    &[("n", Some("x")), ("n/m", Some("y"))],
+                    ApplyError::FileInTheWay {
+                        path: path("n/m"),
+                        file: path("n"),
+                    },
+                ),
+            ];
+            for (edits, expected) in cases {
+                match apply(c, Some(t), &changes(edits)) {
+                    Err(Error::Apply(e)) => assert_eq!(e, expected),
+                    other => panic!("expected {expected:?}, got {other:?}"),
+                }
             }
-        }
+            Ok(())
+        });
     }
 
     #[test]
     fn root_tree_derives_a_long_chain_and_caches_it() {
-        let (_dir, store) = objects();
-        let repo = store.write(|c| db::create_repo(c, "r")).unwrap();
-        let author = scion_core::IdentityTime {
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(dir.path()).unwrap();
+        let author = IdentityTime {
             name: b"a".to_vec(),
             email: b"a@x".to_vec(),
             unix_secs: 0,
             tz_offset_minutes: 0,
         };
-        // One transaction for the setup; the derivation below is what is tested.
-        let tip = store
+        let (repo, tip) = store
             .write(|c| {
+                let repo = db::create_repo(c, "r")?;
                 let mut parent: Option<ChangesetId> = None;
                 for i in 0..2000 {
-                    let cs = scion_core::Changeset {
+                    let cs = Changeset {
                         parents: parent.into_iter().collect(),
                         author: author.clone(),
                         committer: None,
@@ -383,11 +390,11 @@ mod tests {
                     };
                     parent = Some(db::insert_changeset(c, repo, &cs)?);
                 }
-                Ok(parent.unwrap())
+                Ok((repo, parent.unwrap()))
             })
             .unwrap();
         let tree = root_tree(&store, repo, tip).unwrap();
-        assert_eq!(files(store.objects(), tree).len(), 7);
+        assert_eq!(store.read(|c| Ok(files(c, tree))).unwrap().len(), 7);
         assert_eq!(root_tree(&store, repo, tip).unwrap(), tree);
     }
 }
