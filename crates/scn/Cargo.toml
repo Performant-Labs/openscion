@@ -1,0 +1,20 @@
+[package]
+name = "scn"
+description = "Command-line client for the Scion version control system"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+clap.workspace = true
+scion-core.workspace = true
+scion-proto.workspace = true
+tokio.workspace = true
+tokio-stream.workspace = true
+tonic.workspace = true
+
+[lints]
+workspace = true

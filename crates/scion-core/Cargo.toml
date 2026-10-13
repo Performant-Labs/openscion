@@ -8,10 +8,10 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
-blake3 = "1.8"
+blake3.workspace = true
 
 [dev-dependencies]
-proptest = "1.12"
+proptest.workspace = true
 
 [lints]
 workspace = true

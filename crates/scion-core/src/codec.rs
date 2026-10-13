@@ -129,7 +129,15 @@ impl Changeset {
     /// The content address of this changeset.
     #[must_use]
     pub fn id(&self) -> ChangesetId {
-        ChangesetId::hash(&self.encode())
+        self.encode_with_id().1
+    }
+
+    /// The canonical encoding and the ID, from a single encode.
+    #[must_use]
+    pub fn encode_with_id(&self) -> (Vec<u8>, ChangesetId) {
+        let bytes = self.encode();
+        let id = ChangesetId::hash(&bytes);
+        (bytes, id)
     }
 }
 
@@ -184,7 +192,15 @@ impl Tree {
     /// The content address of this tree.
     #[must_use]
     pub fn id(&self) -> TreeId {
-        TreeId::hash(&self.encode())
+        self.encode_with_id().1
+    }
+
+    /// The canonical encoding and the ID, from a single encode.
+    #[must_use]
+    pub fn encode_with_id(&self) -> (Vec<u8>, TreeId) {
+        let bytes = self.encode();
+        let id = TreeId::hash(&bytes);
+        (bytes, id)
     }
 }
 

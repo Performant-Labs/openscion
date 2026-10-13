@@ -1,0 +1,149 @@
+// Scion RPC API, version 1.
+//
+// Every request names a repository. IDs are 32 raw bytes. Paths are raw bytes
+// split on '/'. Changesets and trees travel in the v1 byte format
+// (docs/format-v1.md), so clients decode them with scion-core.
+//
+// Reads take a changeset ID, never a ref name: every read targets an immutable
+// object, so any cache tier can answer it. Resolve a ref first with ResolveRef.
+
+syntax = "proto3";
+
+package scion.v1;
+
+service Scion {
+  // Write path.
+
+  // Stores one file. The first message names the repo; every message carries
+  // the next chunk of the file. Returns the blob ID. Safe to repeat.
+  rpc PutBlob(stream PutBlobRequest) returns (PutBlobResponse);
+  // Stores a changeset with exactly one parent. Safe to repeat: the ID is the
+  // content.
+  rpc CreateChangeset(CreateChangesetRequest) returns (CreateChangesetResponse);
+  // Rebases a changeset onto a ref and moves the ref. A retry with the same
+  // request key returns the same land.
+  rpc Land(LandRequest) returns (LandResponse);
+  // Returns the current state of a land.
+  rpc GetLand(GetLandRequest) returns (LandResponse);
+
+  // Read path.
+
+  rpc ResolveRef(ResolveRefRequest) returns (ResolveRefResponse);
+  rpc GetChangeset(GetChangesetRequest) returns (GetChangesetResponse);
+  // Streams the content of a regular file or the target of a symlink.
+  rpc ReadFile(ReadFileRequest) returns (stream ReadFileResponse);
+  // Returns one directory level as a TreeV1 object.
+  rpc ListDir(ListDirRequest) returns (ListDirResponse);
+  // Walks first parents, newest first.
+  rpc Log(LogRequest) returns (LogResponse);
+}
+
+message PutBlobRequest {
+  string repo = 1;
+  bytes data = 2;
+}
+
+message PutBlobResponse {
+  bytes blob_id = 1;
+}
+
+message CreateChangesetRequest {
+  string repo = 1;
+  // ChangesetV1 bytes.
+  bytes changeset = 2;
+}
+
+message CreateChangesetResponse {
+  bytes changeset_id = 1;
+}
+
+message LandRequest {
+  string repo = 1;
+  bytes changeset_id = 2;
+  string target_ref = 3;
+  // Chosen by the caller. Unique per repo and caller.
+  string request_key = 4;
+}
+
+message GetLandRequest {
+  string repo = 1;
+  string land_id = 2;
+}
+
+enum LandState {
+  LAND_STATE_UNSPECIFIED = 0;
+  LAND_STATE_PENDING = 1;
+  LAND_STATE_LANDED = 2;
+  // A path in the changeset changed on the ref after the changeset's base.
+  LAND_STATE_CONFLICT = 3;
+  // The land can never succeed, for example the base is not on the ref.
+  LAND_STATE_REJECTED = 4;
+}
+
+message LandResponse {
+  string land_id = 1;
+  LandState state = 2;
+  // The rebased changeset now at the tip of the ref. Set when LANDED.
+  bytes result_changeset_id = 3;
+  // Why the land is CONFLICT or REJECTED.
+  string detail = 4;
+  // Paths that conflict. Set when CONFLICT.
+  repeated bytes conflict_paths = 5;
+}
+
+message ResolveRefRequest {
+  string repo = 1;
+  string name = 2;
+}
+
+message ResolveRefResponse {
+  bytes changeset_id = 1;
+}
+
+message GetChangesetRequest {
+  string repo = 1;
+  bytes changeset_id = 2;
+}
+
+message GetChangesetResponse {
+  // ChangesetV1 bytes.
+  bytes changeset = 1;
+}
+
+message ReadFileRequest {
+  string repo = 1;
+  bytes changeset_id = 2;
+  bytes path = 3;
+}
+
+message ReadFileResponse {
+  bytes data = 1;
+}
+
+message ListDirRequest {
+  string repo = 1;
+  bytes changeset_id = 2;
+  // Empty means the repo root.
+  bytes path = 3;
+}
+
+message ListDirResponse {
+  // TreeV1 bytes.
+  bytes tree = 1;
+}
+
+message LogRequest {
+  string repo = 1;
+  bytes changeset_id = 2;
+  uint32 limit = 3;
+}
+
+message LogResponse {
+  repeated LogEntry entries = 1;
+}
+
+message LogEntry {
+  bytes changeset_id = 1;
+  // ChangesetV1 bytes.
+  bytes changeset = 2;
+}

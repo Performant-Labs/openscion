@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["crates/scion-core"]
+members = ["crates/*"]
 
 [workspace.package]
 version = "0.1.0"
@@ -8,6 +8,28 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 authors = ["Ben Shaharizad <bnsd55@gmail.com>"]
+
+[workspace.dependencies]
+scion-core = { path = "crates/scion-core" }
+scion-proto = { path = "crates/scion-proto" }
+
+anyhow = "1.0"
+blake3 = "1.8"
+clap = { version = "4.6", features = ["derive", "env"] }
+gix = "0.89"
+prost = "0.14"
+proptest = "1.12"
+rusqlite = { version = "0.40", features = ["bundled"] }
+tempfile = "3.27"
+thiserror = "2.0"
+tokio = { version = "1.53", features = ["macros", "rt-multi-thread", "signal", "sync"] }
+tokio-stream = "0.1"
+tonic = "0.14"
+tonic-prost = "0.14"
+tonic-prost-build = "0.14"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+zstd = "0.14"
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

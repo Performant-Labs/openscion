@@ -462,3 +462,16 @@ fn accepts_paths_at_the_limits_and_keeps_raw_bytes() {
         assert_eq!(RepoPath::new(p).unwrap().as_bytes(), p);
     }
 }
+
+#[test]
+fn ids_parse_from_hex_and_bytes() {
+    let id = root().id();
+    assert_eq!(id.to_string().parse::<scion_core::ChangesetId>(), Ok(id));
+    assert_eq!(
+        scion_core::ChangesetId::try_from(id.as_bytes().as_slice()),
+        Ok(id)
+    );
+    assert!("abc".parse::<scion_core::ChangesetId>().is_err());
+    assert!(scion_core::ChangesetId::try_from([0u8; 31].as_slice()).is_err());
+    assert_eq!(root().encode_with_id(), (root().encode(), root().id()));
+}

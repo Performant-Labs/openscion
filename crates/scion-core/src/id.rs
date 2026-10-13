@@ -1,4 +1,5 @@
 use std::fmt;
+use std::str::FromStr;
 
 const BLOB_DOMAIN: &[u8] = b"scion\0blob\0v1\0";
 const CHANGESET_DOMAIN: &[u8] = b"scion\0changeset\0v1\0";
@@ -47,8 +48,40 @@ macro_rules! object_id {
                 write!(f, concat!(stringify!($name), "({})"), self)
             }
         }
+
+        /// Parses 64 hex digits.
+        impl FromStr for $name {
+            type Err = ParseIdError;
+
+            fn from_str(s: &str) -> Result<Self, ParseIdError> {
+                blake3::Hash::from_hex(s)
+                    .map(|hash| Self(*hash.as_bytes()))
+                    .map_err(|_| ParseIdError)
+            }
+        }
+
+        /// Takes exactly 32 raw bytes.
+        impl TryFrom<&[u8]> for $name {
+            type Error = ParseIdError;
+
+            fn try_from(bytes: &[u8]) -> Result<Self, ParseIdError> {
+                bytes.try_into().map(Self).map_err(|_| ParseIdError)
+            }
+        }
     };
 }
+
+/// Text or bytes that are not an object ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ParseIdError;
+
+impl fmt::Display for ParseIdError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("not an object ID: expected 64 hex digits or 32 bytes")
+    }
+}
+
+impl std::error::Error for ParseIdError {}
 
 object_id!(
     /// Content address of a file's raw bytes.

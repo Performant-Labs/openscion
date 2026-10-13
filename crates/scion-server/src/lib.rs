@@ -1,0 +1,23 @@
+//! Scion server: durable storage, server-side commits and lands, and reads.
+//!
+//! Modules from the bottom up:
+//!
+//! - [`store`] and [`db`]: `SQLite` metadata plus a folder of immutable objects.
+//! - [`tree`]: apply changesets to trees and derive each changeset's root tree.
+//! - [`read`], [`write`], [`land`]: the operations behind the RPCs.
+//! - [`import`]: one-way import from a git repository.
+//! - [`service`] and [`auth`]: the gRPC front end.
+
+pub mod auth;
+pub mod db;
+pub mod error;
+pub mod import;
+pub mod land;
+pub mod read;
+pub mod service;
+pub mod store;
+pub mod tree;
+pub mod write;
+
+pub use error::{Error, Result};
+pub use store::Store;
