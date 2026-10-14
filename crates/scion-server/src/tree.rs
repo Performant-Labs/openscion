@@ -392,6 +392,94 @@ mod tests {
         });
     }
 
+    /// A changeset applied to a flat path → content map, with the same rules:
+    /// deletes first, then puts in path order. `None` means the changeset
+    /// does not apply.
+    fn apply_flat(
+        files: &BTreeMap<String, u8>,
+        changes: &BTreeMap<String, Option<u8>>,
+    ) -> Option<BTreeMap<String, u8>> {
+        let mut files = files.clone();
+        for (path, _) in changes.iter().filter(|(_, c)| c.is_none()) {
+            files.remove(path)?;
+        }
+        for (path, content) in changes {
+            let Some(content) = content else { continue };
+            let file_above = path
+                .match_indices('/')
+                .any(|(i, _)| files.contains_key(&path[..i]));
+            let dir_here = files.keys().any(|f| f.starts_with(&format!("{path}/")));
+            if file_above || dir_here {
+                return None;
+            }
+            files.insert(path.clone(), *content);
+        }
+        Some(files)
+    }
+
+    fn snapshot(c: &Connection, root: TreeId) -> BTreeMap<String, u8> {
+        files(c, root)
+            .into_iter()
+            .map(|path| {
+                let Some(Entry::File(FileState::Regular { content, .. })) =
+                    lookup(c, root, &RepoPath::new(path.as_str()).unwrap()).unwrap()
+                else {
+                    panic!("{path} is not a regular file");
+                };
+                let byte = (0..=u8::MAX)
+                    .find(|b| BlobId::of(&[*b]) == content)
+                    .expect("test content is one byte");
+                (path, byte)
+            })
+            .collect()
+    }
+
+    proptest::proptest! {
+        /// `apply` agrees with the flat model on every random edit sequence:
+        /// the same files with the same content, and the same refusals.
+        #[test]
+        fn apply_matches_a_flat_model(
+            history in proptest::collection::vec(
+                proptest::collection::btree_map(
+                    proptest::sample::select(
+                        ["a", "b", "a/b", "a/c", "b/a", "a/b/c", "a/b/d", "c/a/b"].as_slice(),
+                    ),
+                    proptest::option::of(0u8..4),
+                    1..5,
+                ),
+                1..6,
+            )
+        ) {
+            with_db(|c| {
+                let mut model = BTreeMap::new();
+                let mut tree = None;
+                for edits in &history {
+                    let changes = edits
+                        .iter()
+                        .map(|(p, content)| {
+                            let state = content.map(|b| FileState::Regular {
+                                content: BlobId::of(&[b]),
+                                executable: false,
+                            });
+                            (RepoPath::new(*p).unwrap(), state)
+                        })
+                        .collect();
+                    let flat_changes = edits.iter().map(|(p, c)| ((*p).to_owned(), *c)).collect();
+                    match (apply_flat(&model, &flat_changes), apply(c, tree, &changes)) {
+                        (Some(next), Ok(next_tree)) => {
+                            assert_eq!(snapshot(c, next_tree), next);
+                            model = next;
+                            tree = Some(next_tree);
+                        }
+                        (None, Err(Error::Apply(_))) => {}
+                        (flat, real) => panic!("model {flat:?} but apply {real:?} for {edits:?}"),
+                    }
+                }
+                Ok(())
+            });
+        }
+    }
+
     #[test]
     fn root_tree_derives_a_long_chain_and_caches_it() {
         let dir = tempfile::tempdir().unwrap();

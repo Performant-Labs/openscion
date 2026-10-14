@@ -14,7 +14,8 @@ pub struct Caller(pub String);
 // principal map, then per-path write rules.
 #[derive(Clone)]
 pub struct Auth {
-    token: Arc<[u8]>,
+    /// Hash of the expected token, so every comparison has the same length.
+    token: Arc<[u8; 32]>,
 }
 
 impl Auth {
@@ -22,7 +23,7 @@ impl Auth {
     #[must_use]
     pub fn new(token: &str) -> Self {
         Self {
-            token: token.as_bytes().into(),
+            token: Arc::new(digest(token.as_bytes())),
         }
     }
 }
@@ -33,7 +34,7 @@ impl Interceptor for Auth {
             .metadata()
             .get("authorization")
             .and_then(|value| value.as_bytes().strip_prefix(b"Bearer "));
-        if !presented.is_some_and(|token| constant_time_eq(token, &self.token)) {
+        if !presented.is_some_and(|token| constant_time_eq(&digest(token), &self.token)) {
             return Err(Status::unauthenticated("missing or wrong token"));
         }
         request.extensions_mut().insert(Caller("default".into()));
@@ -41,7 +42,11 @@ impl Interceptor for Auth {
     }
 }
 
-/// Compares without an early exit, so timing does not reveal a prefix match.
-fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
-    a.len() == b.len() && a.iter().zip(b).fold(0, |diff, (x, y)| diff | (x ^ y)) == 0
+fn digest(token: &[u8]) -> [u8; 32] {
+    *blake3::hash(token).as_bytes()
+}
+
+/// Compares two digests without an early exit, so timing reveals nothing.
+fn constant_time_eq(a: &[u8; 32], b: &[u8; 32]) -> bool {
+    a.iter().zip(b).fold(0, |diff, (x, y)| diff | (x ^ y)) == 0
 }

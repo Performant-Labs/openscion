@@ -14,8 +14,9 @@ package scion.v1;
 service Scion {
   // Write path.
 
-  // Stores one file. The first message names the repo; every message carries
-  // the next chunk of the file. Returns the blob ID. Safe to repeat.
+  // Stores one file. Only the first message names the repo; later messages
+  // leave it empty. Every message carries the next chunk of the file. Returns
+  // the blob ID. Safe to repeat.
   rpc PutBlob(stream PutBlobRequest) returns (PutBlobResponse);
   // Stores a changeset with exactly one parent. Safe to repeat: the ID is the
   // content.

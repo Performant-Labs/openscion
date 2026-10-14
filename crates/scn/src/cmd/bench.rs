@@ -172,13 +172,24 @@ async fn verify(mut ctx: Ctx, start: ChangesetId, landed: &[ChangesetId]) -> Res
                 .copied();
         }
     }
-    let missing = landed.iter().filter(|id| !history.contains(*id)).count();
-    ensure!(missing == 0, "{missing} landed changesets are not on main");
+    check_landed(landed, &history)
+}
+
+/// Every reported land is distinct and the reported set equals what `main`
+/// gained: no duplicate, no missing, no extra.
+fn check_landed(landed: &[ChangesetId], history: &HashSet<ChangesetId>) -> Result<()> {
+    let reported: HashSet<ChangesetId> = landed.iter().copied().collect();
     ensure!(
-        history.len() == landed.len(),
-        "main gained {} changesets but {} lands reported success",
+        reported.len() == landed.len(),
+        "{} lands reported the same result",
+        landed.len() - reported.len()
+    );
+    ensure!(
+        reported == *history,
+        "reported lands differ from main: {} reported, {} on main, {} in common",
+        reported.len(),
         history.len(),
-        landed.len()
+        reported.intersection(history).count()
     );
     Ok(())
 }
@@ -228,4 +239,31 @@ fn report(json: bool, agents: usize, stats: &mut Stats, elapsed: Duration) {
     println!("land RPC     p50 {land_p50:.1} ms  p99 {land_p99:.1} ms  max {land_max:.1} ms");
     println!("end to end   p50 {total_p50:.1} ms  p99 {total_p99:.1} ms  (upload + create + land)");
     println!("verified: main gained exactly the {landed} landed changesets");
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn id(n: u8) -> ChangesetId {
+        ChangesetId::from_bytes([n; 32])
+    }
+
+    #[test]
+    fn check_landed_needs_exactly_the_reported_set() {
+        let history: HashSet<_> = [id(1), id(2)].into();
+        assert!(check_landed(&[id(1), id(2)], &history).is_ok());
+        assert!(
+            check_landed(&[id(1), id(1)], &history).is_err(),
+            "duplicate, one missing"
+        );
+        assert!(
+            check_landed(&[id(1)], &history).is_err(),
+            "main has an unreported change"
+        );
+        assert!(
+            check_landed(&[id(1), id(2), id(3)], &history).is_err(),
+            "reported but not on main"
+        );
+    }
 }

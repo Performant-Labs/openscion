@@ -42,7 +42,8 @@ CREATE TABLE refs (
 ) STRICT, WITHOUT ROWID;
 
 -- One row per land request. A retry with the same (repo, caller, key) finds
--- this row. `conflict_paths` is a list of u32be-length-prefixed paths.
+-- this row. `conflict_paths` holds the paths joined by NUL bytes, which a
+-- path cannot contain.
 CREATE TABLE lands (
     land_id        INTEGER PRIMARY KEY,
     repo_id        INTEGER NOT NULL REFERENCES repos (repo_id),

@@ -29,6 +29,10 @@ enum Command {
         /// Bearer token that clients must send.
         #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
         token: String,
+        /// Allow a non-loopback address. Traffic, including the token, is not
+        /// encrypted, so use this only on a trusted network.
+        #[arg(long)]
+        insecure_listen: bool,
     },
     /// Import a local git repository, one way. Safe to repeat.
     Import {
@@ -59,8 +63,19 @@ async fn main() -> anyhow::Result<()> {
     let store = Store::open(&cli.data)
         .with_context(|| format!("cannot open data directory {}", cli.data.display()))?;
     match cli.command {
-        Command::Serve { listen, token } => {
+        Command::Serve {
+            listen,
+            token,
+            insecure_listen,
+        } => {
             anyhow::ensure!(!token.is_empty(), "--token must not be empty");
+            // SHORTCUT: no TLS. Upgrade: tonic TLS or mTLS before any
+            // deployment beyond one machine.
+            anyhow::ensure!(
+                listen.ip().is_loopback() || insecure_listen,
+                "{listen} is not a loopback address; traffic and the token would \
+                 travel unencrypted. Pass --insecure-listen to allow it."
+            );
             let listener = tokio::net::TcpListener::bind(listen)
                 .await
                 .with_context(|| format!("cannot listen on {listen}"))?;

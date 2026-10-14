@@ -5,6 +5,7 @@
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Duration;
 
 use scion_core::RepoPath;
 use scion_proto::v1::scion_server::{Scion, ScionServer};
@@ -16,6 +17,7 @@ use scion_proto::v1::{
 };
 use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES};
 use tokio::net::TcpListener;
+use tokio::sync::Semaphore;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_stream::{Stream, StreamExt};
 use tonic::service::interceptor::InterceptedService;
@@ -25,10 +27,18 @@ use crate::auth::{Auth, Caller};
 use crate::error::Result;
 use crate::land::{self, LandOutcome, LandState, Lands};
 use crate::store::{MAX_OBJECT_BYTES, Store};
-use crate::{read, write};
+use crate::{db, names, read, write};
 
 /// Most changesets one `Log` call returns.
 const MAX_LOG: usize = 1000;
+/// Most changeset bytes in one `Log` reply; the client pages for more.
+const LOG_BUDGET_BYTES: usize = MAX_MESSAGE_BYTES / 2;
+/// Most store operations running at once.
+const MAX_BLOCKING: usize = 256;
+/// Most uploads in flight at once. Each buffers up to `MAX_OBJECT_BYTES`.
+const MAX_UPLOADS: usize = 16;
+/// Longest a request may take before the server gives up on it.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// Serves the API on `listener`, requiring `token`, until `shutdown` resolves.
 ///
@@ -43,6 +53,7 @@ pub async fn serve(
 ) -> Result<(), tonic::transport::Error> {
     let service = InterceptedService::new(ScionService::new(store).into_server(), Auth::new(token));
     tonic::transport::Server::builder()
+        .timeout(REQUEST_TIMEOUT)
         .add_service(service)
         .serve_with_incoming_shutdown(TcpListenerStream::new(listener), shutdown)
         .await
@@ -52,6 +63,12 @@ pub async fn serve(
 pub struct ScionService {
     store: Store,
     lands: Arc<Lands>,
+    /// Bounds blocking work, so a flood of requests queues instead of
+    /// spawning unbounded threads.
+    work: Arc<Semaphore>,
+    /// Bounds buffered uploads, so their memory stays under
+    /// `MAX_UPLOADS * MAX_OBJECT_BYTES`.
+    uploads: Arc<Semaphore>,
 }
 
 impl ScionService {
@@ -59,6 +76,8 @@ impl ScionService {
         Self {
             store,
             lands: Arc::default(),
+            work: Arc::new(Semaphore::new(MAX_BLOCKING)),
+            uploads: Arc::new(Semaphore::new(MAX_UPLOADS)),
         }
     }
 
@@ -74,16 +93,27 @@ impl ScionService {
         T: Send + 'static,
         F: FnOnce(Store) -> Result<T> + Send + 'static,
     {
-        let store = self.store.clone();
-        tokio::task::spawn_blocking(move || f(store))
+        let permit = Arc::clone(&self.work)
+            .acquire_owned()
             .await
-            .map_err(|e| Status::internal(format!("worker failed: {e}")))?
-            .map_err(Status::from)
+            .map_err(|_| Status::unavailable("server is shutting down"))?;
+        let store = self.store.clone();
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            f(store)
+        })
+        .await
+        .map_err(|e| Status::internal(format!("worker failed: {e}")))?
+        .map_err(Status::from)
     }
 }
 
 fn parse_id<T: for<'a> TryFrom<&'a [u8]>>(bytes: &[u8], what: &str) -> Result<T, Status> {
     T::try_from(bytes).map_err(|_| Status::invalid_argument(format!("{what} must be 32 bytes")))
+}
+
+fn check_name(what: &str, value: &str) -> Result<(), Status> {
+    names::check(what, value).map_err(Status::from)
 }
 
 fn parse_path(bytes: Vec<u8>) -> Result<RepoPath, Status> {
@@ -130,12 +160,29 @@ impl Scion for ScionService {
         &self,
         request: Request<Streaming<PutBlobRequest>>,
     ) -> Result<Response<PutBlobResponse>, Status> {
+        let _upload = Arc::clone(&self.uploads)
+            .acquire_owned()
+            .await
+            .map_err(|_| Status::unavailable("server is shutting down"))?;
         let mut stream = request.into_inner();
-        let mut repo = None;
-        let mut data = Vec::new();
+        let first = stream
+            .next()
+            .await
+            .ok_or_else(|| Status::invalid_argument("empty upload"))??;
+        check_name("repo", &first.repo)?;
+        let repo = first.repo;
+        // Check the repo before buffering any more data.
+        let lookup = repo.clone();
+        self.blocking(move |store| store.read(|c| db::repo_id(c, &lookup)))
+            .await?;
+        let mut data = first.data;
         while let Some(chunk) = stream.next().await {
             let chunk = chunk?;
-            repo.get_or_insert(chunk.repo);
+            if !chunk.repo.is_empty() {
+                return Err(Status::invalid_argument(
+                    "only the first PutBlob message names the repo",
+                ));
+            }
             if data.len() + chunk.data.len() > MAX_OBJECT_BYTES {
                 return Err(Status::invalid_argument(format!(
                     "blob is larger than {MAX_OBJECT_BYTES} bytes"
@@ -143,7 +190,6 @@ impl Scion for ScionService {
             }
             data.extend_from_slice(&chunk.data);
         }
-        let repo = repo.ok_or_else(|| Status::invalid_argument("empty upload"))?;
         let id = self
             .blocking(move |store| write::put_blob(&store, &repo, &data))
             .await?;
@@ -157,6 +203,7 @@ impl Scion for ScionService {
         request: Request<CreateChangesetRequest>,
     ) -> Result<Response<CreateChangesetResponse>, Status> {
         let CreateChangesetRequest { repo, changeset } = request.into_inner();
+        check_name("repo", &repo)?;
         let id = self
             .blocking(move |store| write::create_changeset(&store, &repo, &changeset))
             .await?;
@@ -171,6 +218,9 @@ impl Scion for ScionService {
     ) -> Result<Response<LandResponse>, Status> {
         let caller = caller(&request)?;
         let req = request.into_inner();
+        check_name("repo", &req.repo)?;
+        check_name("target_ref", &req.target_ref)?;
+        check_name("request_key", &req.request_key)?;
         let req = land::LandRequest {
             changeset: parse_id(&req.changeset_id, "changeset_id")?,
             repo: req.repo,
@@ -203,6 +253,8 @@ impl Scion for ScionService {
         request: Request<ResolveRefRequest>,
     ) -> Result<Response<ResolveRefResponse>, Status> {
         let ResolveRefRequest { repo, name } = request.into_inner();
+        check_name("repo", &repo)?;
+        check_name("ref", &name)?;
         let id = self
             .blocking(move |store| read::resolve_ref(&store, &repo, &name))
             .await?;
@@ -216,6 +268,7 @@ impl Scion for ScionService {
         request: Request<GetChangesetRequest>,
     ) -> Result<Response<GetChangesetResponse>, Status> {
         let req = request.into_inner();
+        check_name("repo", &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let changeset = self
             .blocking(move |store| read::get_changeset(&store, &req.repo, id))
@@ -232,19 +285,19 @@ impl Scion for ScionService {
         request: Request<ReadFileRequest>,
     ) -> Result<Response<ReadFileStream>, Status> {
         let req = request.into_inner();
+        check_name("repo", &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = parse_path(req.path)?;
         let data = self
             .blocking(move |store| read::read_file(&store, &req.repo, id, &path))
             .await?;
-        let chunks: Vec<_> = data
-            .chunks(CHUNK_BYTES)
-            .map(|chunk| {
-                Ok(ReadFileResponse {
-                    data: chunk.to_vec(),
-                })
+        // Copies one chunk at a time, as the stream is read.
+        let chunks = (0..data.len().div_ceil(CHUNK_BYTES)).map(move |i| {
+            let end = data.len().min((i + 1) * CHUNK_BYTES);
+            Ok(ReadFileResponse {
+                data: data[i * CHUNK_BYTES..end].to_vec(),
             })
-            .collect();
+        });
         Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
     }
 
@@ -253,6 +306,7 @@ impl Scion for ScionService {
         request: Request<ListDirRequest>,
     ) -> Result<Response<ListDirResponse>, Status> {
         let req = request.into_inner();
+        check_name("repo", &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let path = if req.path.is_empty() {
             None
@@ -269,17 +323,26 @@ impl Scion for ScionService {
 
     async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogResponse>, Status> {
         let req = request.into_inner();
+        check_name("repo", &req.repo)?;
         let id = parse_id(&req.changeset_id, "changeset_id")?;
         let limit = (req.limit as usize).clamp(1, MAX_LOG);
-        let entries = self
+        let changesets = self
             .blocking(move |store| read::log(&store, &req.repo, id, limit))
-            .await?
-            .into_iter()
-            .map(|(id, changeset)| LogEntry {
+            .await?;
+        // Always send the first entry; stop before the reply gets too big.
+        let mut budget = LOG_BUDGET_BYTES;
+        let mut entries = Vec::new();
+        for (id, changeset) in changesets {
+            let body = changeset.encode();
+            if !entries.is_empty() && body.len() > budget {
+                break;
+            }
+            budget = budget.saturating_sub(body.len());
+            entries.push(LogEntry {
                 changeset_id: id.as_bytes().to_vec(),
-                changeset: changeset.encode(),
-            })
-            .collect();
+                changeset: body,
+            });
+        }
         Ok(Response::new(LogResponse { entries }))
     }
 }

@@ -13,6 +13,7 @@ pub mod db;
 pub mod error;
 pub mod import;
 pub mod land;
+pub mod names;
 pub mod read;
 pub mod service;
 pub mod store;
