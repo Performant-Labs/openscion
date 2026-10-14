@@ -49,6 +49,10 @@ pub enum Error {
     /// A git repository could not be read during import.
     #[error("git: {0}")]
     Git(String),
+    /// Another writer kept winning a race. Nothing was written; the same
+    /// request may succeed if retried.
+    #[error("{0}")]
+    Aborted(String),
 }
 
 /// Result with the server [`Error`].
@@ -59,6 +63,7 @@ impl From<Error> for Status {
         match e {
             Error::NotFound(_) => Status::not_found(e.to_string()),
             Error::InvalidArgument(_) | Error::Apply(_) => Status::invalid_argument(e.to_string()),
+            Error::Aborted(_) => Status::aborted(e.to_string()),
             Error::Corrupt(_) | Error::Db(_) | Error::Io(_) | Error::Git(_) => {
                 // Details stay in the server log, not in the reply.
                 tracing::error!(error = %e, "internal error");

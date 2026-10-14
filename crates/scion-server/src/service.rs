@@ -238,12 +238,13 @@ impl Scion for ScionService {
         &self,
         request: Request<GetLandRequest>,
     ) -> Result<Response<LandResponse>, Status> {
+        let caller = caller(&request)?;
         let GetLandRequest { repo, land_id } = request.into_inner();
         let land_id = land_id
             .parse()
             .map_err(|_| Status::invalid_argument("land_id must be a number"))?;
         let outcome = self
-            .blocking(move |store| land::get_land(&store, &repo, land_id))
+            .blocking(move |store| land::get_land(&store, &caller, &repo, land_id))
             .await?;
         Ok(Response::new(land_response(outcome)))
     }
