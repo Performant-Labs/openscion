@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="docs/assets/banner.jpg" alt="open-scion logo: a young scion grafted onto a rootstock whose roots are circuit traces" width="720">
+</p>
+
 # open-scion
 
 [![CI](https://github.com/bnsd55/open-scion/actions/workflows/ci.yml/badge.svg)](https://github.com/bnsd55/open-scion/actions/workflows/ci.yml)
