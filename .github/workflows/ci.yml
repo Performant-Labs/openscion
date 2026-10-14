@@ -24,6 +24,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
       - uses: Swatinem/rust-cache@v2
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
@@ -34,6 +37,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
       - uses: Swatinem/rust-cache@v2
       - run: cargo test --workspace
         env:
@@ -45,6 +51,9 @@ jobs:
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@1.88
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: protoc
       - uses: Swatinem/rust-cache@v2
       - run: cargo check --workspace --all-targets
 
@@ -65,4 +74,7 @@ jobs:
         run: |
           fuzz_dir="$GITHUB_WORKSPACE/crates/scion-core/fuzz"
           mkdir -p "$fuzz_dir/corpus/decode"
-          cargo fuzz run decode "$fuzz_dir/corpus/decode" "$fuzz_dir/seeds/decode" -- -max_total_time=60
+          # The prebuilt cargo-fuzz defaults to a musl target, where the
+          # address sanitizer cannot run.
+          cargo fuzz run --target x86_64-unknown-linux-gnu decode \
+            "$fuzz_dir/corpus/decode" "$fuzz_dir/seeds/decode" -- -max_total_time=60

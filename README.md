@@ -1,5 +1,10 @@
 # open-scion
 
+[![CI](https://github.com/bnsd55/open-scion/actions/workflows/ci.yml/badge.svg)](https://github.com/bnsd55/open-scion/actions/workflows/ci.yml)
+[![License: MIT OR Apache-2.0](https://img.shields.io/badge/license-MIT%20OR%20Apache--2.0-blue.svg)](#license)
+[![Rust 1.88+](https://img.shields.io/badge/rust-1.88%2B-orange.svg)](https://www.rust-lang.org)
+![Status: proof of concept](https://img.shields.io/badge/status-proof%20of%20concept-yellow.svg)
+
 A version control system for large monorepos where most of the writers are
 AI agents. The server keeps the history and makes the commits; clients ask
 only for what they need. Written in Rust.
@@ -149,7 +154,8 @@ limit and its upgrade path.
 
 ## Build and test
 
-Requires Rust 1.88 or newer.
+Requires Rust 1.88 or newer and `protoc` (the Protocol Buffers compiler; for
+example `brew install protobuf` or `apt install protobuf-compiler`).
 
 ```sh
 cargo test --workspace

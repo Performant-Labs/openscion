@@ -8,6 +8,9 @@ edition = "2024"
 rust-version = "1.88"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bnsd55/open-scion"
+homepage = "https://github.com/bnsd55/open-scion"
+keywords = ["vcs", "version-control", "monorepo", "git", "source-control"]
+categories = ["development-tools"]
 authors = ["Ben Shaharizad <bnsd55@gmail.com>"]
 
 [workspace.dependencies]
