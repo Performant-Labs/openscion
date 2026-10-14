@@ -112,10 +112,12 @@ Every `scn` command takes `--json` for machine-readable output.
 
 `scn bench` runs many agents that land changes at the same time, then checks
 that `main` gained each landed change exactly once. With one server process on
-one machine, 200 agents landed 10,000 changes at about 210 lands per second,
-with none lost or duplicated. Importing a git repository with 23,871 commits
-took 50 seconds. The write rate is limited today by one full disk flush per new
-file ([#3](https://github.com/bnsd55/open-scion/issues/3)).
+one machine, 200 agents landed 10,000 changes with none lost or duplicated.
+Importing a git repository with 23,871 commits took 50 seconds. The write rate
+is limited today by full disk flushes, one per new file and one per land.
+Sharing one flush between many requests is
+[#3](https://github.com/bnsd55/open-scion/issues/3). The rate will be published
+with it.
 
 ## Layout
 
