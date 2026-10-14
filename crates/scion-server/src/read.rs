@@ -1,6 +1,6 @@
 //! Reads. Each takes a changeset ID, so each answer is immutable.
 
-use scion_core::{Changeset, ChangesetId, Entry, FileState, RepoPath, Tree};
+use scion_core::{Changeset, ChangesetId, Entry, RepoPath, Tree};
 
 use crate::db;
 use crate::error::{Error, Result};
@@ -43,12 +43,10 @@ pub fn read_file(store: &Store, repo: &str, cs: ChangesetId, path: &RepoPath) ->
     let repo = store.read(|c| db::repo_id(c, repo))?;
     let root = tree::root_tree(store, repo, cs)?;
     match store.read(|c| tree::lookup(c, root, path))? {
-        Some(Entry::File(
-            FileState::Regular { content: blob, .. } | FileState::Symlink { target: blob },
-        )) => store.blobs().get(blob),
-        Some(Entry::File(FileState::Gitlink { .. })) => {
-            Err(Error::InvalidArgument(format!("{path:?} is a submodule")))
-        }
+        Some(Entry::File(state)) => match state.blob() {
+            Some(blob) => store.blobs().get(blob),
+            None => Err(Error::InvalidArgument(format!("{path:?} is a submodule"))),
+        },
         Some(Entry::Dir(_)) => Err(Error::InvalidArgument(format!("{path:?} is a directory"))),
         None => Err(Error::NotFound(format!("path {path:?}"))),
     }

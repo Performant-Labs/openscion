@@ -7,6 +7,7 @@
 //! <data>/tmp/                      staging for atomic blob writes
 //! ```
 
+use std::collections::BTreeSet;
 use std::fs;
 use std::io::{ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
@@ -52,6 +53,8 @@ impl Store {
              PRAGMA foreign_keys = ON;
              PRAGMA busy_timeout = 5000;",
         )?;
+        // Enough for every hot statement, so none is prepared twice.
+        db.set_prepared_statement_cache_capacity(64);
         migrate(&db)?;
         Ok(Self {
             inner: Arc::new(Inner {
@@ -128,32 +131,24 @@ impl Blobs {
         Ok(Self { root, tmp })
     }
 
-    /// Stores a file's content durably. Safe to repeat.
+    /// Stores one file's content durably. Safe to repeat.
     ///
     /// # Errors
     ///
     /// Fails if the content is larger than [`MAX_OBJECT_BYTES`] or the write fails.
     pub fn put(&self, raw: &[u8]) -> Result<BlobId> {
-        if raw.len() > MAX_OBJECT_BYTES {
-            return Err(Error::InvalidArgument(format!(
-                "blob is larger than {MAX_OBJECT_BYTES} bytes"
-            )));
-        }
-        let id = BlobId::of(raw);
-        let (dir, path) = self.location(id);
-        if path.exists() {
-            return Ok(id);
-        }
-        let compressed = zstd::bulk::compress(raw, 3)?;
-        // Write to a temp file, flush it to disk, then rename into place, so a
-        // reader never sees a partial blob and no metadata can point at a
-        // blob that a crash could lose.
-        let mut tmp = tempfile::NamedTempFile::new_in(&self.tmp)?;
-        tmp.write_all(&compressed)?;
-        tmp.as_file().sync_all()?;
-        fs::create_dir_all(dir)?;
-        tmp.persist(&path).map_err(|e| e.error)?;
+        let mut batch = self.batch();
+        let id = batch.put(raw)?;
+        batch.sync()?;
         Ok(id)
+    }
+
+    /// Starts a batch of writes that become durable together.
+    pub fn batch(&self) -> BlobBatch<'_> {
+        BlobBatch {
+            blobs: self,
+            dirs: BTreeSet::new(),
+        }
     }
 
     /// Reads a file's content and checks it against its ID.
@@ -197,4 +192,75 @@ impl Blobs {
         let path = dir.join(&hex[2..]);
         (dir, path)
     }
+}
+
+/// Blobs written but not yet durable. Call [`BlobBatch::sync`] before
+/// committing any metadata that names them.
+///
+/// Each blob is flushed to the drive when written (a plain `fsync`, cheap);
+/// `sync` then flushes the directories that changed and issues one full flush
+/// of the drive cache for the whole batch. On macOS a full flush
+/// (`F_FULLFSYNC`) costs about 3 ms, so one per batch, not one per blob, is
+/// what makes a large import fast.
+#[must_use = "blobs in a batch are not durable until `sync`"]
+pub struct BlobBatch<'a> {
+    blobs: &'a Blobs,
+    dirs: BTreeSet<PathBuf>,
+}
+
+impl BlobBatch<'_> {
+    /// Writes one blob. Safe to repeat.
+    ///
+    /// # Errors
+    ///
+    /// Fails if the content is larger than [`MAX_OBJECT_BYTES`] or the write fails.
+    pub fn put(&mut self, raw: &[u8]) -> Result<BlobId> {
+        if raw.len() > MAX_OBJECT_BYTES {
+            return Err(Error::InvalidArgument(format!(
+                "blob is larger than {MAX_OBJECT_BYTES} bytes"
+            )));
+        }
+        let id = BlobId::of(raw);
+        let (dir, path) = self.blobs.location(id);
+        // SHORTCUT: an existing file is trusted. After a power loss between a
+        // write and its batch's `sync`, a torn file can remain; reads detect
+        // it by hash. Upgrade: rewrite on a failed read.
+        if path.exists() {
+            return Ok(id);
+        }
+        let compressed = zstd::bulk::compress(raw, 3)?;
+        // Write a temp file and flush it before the rename, so the name never
+        // points at data that is not on the drive.
+        let mut tmp = tempfile::NamedTempFile::new_in(&self.blobs.tmp)?;
+        tmp.write_all(&compressed)?;
+        fsync(tmp.as_file())?;
+        fs::create_dir_all(&dir)?;
+        tmp.persist(&path).map_err(|e| e.error)?;
+        self.dirs.insert(dir);
+        Ok(id)
+    }
+
+    /// Makes every blob written in this batch durable.
+    ///
+    /// # Errors
+    ///
+    /// Fails if a flush fails.
+    pub fn sync(self) -> Result<()> {
+        if self.dirs.is_empty() {
+            return Ok(());
+        }
+        for dir in &self.dirs {
+            fsync(&fs::File::open(dir)?)?;
+        }
+        fsync(&fs::File::open(&self.blobs.root)?)?;
+        // One full flush of the drive cache covers everything above.
+        fs::File::open(&self.blobs.root)?.sync_all()?;
+        Ok(())
+    }
+}
+
+/// A plain `fsync`: data reaches the drive, not necessarily past its cache.
+/// (`File::sync_all` is a full cache flush on macOS, about 20x slower.)
+fn fsync(file: &fs::File) -> std::io::Result<()> {
+    rustix::fs::fsync(file).map_err(Into::into)
 }

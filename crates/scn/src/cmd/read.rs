@@ -1,15 +1,13 @@
 //! `cat`, `ls`, `log`, `show`.
 
-use std::borrow::Cow;
-use std::fmt::Write as _;
 use std::io::Write as _;
 
 use anyhow::{Context, Result, bail};
-use scion_core::{Changeset, ChangesetId, Entry, FileState, GitOid, IdentityTime, Tree};
+use scion_core::{Changeset, ChangesetId, Entry, FileState, IdentityTime, Tree};
 use scion_proto::v1::{GetChangesetRequest, ListDirRequest, LogRequest, ReadFileRequest};
 use serde_json::{Value, json};
 
-use crate::client::{Ctx, id_from, split_spec};
+use crate::client::{Ctx, id_from, lossy, split_spec};
 
 /// Prints a file's raw bytes. The content is printed as it is, also with
 /// `--json`.
@@ -186,13 +184,6 @@ fn decode_changeset(id: ChangesetId, bytes: &[u8]) -> Result<Changeset> {
     Ok(cs)
 }
 
-// SHORTCUT: names, paths and messages that are not UTF-8 print lossily, in
-// JSON too. Upgrade: add the exact bytes (for example base64) next to the
-// text when a consumer needs them.
-fn lossy(bytes: &[u8]) -> Cow<'_, str> {
-    String::from_utf8_lossy(bytes)
-}
-
 /// A git-style mode and a kind name.
 fn describe(entry: &Entry) -> (&'static str, &'static str) {
     match entry {
@@ -248,18 +239,7 @@ fn entry_json(entry: &Entry) -> Value {
         Entry::File(
             FileState::Regular { content: blob, .. } | FileState::Symlink { target: blob },
         ) => blob.to_string(),
-        Entry::File(FileState::Gitlink { commit }) => {
-            let bytes: &[u8] = match commit {
-                GitOid::Sha1(bytes) => bytes,
-                GitOid::Sha256(bytes) => bytes,
-            };
-            let mut hex = String::with_capacity(2 * bytes.len());
-            for b in bytes {
-                // Writing to a String cannot fail.
-                let _ = write!(hex, "{b:02x}");
-            }
-            hex
-        }
+        Entry::File(FileState::Gitlink { commit }) => commit.to_string(),
     };
     let mut value = json!({ "kind": describe(entry).1, "id": id });
     if let Entry::File(FileState::Regular { executable, .. }) = entry {

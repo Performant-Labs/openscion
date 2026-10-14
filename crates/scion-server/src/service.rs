@@ -14,6 +14,7 @@ use scion_proto::v1::{
     LogResponse, PutBlobRequest, PutBlobResponse, ReadFileRequest, ReadFileResponse,
     ResolveRefRequest, ResolveRefResponse,
 };
+use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_stream::{Stream, StreamExt};
@@ -26,10 +27,6 @@ use crate::land::{self, LandOutcome, LandState, Lands};
 use crate::store::{MAX_OBJECT_BYTES, Store};
 use crate::{read, write};
 
-/// Largest single gRPC message, in either direction.
-pub const MAX_MESSAGE_BYTES: usize = 64 << 20;
-/// Chunk size for streamed file content.
-const CHUNK_BYTES: usize = 1 << 20;
 /// Most changesets one `Log` call returns.
 const MAX_LOG: usize = 1000;
 
@@ -58,18 +55,14 @@ pub struct ScionService {
 }
 
 impl ScionService {
-    /// Serves `store`.
-    #[must_use]
-    pub fn new(store: Store) -> Self {
+    fn new(store: Store) -> Self {
         Self {
             store,
             lands: Arc::default(),
         }
     }
 
-    /// Wraps the service in a gRPC server with message size limits.
-    #[must_use]
-    pub fn into_server(self) -> ScionServer<Self> {
+    fn into_server(self) -> ScionServer<Self> {
         ScionServer::new(self)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES)
@@ -244,18 +237,14 @@ impl Scion for ScionService {
         let data = self
             .blocking(move |store| read::read_file(&store, &req.repo, id, &path))
             .await?;
-        // An empty file still sends one (empty) chunk.
-        let chunks: Vec<_> = if data.is_empty() {
-            vec![Ok(ReadFileResponse { data })]
-        } else {
-            data.chunks(CHUNK_BYTES)
-                .map(|chunk| {
-                    Ok(ReadFileResponse {
-                        data: chunk.to_vec(),
-                    })
+        let chunks: Vec<_> = data
+            .chunks(CHUNK_BYTES)
+            .map(|chunk| {
+                Ok(ReadFileResponse {
+                    data: chunk.to_vec(),
                 })
-                .collect()
-        };
+            })
+            .collect();
         Ok(Response::new(Box::pin(tokio_stream::iter(chunks))))
     }
 

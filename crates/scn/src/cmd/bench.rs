@@ -5,15 +5,30 @@
 //! change is there exactly once.
 
 use std::collections::{BTreeMap, HashSet};
-use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, ensure};
-use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
-use scion_proto::v1::{CreateChangesetRequest, LandRequest, LandState, LogRequest, PutBlobRequest};
+use scion_core::{Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
+use scion_proto::v1::{LandRequest, LandState, LogRequest};
 use serde_json::json;
 use tokio::task::JoinSet;
 
-use crate::client::{Ctx, id_from};
+use crate::client::{Ctx, id_from, now_unix_secs};
+
+/// Arguments of `scn bench`.
+#[derive(clap::Args)]
+pub struct BenchArgs {
+    /// Concurrent agents.
+    #[arg(long, default_value_t = 200)]
+    agents: usize,
+    /// Total lands across all agents.
+    #[arg(long, default_value_t = 10_000)]
+    lands: usize,
+    /// Each agent re-reads `main` before every change (fresh), or keeps the
+    /// base it started from (shared).
+    #[arg(long, value_enum, default_value_t = Base::Shared)]
+    base: Base,
+}
 
 /// How each agent picks its base.
 #[derive(Clone, Copy, Debug, clap::ValueEnum)]
@@ -36,7 +51,12 @@ struct Stats {
 }
 
 /// Runs the benchmark and prints throughput and latency.
-pub async fn bench(ctx: &Ctx, agents: usize, lands: usize, base: Base) -> Result<()> {
+pub async fn bench(ctx: &Ctx, args: BenchArgs) -> Result<()> {
+    let BenchArgs {
+        agents,
+        lands,
+        base,
+    } = args;
     ensure!(
         agents > 0 && lands > 0,
         "--agents and --lands must be positive"
@@ -47,8 +67,7 @@ pub async fn bench(ctx: &Ctx, agents: usize, lands: usize, base: Base) -> Result
     let mut tasks = JoinSet::new();
     for agent in 0..agents {
         let count = per_agent.min(lands.saturating_sub(agent * per_agent));
-        let ctx = ctx.clone();
-        tasks.spawn(run_agent(ctx, agent, count, start, base));
+        tasks.spawn(run_agent(ctx.clone(), agent, count, start, base));
     }
     let mut stats = Stats::default();
     while let Some(agent) = tasks.join_next().await {
@@ -60,8 +79,8 @@ pub async fn bench(ctx: &Ctx, agents: usize, lands: usize, base: Base) -> Result
         stats.total.extend(agent.total);
     }
     let elapsed = started.elapsed();
-    let on_main = verify(ctx.clone(), start, &stats.landed).await?;
-    report(ctx.json, agents, &mut stats, elapsed, on_main);
+    verify(ctx.clone(), start, &stats.landed).await?;
+    report(ctx.json, agents, &mut stats, elapsed);
     Ok(())
 }
 
@@ -79,12 +98,19 @@ async fn run_agent(
             Base::Shared => start,
             Base::Fresh => ctx.resolve("main").await?,
         };
-        let content = format!("agent {agent} change {i}\n");
-        let blob = upload(&mut ctx, content.as_bytes()).await?;
+        // Unique per run, so every run pays for new blobs and runs compare.
+        let blob = ctx
+            .put_blob(format!("run {start} agent {agent} change {i}\n").into_bytes())
+            .await?;
         let path = RepoPath::new(format!("bench/agent-{agent:04}/{i:06}.txt"))?;
         let changeset = Changeset {
             parents: vec![parent],
-            author: author(),
+            author: IdentityTime {
+                name: b"scn bench".to_vec(),
+                email: b"bench@localhost".to_vec(),
+                unix_secs: now_unix_secs()?,
+                tz_offset_minutes: 0,
+            },
             committer: None,
             message: format!("bench: agent {agent} change {i}\n").into_bytes(),
             changes: BTreeMap::from([(
@@ -95,16 +121,7 @@ async fn run_agent(
                 }),
             )]),
         };
-        let id: ChangesetId = id_from(
-            &ctx.client
-                .create_changeset(CreateChangesetRequest {
-                    repo: ctx.repo.clone(),
-                    changeset: changeset.encode(),
-                })
-                .await?
-                .into_inner()
-                .changeset_id,
-        )?;
+        let id = ctx.create_changeset(&changeset).await?;
         let landing = Instant::now();
         let reply = ctx
             .client
@@ -127,34 +144,9 @@ async fn run_agent(
     Ok(stats)
 }
 
-async fn upload(ctx: &mut Ctx, data: &[u8]) -> Result<BlobId> {
-    let request = PutBlobRequest {
-        repo: ctx.repo.clone(),
-        data: data.to_vec(),
-    };
-    let reply = ctx
-        .client
-        .put_blob(tokio_stream::iter([request]))
-        .await?
-        .into_inner();
-    id_from(&reply.blob_id)
-}
-
-fn author() -> IdentityTime {
-    let unix_secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX));
-    IdentityTime {
-        name: b"scn bench".to_vec(),
-        email: b"bench@localhost".to_vec(),
-        unix_secs,
-        tz_offset_minutes: 0,
-    }
-}
-
-/// Walks `main` back to `start` and checks that it holds exactly the landed
-/// changesets. Returns how many changesets were added to `main`.
-async fn verify(mut ctx: Ctx, start: ChangesetId, landed: &[ChangesetId]) -> Result<usize> {
+/// Walks `main` back to `start` and checks that it gained exactly the landed
+/// changesets, each once.
+async fn verify(mut ctx: Ctx, start: ChangesetId, landed: &[ChangesetId]) -> Result<()> {
     let mut cur = Some(ctx.resolve("main").await?);
     let mut history = HashSet::new();
     'walk: while let Some(from) = cur {
@@ -188,64 +180,52 @@ async fn verify(mut ctx: Ctx, start: ChangesetId, landed: &[ChangesetId]) -> Res
         history.len(),
         landed.len()
     );
-    Ok(history.len())
+    Ok(())
 }
 
-fn percentile(sorted: &[Duration], p: f64) -> Duration {
-    if sorted.is_empty() {
-        return Duration::ZERO;
-    }
-    #[allow(
-        clippy::cast_possible_truncation,
-        clippy::cast_sign_loss,
-        clippy::cast_precision_loss
-    )]
-    let rank = ((sorted.len() - 1) as f64 * p).round() as usize;
-    sorted[rank]
+/// Percentiles of `sorted`, in milliseconds.
+fn percentiles_ms(sorted: &[Duration]) -> [f64; 3] {
+    let at = |p: f64| {
+        #[allow(
+            clippy::cast_possible_truncation,
+            clippy::cast_sign_loss,
+            clippy::cast_precision_loss
+        )]
+        let rank = ((sorted.len().saturating_sub(1)) as f64 * p).round() as usize;
+        sorted.get(rank).map_or(0.0, |d| d.as_secs_f64() * 1000.0)
+    };
+    [at(0.50), at(0.99), at(1.0)]
 }
 
-fn report(json: bool, agents: usize, stats: &mut Stats, elapsed: Duration, on_main: usize) {
+fn report(json: bool, agents: usize, stats: &mut Stats, elapsed: Duration) {
     stats.land.sort();
     stats.total.sort();
-    let ms = |d: Duration| d.as_secs_f64() * 1000.0;
+    let [land_p50, land_p99, land_max] = percentiles_ms(&stats.land);
+    let [total_p50, total_p99, _] = percentiles_ms(&stats.total);
+    let landed = stats.landed.len();
     #[allow(clippy::cast_precision_loss)]
-    let rate = stats.landed.len() as f64 / elapsed.as_secs_f64();
-    let (p50, p99, max) = (
-        percentile(&stats.land, 0.50),
-        percentile(&stats.land, 0.99),
-        stats.land.last().copied().unwrap_or_default(),
-    );
+    let rate = landed as f64 / elapsed.as_secs_f64();
     if json {
         let out = json!({
             "agents": agents,
-            "landed": stats.landed.len(),
+            "landed": landed,
             "conflicts": stats.conflicts,
             "rejected": stats.rejected,
             "seconds": elapsed.as_secs_f64(),
             "lands_per_second": rate,
-            "land_ms": { "p50": ms(p50), "p99": ms(p99), "max": ms(max) },
-            "end_to_end_ms": { "p50": ms(percentile(&stats.total, 0.50)), "p99": ms(percentile(&stats.total, 0.99)) },
-            "verified_on_main": on_main,
+            "land_ms": { "p50": land_p50, "p99": land_p99, "max": land_max },
+            "end_to_end_ms": { "p50": total_p50, "p99": total_p99 },
+            "verified_on_main": true,
         });
         println!("{out}");
         return;
     }
     println!(
-        "{} lands by {agents} agents in {:.1} s: {rate:.0} lands/s",
-        stats.landed.len(),
+        "{landed} lands by {agents} agents in {:.1} s: {rate:.0} lands/s",
         elapsed.as_secs_f64()
     );
     println!("conflicts {}, rejected {}", stats.conflicts, stats.rejected);
-    println!(
-        "land RPC     p50 {:.1} ms  p99 {:.1} ms  max {:.1} ms",
-        ms(p50),
-        ms(p99),
-        ms(max)
-    );
-    println!(
-        "end to end   p50 {:.1} ms  p99 {:.1} ms  (upload + create + land)",
-        ms(percentile(&stats.total, 0.50)),
-        ms(percentile(&stats.total, 0.99))
-    );
-    println!("verified: main gained exactly the {on_main} landed changesets");
+    println!("land RPC     p50 {land_p50:.1} ms  p99 {land_p99:.1} ms  max {land_max:.1} ms");
+    println!("end to end   p50 {total_p50:.1} ms  p99 {total_p99:.1} ms  (upload + create + land)");
+    println!("verified: main gained exactly the {landed} landed changesets");
 }

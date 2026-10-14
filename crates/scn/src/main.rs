@@ -3,7 +3,6 @@
 mod client;
 mod cmd;
 
-use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
@@ -22,13 +21,7 @@ struct Cli {
     )]
     server: String,
     /// Bearer token for the server.
-    #[arg(
-        long,
-        env = "SCION_TOKEN",
-        hide_env_values = true,
-        global = true,
-        default_value = ""
-    )]
+    #[arg(long, env = "SCION_TOKEN", hide_env_values = true)]
     token: String,
     /// Repository name.
     #[arg(long, env = "SCION_REPO", default_value = "main", global = true)]
@@ -67,51 +60,11 @@ enum Command {
         rev: String,
     },
     /// Create a changeset on the server. Moves no ref; use `scn land` next.
-    Commit {
-        /// Base: ref name or changeset ID.
-        #[arg(long, default_value = "main")]
-        base: String,
-        /// Commit message.
-        #[arg(short, long)]
-        message: String,
-        /// `PATH=FILE`: put the content of local FILE at PATH. Repeatable.
-        #[arg(long = "put", value_name = "PATH=FILE")]
-        puts: Vec<String>,
-        /// Mark the put files executable.
-        #[arg(long)]
-        executable: bool,
-        /// PATH to delete. Repeatable.
-        #[arg(long = "delete", value_name = "PATH")]
-        deletes: Vec<String>,
-        /// Author as `Name <email>`.
-        #[arg(long, env = "SCION_AUTHOR", default_value = "scn <scn@localhost>")]
-        author: String,
-    },
+    Commit(cmd::commit::CommitArgs),
     /// Rebase a changeset onto a ref and move the ref.
-    Land {
-        /// Changeset ID.
-        changeset: String,
-        /// Ref to move.
-        #[arg(long, default_value = "main")]
-        onto: String,
-        /// Retry key. Defaults to the changeset ID and ref, so a retry of the
-        /// same land is safe.
-        #[arg(long)]
-        request_id: Option<String>,
-    },
+    Land(cmd::land::LandArgs),
     /// Many agents commit and land at the same time; print throughput.
-    Bench {
-        /// Concurrent agents.
-        #[arg(long, default_value_t = 200)]
-        agents: usize,
-        /// Total lands across all agents.
-        #[arg(long, default_value_t = 10_000)]
-        lands: usize,
-        /// Each agent re-reads `main` before every change (fresh base),
-        /// or keeps the base it started from (shared base).
-        #[arg(long, value_enum, default_value_t = cmd::bench::Base::Shared)]
-        base: cmd::bench::Base,
-    },
+    Bench(cmd::bench::BenchArgs),
 }
 
 #[tokio::main]
@@ -133,32 +86,8 @@ async fn run(cli: Cli) -> anyhow::Result<()> {
         Command::Ls { spec } => cmd::read::ls(&mut ctx, &spec).await,
         Command::Log { rev, limit } => cmd::read::log(&mut ctx, &rev, limit).await,
         Command::Show { rev } => cmd::read::show(&mut ctx, &rev).await,
-        Command::Commit {
-            base,
-            message,
-            puts,
-            executable,
-            deletes,
-            author,
-        } => {
-            let puts = puts
-                .iter()
-                .map(|p| cmd::commit::parse_put(p))
-                .collect::<anyhow::Result<Vec<(String, PathBuf)>>>()?;
-            cmd::commit::commit(
-                &mut ctx, &base, &message, &puts, executable, &deletes, &author,
-            )
-            .await
-        }
-        Command::Land {
-            changeset,
-            onto,
-            request_id,
-        } => cmd::land::land(&mut ctx, &changeset, &onto, request_id).await,
-        Command::Bench {
-            agents,
-            lands,
-            base,
-        } => cmd::bench::bench(&ctx, agents, lands, base).await,
+        Command::Commit(args) => cmd::commit::commit(&mut ctx, args).await,
+        Command::Land(args) => cmd::land::land(&mut ctx, args).await,
+        Command::Bench(args) => cmd::bench::bench(&ctx, args).await,
     }
 }

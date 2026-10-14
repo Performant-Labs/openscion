@@ -5,26 +5,37 @@ use scion_core::ChangesetId;
 use scion_proto::v1::{LandRequest, LandResponse, LandState};
 use serde_json::json;
 
-use crate::client::{Ctx, id_from};
+use crate::client::{Ctx, id_from, lossy};
+
+/// Arguments of `scn land`.
+#[derive(clap::Args)]
+pub struct LandArgs {
+    /// Changeset ID.
+    changeset: ChangesetId,
+    /// Ref to move.
+    #[arg(long, default_value = "main")]
+    onto: String,
+    /// Retry key. Defaults to the changeset ID and ref, so a retry of the
+    /// same land is safe.
+    #[arg(long)]
+    request_id: Option<String>,
+}
 
 /// Lands a changeset and prints the outcome. Fails unless it landed, so a
 /// script or an agent can branch on the exit code.
-pub async fn land(
-    ctx: &mut Ctx,
-    changeset: &str,
-    onto: &str,
-    request_id: Option<String>,
-) -> Result<()> {
-    let id: ChangesetId = changeset
-        .parse()
-        .context("changeset must be a 64-digit changeset ID")?;
+pub async fn land(ctx: &mut Ctx, args: LandArgs) -> Result<()> {
+    let LandArgs {
+        changeset: id,
+        onto,
+        request_id,
+    } = args;
     let request_key = request_id.unwrap_or_else(|| format!("{id}:{onto}"));
     let reply = ctx
         .client
         .land(LandRequest {
             repo: ctx.repo.clone(),
             changeset_id: id.as_bytes().to_vec(),
-            target_ref: onto.to_owned(),
+            target_ref: onto,
             request_key,
         })
         .await
@@ -51,7 +62,7 @@ fn print_outcome(json: bool, reply: &LandResponse) -> Result<()> {
     let paths: Vec<String> = reply
         .conflict_paths
         .iter()
-        .map(|p| String::from_utf8_lossy(p).into_owned())
+        .map(|p| lossy(p).into_owned())
         .collect();
     if json {
         let out = json!({

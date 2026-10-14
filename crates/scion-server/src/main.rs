@@ -5,11 +5,8 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use scion_server::Store;
-use scion_server::auth::Auth;
 use scion_server::import::{ImportOptions, import_git};
-use scion_server::service::ScionService;
-use tonic::service::interceptor::InterceptedService;
+use scion_server::{Store, service};
 use tracing_subscriber::EnvFilter;
 
 #[derive(Parser)]
@@ -64,15 +61,14 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Serve { listen, token } => {
             anyhow::ensure!(!token.is_empty(), "--token must not be empty");
-            let service =
-                InterceptedService::new(ScionService::new(store).into_server(), Auth::new(&token));
+            let listener = tokio::net::TcpListener::bind(listen)
+                .await
+                .with_context(|| format!("cannot listen on {listen}"))?;
             tracing::info!(%listen, "serving");
-            tonic::transport::Server::builder()
-                .add_service(service)
-                .serve_with_shutdown(listen, async {
-                    tokio::signal::ctrl_c().await.ok();
-                })
-                .await?;
+            service::serve(store, listener, &token, async {
+                tokio::signal::ctrl_c().await.ok();
+            })
+            .await?;
         }
         Command::Import {
             repo,

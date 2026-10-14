@@ -22,7 +22,7 @@ use scion_core::{
 
 use crate::db::{self, RepoId};
 use crate::error::{Error, Result};
-use crate::store::Store;
+use crate::store::{BlobBatch, Store};
 use crate::tree;
 
 /// `git_import.git_algo` for SHA-1 object names.
@@ -104,7 +104,6 @@ pub fn import_git(
 
     let mut importer = Importer {
         git: &git,
-        store,
         blobs: HashMap::new(),
     };
     let mut checker = Checker {
@@ -115,13 +114,16 @@ pub fn import_git(
     };
     let mut done = 0;
     for batch in plan.todo.chunks(BATCH) {
-        // Blobs go to disk first, so no stored metadata points at a missing blob.
+        // Blobs are made durable first, so no stored metadata points at a
+        // blob that a crash could lose.
+        let mut blobs = store.blobs().batch();
         let mut prepared = Vec::with_capacity(batch.len());
         for &commit in batch {
-            let (cs, git_tree) = importer.changeset(commit, &known)?;
+            let (cs, git_tree) = importer.changeset(commit, &known, &mut blobs)?;
             known.insert(commit, cs.id());
             prepared.push((commit, cs, git_tree));
         }
+        blobs.sync()?;
         store.write(|c| {
             for (commit, cs, git_tree) in &prepared {
                 let root = record(c, repo_id, *commit, cs)?;
@@ -144,7 +146,7 @@ pub fn import_git(
     let tip = known
         .get(&tip)
         .copied()
-        .ok_or_else(|| Error::Git(format!("commit {tip} was not imported")))?;
+        .ok_or_else(|| Error::Corrupt(format!("commit {tip} was not imported")))?;
     store.write(|c| point_ref(c, repo_id, &opts.target_ref, tip))?;
     // Every planned check ran, or the import failed above.
     let report = ImportReport {
@@ -250,24 +252,17 @@ fn plan(
 /// Stores one changeset, its git mapping and its root tree. Returns the root
 /// tree.
 fn record(c: &Connection, repo: RepoId, commit: ObjectId, cs: &Changeset) -> Result<TreeId> {
-    let id = db::insert_changeset(c, repo, cs)?;
-    c.prepare_cached(
-        "INSERT OR IGNORE INTO git_import (repo_id, git_algo, git_oid, cs)
-         VALUES (?1, ?2, ?3, ?4)",
-    )?
-    .execute(params![repo.0, SHA1, commit.as_slice(), id.as_bytes()])?;
-    let base = cs
-        .parents
-        .first()
-        .map(|parent| tree::derive_root_tree(c, repo, *parent))
-        .transpose()?;
-    let root = tree::apply(c, base, &cs.changes).map_err(|e| match e {
+    let (id, root) = tree::store_changeset(c, repo, cs).map_err(|e| match e {
         Error::Apply(e) => Error::Corrupt(format!(
             "commit {commit}: changes do not apply to the first parent: {e}"
         )),
         other => other,
     })?;
-    tree::record_root_tree(c, id, root)?;
+    c.prepare_cached(
+        "INSERT OR IGNORE INTO git_import (repo_id, git_algo, git_oid, cs)
+         VALUES (?1, ?2, ?3, ?4)",
+    )?
+    .execute(params![repo.0, SHA1, commit.as_slice(), id.as_bytes()])?;
     Ok(root)
 }
 
@@ -310,7 +305,6 @@ fn point_ref(c: &Connection, repo: RepoId, name: &str, tip: ChangesetId) -> Resu
 /// Turns git commits into changesets.
 struct Importer<'a> {
     git: &'a gix::Repository,
-    store: &'a Store,
     /// Blobs stored in this run, so each is read from git once.
     // SHORTCUT: grows with every distinct blob in the history (about 100
     // bytes each, so 1M blobs take about 100 MB). Upgrade: a bounded LRU; a
@@ -319,12 +313,13 @@ struct Importer<'a> {
 }
 
 impl Importer<'_> {
-    /// Builds the changeset for `commit` and stores its new blobs. Returns it
-    /// with the commit's git tree. Every parent must be in `known`.
+    /// Builds the changeset for `commit` and writes its new blobs to `batch`.
+    /// Returns it with the commit's git tree. Every parent must be in `known`.
     fn changeset(
         &mut self,
         commit: ObjectId,
         known: &HashMap<ObjectId, ChangesetId>,
+        batch: &mut BlobBatch<'_>,
     ) -> Result<(Changeset, ObjectId)> {
         let git = self.git;
         let object = find_commit(git, commit)?;
@@ -357,7 +352,7 @@ impl Importer<'_> {
             author: identity(commit, "author", decoded.author())?,
             committer: Some(identity(commit, "committer", decoded.committer())?),
             message: decoded.message.to_vec(),
-            changes: self.diff(commit, base, git_tree)?,
+            changes: self.diff(commit, base, git_tree, batch)?,
         };
         Ok((changeset, git_tree))
     }
@@ -369,6 +364,7 @@ impl Importer<'_> {
         commit: ObjectId,
         from: Option<ObjectId>,
         to: ObjectId,
+        batch: &mut BlobBatch<'_>,
     ) -> Result<BTreeMap<RepoPath, Option<FileState>>> {
         let mut changes = BTreeMap::new();
         // (directory path, tree before, tree after). `None` is a directory
@@ -393,7 +389,7 @@ impl Importer<'_> {
                 // delete first, so a file can become a directory and back.
                 match (before, after) {
                     (_, Some(GitEntry::File(kind, id))) => {
-                        let state = file_state(*kind, *id, |id| self.blob(id))?;
+                        let state = file_state(*kind, *id, |id| self.blob(id, batch))?;
                         changes.insert(path, Some(state));
                     }
                     (Some(GitEntry::File(..)), _) => {
@@ -406,10 +402,10 @@ impl Importer<'_> {
         Ok(changes)
     }
 
-    /// Stores a git blob and returns its Scion ID.
-    fn blob(&mut self, oid: ObjectId) -> Result<BlobId> {
+    /// Writes a git blob to `batch` and returns its Scion ID.
+    fn blob(&mut self, oid: ObjectId, batch: &mut BlobBatch<'_>) -> Result<BlobId> {
         cached(&mut self.blobs, oid, || {
-            self.store.blobs().put(&read_blob(self.git, oid)?.data)
+            batch.put(&read_blob(self.git, oid)?.data)
         })
     }
 }
@@ -462,9 +458,8 @@ impl Checker<'_> {
                         if expected != *state {
                             return Err(differs(format!("git {expected:?}, Scion {state:?}")));
                         }
-                        if let FileState::Regular { content: blob, .. }
-                        | FileState::Symlink { target: blob } = state
-                            && !self.store.blobs().contains(*blob)
+                        if let Some(blob) = state.blob()
+                            && !self.store.blobs().contains(blob)
                         {
                             return Err(differs(format!("blob {blob} is not stored")));
                         }

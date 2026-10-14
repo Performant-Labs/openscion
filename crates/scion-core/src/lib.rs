@@ -68,6 +68,26 @@ pub enum GitOid {
     Sha256([u8; 32]),
 }
 
+impl GitOid {
+    /// The raw object name bytes.
+    #[must_use]
+    pub fn as_bytes(&self) -> &[u8] {
+        match self {
+            Self::Sha1(oid) => oid,
+            Self::Sha256(oid) => oid,
+        }
+    }
+}
+
+/// Lowercase hex, as git prints it.
+impl std::fmt::Display for GitOid {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_bytes()
+            .iter()
+            .try_for_each(|b| write!(f, "{b:02x}"))
+    }
+}
+
 /// What a path holds when it is not a directory.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum FileState {
@@ -88,6 +108,17 @@ pub enum FileState {
         /// The submodule commit.
         commit: GitOid,
     },
+}
+
+impl FileState {
+    /// The blob this state points at. A gitlink has none.
+    #[must_use]
+    pub fn blob(&self) -> Option<BlobId> {
+        match self {
+            Self::Regular { content: blob, .. } | Self::Symlink { target: blob } => Some(*blob),
+            Self::Gitlink { .. } => None,
+        }
+    }
 }
 
 /// One commit, stored as the files that changed relative to its first parent.

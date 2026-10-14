@@ -7,7 +7,7 @@
 use std::collections::BTreeMap;
 
 use rusqlite::Connection;
-use scion_core::{ChangesetId, Entry, FileState, PathElem, RepoPath, Tree, TreeId};
+use scion_core::{Changeset, ChangesetId, Entry, FileState, PathElem, RepoPath, Tree, TreeId};
 
 use crate::db::{self, RepoId};
 use crate::error::{ApplyError, Error, Result};
@@ -71,7 +71,7 @@ pub fn lookup(c: &Connection, root: TreeId, path: &RepoPath) -> Result<Option<En
 /// stored changeset does not apply to its parent tree.
 pub fn root_tree(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
     let known = store.read(|c| {
-        db::generation(c, repo, cs)?;
+        require(c, repo, cs)?;
         db::get_derived(c, ROOT_TREE, ROOT_TREE_VERSION, cs)
     })?;
     match known {
@@ -91,6 +91,9 @@ pub fn root_tree(store: &Store, repo: RepoId, cs: ChangesetId) -> Result<TreeId>
 /// [`Error::NotFound`] if `repo` does not have `cs`. [`Error::Corrupt`] if a
 /// stored changeset does not apply to its parent tree.
 pub fn derive_root_tree(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result<TreeId> {
+    // Derived data is keyed by changeset alone, so check the repo here: a
+    // cached tree must not leak to a repo that cannot see the changeset.
+    require(c, repo, cs)?;
     let mut pending = Vec::new();
     let mut cur = Some(cs);
     let mut base = None;
@@ -108,20 +111,43 @@ pub fn derive_root_tree(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result
             Error::Apply(e) => Error::Corrupt(format!("stored changeset {id} does not apply: {e}")),
             other => other,
         })?;
-        record_root_tree(c, id, tree)?;
+        db::put_derived(c, ROOT_TREE, ROOT_TREE_VERSION, id, *tree.as_bytes())?;
         base = Some(tree);
     }
     base.ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
 }
 
-/// Records the root tree of a changeset computed elsewhere (for example by a
-/// land, which applies the changes to check them anyway).
+/// Stores a changeset in `repo` with its root tree: the first parent's tree
+/// plus the changes. Every parent must be in `repo`. Safe to repeat. This is
+/// the one write path for changesets, used by commits, lands and imports.
 ///
 /// # Errors
 ///
-/// [`Error::Corrupt`] if a different tree is already recorded.
-pub fn record_root_tree(c: &Connection, cs: ChangesetId, tree: TreeId) -> Result<()> {
-    db::put_derived(c, ROOT_TREE, ROOT_TREE_VERSION, cs, *tree.as_bytes())
+/// [`Error::Apply`] if the changes do not apply to the first parent's tree;
+/// callers decide whether that is the client's fault or corruption.
+/// [`Error::NotFound`] if a parent is not in `repo`.
+pub fn store_changeset(
+    c: &Connection,
+    repo: RepoId,
+    cs: &Changeset,
+) -> Result<(ChangesetId, TreeId)> {
+    let base = cs
+        .parents
+        .first()
+        .map(|&parent| derive_root_tree(c, repo, parent))
+        .transpose()?;
+    let tree = apply(c, base, &cs.changes)?;
+    let id = db::insert_changeset(c, repo, cs)?;
+    db::put_derived(c, ROOT_TREE, ROOT_TREE_VERSION, id, *tree.as_bytes())?;
+    Ok((id, tree))
+}
+
+fn require(c: &Connection, repo: RepoId, cs: ChangesetId) -> Result<()> {
+    if db::has_changeset(c, repo, cs)? {
+        Ok(())
+    } else {
+        Err(Error::NotFound(format!("changeset {cs}")))
+    }
 }
 
 fn parts(path: &RepoPath) -> Vec<PathElem> {

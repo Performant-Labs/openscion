@@ -2,6 +2,7 @@
 //! against an in-process server.
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
+use scion_proto::CHUNK_BYTES;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ReadFileRequest};
 use scion_server::{Store, db, service};
@@ -13,7 +14,6 @@ use tonic::{Code, Request, Status};
 
 const REPO: &str = "main";
 const TOKEN: &str = "secret";
-const CHUNK_BYTES: usize = 1 << 20;
 
 fn changeset(parents: Vec<ChangesetId>, path: &str, state: Option<FileState>) -> Changeset {
     Changeset {

@@ -1,34 +1,33 @@
 //! Connection to the server, plus helpers every command shares.
 
+use std::borrow::Cow;
+use std::time::{SystemTime, UNIX_EPOCH};
+
 use anyhow::{Context, Result, bail};
-use scion_core::{ChangesetId, RepoPath};
-use scion_proto::v1::ResolveRefRequest;
+use scion_core::{BlobId, Changeset, ChangesetId, RepoPath};
 use scion_proto::v1::scion_client::ScionClient;
-use tonic::metadata::MetadataValue;
+use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ResolveRefRequest};
+use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES};
+use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
-
-/// Largest single gRPC message the client accepts.
-const MAX_MESSAGE_BYTES: usize = 64 << 20;
 
 /// A connected client.
 pub type Client = ScionClient<InterceptedService<Channel, Bearer>>;
 
 /// Adds the bearer token to every request.
 #[derive(Clone)]
-pub struct Bearer(Option<MetadataValue<tonic::metadata::Ascii>>);
+pub struct Bearer(MetadataValue<Ascii>);
 
 impl Interceptor for Bearer {
     fn call(
         &mut self,
         mut request: tonic::Request<()>,
     ) -> Result<tonic::Request<()>, tonic::Status> {
-        if let Some(value) = &self.0 {
-            request
-                .metadata_mut()
-                .insert("authorization", value.clone());
-        }
+        request
+            .metadata_mut()
+            .insert("authorization", self.0.clone());
         Ok(request)
     }
 }
@@ -52,15 +51,9 @@ impl Ctx {
             .connect()
             .await
             .with_context(|| format!("cannot connect to {server}"))?;
-        let bearer = if token.is_empty() {
-            None
-        } else {
-            Some(
-                format!("Bearer {token}")
-                    .parse()
-                    .context("token is not valid ASCII")?,
-            )
-        };
+        let bearer = format!("Bearer {token}")
+            .parse()
+            .context("token is not valid ASCII")?;
         let client = ScionClient::with_interceptor(channel, Bearer(bearer))
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -83,6 +76,41 @@ impl Ctx {
             .into_inner();
         id_from(&reply.changeset_id)
     }
+
+    /// Uploads one file's content in chunks. The first message names the repo;
+    /// an empty file still sends one (empty) message.
+    pub async fn put_blob(&mut self, data: Vec<u8>) -> Result<BlobId> {
+        let repo = self.repo.clone();
+        let messages = data.len().div_ceil(CHUNK_BYTES).max(1);
+        // Copies one chunk at a time, when the stream asks for it.
+        let requests = (0..messages).map(move |i| {
+            let end = data.len().min((i + 1) * CHUNK_BYTES);
+            PutBlobRequest {
+                repo: if i == 0 { repo.clone() } else { String::new() },
+                data: data[i * CHUNK_BYTES..end].to_vec(),
+            }
+        });
+        let reply = self
+            .client
+            .put_blob(tokio_stream::iter(requests))
+            .await?
+            .into_inner();
+        id_from(&reply.blob_id)
+    }
+
+    /// Stores a changeset on the server. Moves no ref.
+    pub async fn create_changeset(&mut self, changeset: &Changeset) -> Result<ChangesetId> {
+        let reply = self
+            .client
+            .create_changeset(CreateChangesetRequest {
+                repo: self.repo.clone(),
+                changeset: changeset.encode(),
+            })
+            .await
+            .context("cannot create the changeset")?
+            .into_inner();
+        id_from(&reply.changeset_id)
+    }
 }
 
 /// Parses 32 raw ID bytes from a reply.
@@ -100,4 +128,20 @@ pub fn split_spec(spec: &str) -> Result<(&str, Option<RepoPath>)> {
             Err(e) => bail!("bad path {path:?}: {e}"),
         },
     }
+}
+
+/// Raw bytes as text for display.
+// SHORTCUT: lossy, also in JSON output, so non-UTF-8 names and messages print
+// with replacement characters. Upgrade: escape or base64 raw bytes in JSON.
+pub fn lossy(bytes: &[u8]) -> Cow<'_, str> {
+    String::from_utf8_lossy(bytes)
+}
+
+/// Seconds since the Unix epoch.
+pub fn now_unix_secs() -> Result<i64> {
+    let secs = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .context("the system clock is before 1970")?
+        .as_secs();
+    i64::try_from(secs).context("the system clock is too far in the future")
 }

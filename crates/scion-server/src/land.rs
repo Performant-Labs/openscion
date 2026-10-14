@@ -15,7 +15,7 @@
 //! landed one (a retry returns it). The ref and the row move in the same
 //! transaction, so they never disagree.
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::sync::{Arc, Mutex, PoisonError};
 
 use rusqlite::{Connection, OptionalExtension, params};
@@ -231,23 +231,51 @@ fn load(c: &Connection, repo: RepoId, land_id: i64) -> Result<LandOutcome> {
     })
 }
 
-/// Marks a pending land as conflict or rejected.
-fn settle(
-    store: &Store,
+/// Moves a pending land to its final state and returns the outcome.
+fn set_state(
+    c: &Connection,
     repo: RepoId,
     land_id: i64,
     state: LandState,
-    detail: &str,
-    paths: &[RepoPath],
+    result: Option<ChangesetId>,
+    detail: String,
+    conflict_paths: Vec<RepoPath>,
 ) -> Result<LandOutcome> {
-    store.write(|c| {
-        c.execute(
-            "UPDATE lands SET state = ?3, detail = ?4, conflict_paths = ?5
+    let updated = c
+        .prepare_cached(
+            "UPDATE lands SET state = ?3, result_cs = ?4, detail = ?5, conflict_paths = ?6
              WHERE repo_id = ?1 AND land_id = ?2 AND state = 'pending'",
-            params![repo.0, land_id, state.as_str(), detail, encode_paths(paths)],
-        )?;
-        load(c, repo, land_id)
+        )?
+        .execute(params![
+            repo.0,
+            land_id,
+            state.as_str(),
+            result.as_ref().map(ChangesetId::as_bytes),
+            detail,
+            encode_paths(&conflict_paths)
+        ])?;
+    if updated != 1 {
+        return Err(Error::Corrupt(format!(
+            "land {land_id} is no longer pending"
+        )));
+    }
+    Ok(LandOutcome {
+        land_id,
+        state,
+        result,
+        detail,
+        conflict_paths,
     })
+}
+
+/// What step 4 decided.
+enum Plan {
+    Reject(String),
+    Conflict(String, Vec<RepoPath>),
+    Land {
+        rebased: Changeset,
+        head: db::RefState,
+    },
 }
 
 /// Runs steps 4 and 5 for a pending land. The caller holds the ref's lock.
@@ -258,83 +286,85 @@ fn finish(
     req: &LandRequest,
     index: &mut Option<PathIndex>,
 ) -> Result<LandOutcome> {
-    let reject = |detail: &str| settle(store, repo, land_id, LandState::Rejected, detail, &[]);
+    let target = &req.target_ref;
+    let plan = store.read(|c| {
+        let cs = db::get_changeset(c, repo, req.changeset)?;
+        let [base] = cs.parents[..] else {
+            return Ok(Plan::Reject(
+                "a land needs a changeset with exactly one parent".into(),
+            ));
+        };
+        let Some(head) = db::get_ref(c, repo, target)? else {
+            return Ok(Plan::Reject(format!("ref {target:?} does not exist")));
+        };
+        let index = index.get_or_insert_with(|| PathIndex::new(head.target));
+        index.advance_to(c, repo, head.target)?;
+        let Some(base_gen) = index.reach(c, repo, base)? else {
+            return Ok(Plan::Reject(format!(
+                "base {base} is not on the first-parent history of {target:?}"
+            )));
+        };
+        let conflicts = index.conflicts(&cs.changes, base_gen);
+        if !conflicts.is_empty() {
+            let detail = format!(
+                "{} path(s) changed on {target:?} after the base",
+                conflicts.len()
+            );
+            return Ok(Plan::Conflict(detail, conflicts));
+        }
+        let rebased = Changeset {
+            parents: vec![head.target],
+            ..cs
+        };
+        Ok(Plan::Land { rebased, head })
+    })?;
+    let (rebased, head) = match plan {
+        Plan::Reject(detail) => {
+            return store
+                .write(|c| set_state(c, repo, land_id, LandState::Rejected, None, detail, vec![]));
+        }
+        Plan::Conflict(detail, paths) => {
+            return store
+                .write(|c| set_state(c, repo, land_id, LandState::Conflict, None, detail, paths));
+        }
+        Plan::Land { rebased, head } => (rebased, head),
+    };
 
-    let cs = store.read(|c| db::get_changeset(c, repo, req.changeset))?;
-    let [base] = cs.parents[..] else {
-        return reject("a land needs a changeset with exactly one parent");
-    };
-    let Some(head) = store.read(|c| db::get_ref(c, repo, &req.target_ref))? else {
-        return reject(&format!("ref {:?} does not exist", req.target_ref));
-    };
-
-    let index = index.get_or_insert_with(|| PathIndex::new(head.target));
-    store.read(|c| index.advance_to(c, repo, head.target))?;
-    let Some(base_gen) = store.read(|c| index.reach(c, repo, base))? else {
-        return reject(&format!(
-            "base {base} is not on the first-parent history of {:?}",
-            req.target_ref
-        ));
-    };
-    let conflicts = index.conflicts(&cs.changes, base_gen);
-    if !conflicts.is_empty() {
-        let detail = format!(
-            "{} path(s) changed on {:?} after the base",
-            conflicts.len(),
-            req.target_ref
-        );
-        return settle(
-            store,
+    let landed = store.write(|c| {
+        let (id, _) = tree::store_changeset(c, repo, &rebased)?;
+        if !db::cas_ref(c, repo, target, Some(head.version), id)? {
+            return Err(Error::Corrupt(format!(
+                "ref {target:?} moved while its land lock was held"
+            )));
+        }
+        let generation = db::generation(c, repo, id)?;
+        let outcome = set_state(
+            c,
             repo,
             land_id,
-            LandState::Conflict,
-            &detail,
-            &conflicts,
-        );
-    }
-
-    let rebased = Changeset {
-        parents: vec![head.target],
-        ..cs
-    };
-    let landed = store.write(|c| {
-        let head_tree = tree::derive_root_tree(c, repo, head.target)?;
-        let tree = match tree::apply(c, Some(head_tree), &rebased.changes) {
-            Ok(tree) => tree,
-            Err(Error::Apply(e)) => return Ok(Err(e)),
-            Err(e) => return Err(e),
-        };
-        let id = db::insert_changeset(c, repo, &rebased)?;
-        tree::record_root_tree(c, id, tree)?;
-        if !db::cas_ref(c, repo, &req.target_ref, Some(head.version), id)? {
-            return Err(Error::Corrupt(format!(
-                "ref {:?} moved while its land lock was held",
-                req.target_ref
-            )));
-        }
-        let updated = c.execute(
-            "UPDATE lands SET state = 'landed', result_cs = ?3
-             WHERE repo_id = ?1 AND land_id = ?2 AND state = 'pending'",
-            params![repo.0, land_id, id.as_bytes()],
+            LandState::Landed,
+            Some(id),
+            String::new(),
+            vec![],
         )?;
-        if updated != 1 {
-            return Err(Error::Corrupt(format!(
-                "land {land_id} is no longer pending"
-            )));
-        }
-        Ok(Ok(id))
-    })?;
+        Ok((outcome, generation))
+    });
     match landed {
-        Ok(id) => {
-            let generation = store.read(|c| db::generation(c, repo, id))?;
-            index.record(id, generation, &rebased.changes);
-            tracing::info!(land_id, %id, target = %req.target_ref, "landed");
-            store.read(|c| load(c, repo, land_id))
+        Ok((outcome, generation)) => {
+            if let (Some(index), Some(id)) = (index.as_mut(), outcome.result) {
+                index.record(id, generation, &rebased.changes);
+            }
+            tracing::info!(land_id, id = ?outcome.result, target = %target, "landed");
+            Ok(outcome)
         }
-        Err(e) => {
-            let detail = format!("does not apply to {:?}: {e}", req.target_ref);
-            settle(store, repo, land_id, LandState::Conflict, &detail, &[])
+        // The path check passed, but the changes still clash with the head's
+        // tree (for example a delete of a file the head never had). The
+        // transaction rolled back; record the conflict.
+        Err(Error::Apply(e)) => {
+            let detail = format!("does not apply to {target:?}: {e}");
+            store.write(|c| set_state(c, repo, land_id, LandState::Conflict, None, detail, vec![]))
         }
+        Err(e) => Err(e),
     }
 }
 
@@ -352,8 +382,8 @@ fn finish(
 struct PathIndex {
     tip: ChangesetId,
     floor: ChangesetId,
-    /// Changesets on the indexed history, by generation.
-    by_gen: HashMap<i64, ChangesetId>,
+    /// Changesets on the indexed history.
+    chain: HashSet<ChangesetId>,
     /// File path → newest generation that put or deleted it.
     files: HashMap<Vec<u8>, i64>,
     /// Directory path → newest generation that changed anything below it.
@@ -365,7 +395,7 @@ impl PathIndex {
         Self {
             tip: head,
             floor: head,
-            by_gen: HashMap::new(),
+            chain: HashSet::new(),
             files: HashMap::new(),
             dirs: HashMap::new(),
         }
@@ -405,7 +435,7 @@ impl PathIndex {
     /// the index backward if needed. `None` if `base` is not on the history.
     fn reach(&mut self, c: &Connection, repo: RepoId, base: ChangesetId) -> Result<Option<i64>> {
         let base_gen = db::generation(c, repo, base)?;
-        if base == self.floor || self.by_gen.get(&base_gen) == Some(&base) {
+        if base == self.floor || self.chain.contains(&base) {
             return Ok(Some(base_gen));
         }
         let mut cur = self.floor;
@@ -467,7 +497,7 @@ impl PathIndex {
         generation: i64,
         changes: &BTreeMap<RepoPath, Option<FileState>>,
     ) {
-        self.by_gen.insert(generation, id);
+        self.chain.insert(id);
         for path in changes.keys() {
             let path = path.as_bytes();
             bump(&mut self.files, path, generation);
@@ -491,25 +521,23 @@ fn ancestors(path: &[u8]) -> impl Iterator<Item = &[u8]> {
         .map(move |(i, _)| &path[..i])
 }
 
+/// Paths joined by NUL, which a `RepoPath` cannot contain.
 fn encode_paths(paths: &[RepoPath]) -> Vec<u8> {
-    let mut out = Vec::new();
-    for path in paths {
-        let len = u32::try_from(path.as_bytes().len()).expect("a RepoPath is at most 4096 bytes");
-        out.extend_from_slice(&len.to_be_bytes());
-        out.extend_from_slice(path.as_bytes());
-    }
-    out
+    paths
+        .iter()
+        .map(RepoPath::as_bytes)
+        .collect::<Vec<_>>()
+        .join(&0)
 }
 
-fn decode_paths(mut bytes: &[u8]) -> Option<Vec<RepoPath>> {
-    let mut paths = Vec::new();
-    while !bytes.is_empty() {
-        let (len, rest) = bytes.split_first_chunk::<4>()?;
-        let (path, rest) = rest.split_at_checked(u32::from_be_bytes(*len) as usize)?;
-        paths.push(RepoPath::new(path).ok()?);
-        bytes = rest;
+fn decode_paths(bytes: &[u8]) -> Option<Vec<RepoPath>> {
+    if bytes.is_empty() {
+        return Some(Vec::new());
     }
-    Some(paths)
+    bytes
+        .split(|&b| b == 0)
+        .map(|p| RepoPath::new(p).ok())
+        .collect()
 }
 
 #[cfg(test)]
@@ -811,6 +839,7 @@ mod tests {
     fn conflict_paths_round_trip() {
         let paths = vec![RepoPath::new("a").unwrap(), RepoPath::new("b/c").unwrap()];
         assert_eq!(decode_paths(&encode_paths(&paths)), Some(paths));
-        assert_eq!(decode_paths(&[0, 0, 0, 9, b'a']), None);
+        assert_eq!(decode_paths(&[]), Some(vec![]));
+        assert_eq!(decode_paths(b"a\0\0b"), None, "an empty path is not a path");
     }
 }

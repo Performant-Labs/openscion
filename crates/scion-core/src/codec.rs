@@ -189,6 +189,17 @@ impl Tree {
         })
     }
 
+    /// Decodes a v1 tree and returns its ID, hashing `bytes` directly. Strict
+    /// decoding means `bytes` is the canonical encoding, so no re-encode is
+    /// needed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Tree::decode`].
+    pub fn decode_with_id(bytes: &[u8]) -> Result<(Self, TreeId), DecodeError> {
+        Ok((Self::decode(bytes)?, TreeId::hash(bytes)))
+    }
+
     /// The content address of this tree.
     #[must_use]
     pub fn id(&self) -> TreeId {
@@ -240,12 +251,12 @@ fn put_file(w: &mut Vec<u8>, file: &FileState) {
             w.extend_from_slice(target.as_bytes());
         }
         FileState::Gitlink { commit } => {
-            let (algo, oid): (u8, &[u8]) = match commit {
-                GitOid::Sha1(oid) => (GIT_SHA1, oid),
-                GitOid::Sha256(oid) => (GIT_SHA256, oid),
+            let algo = match commit {
+                GitOid::Sha1(_) => GIT_SHA1,
+                GitOid::Sha256(_) => GIT_SHA256,
             };
             w.extend_from_slice(&[TAG_GITLINK, algo]);
-            w.extend_from_slice(oid);
+            w.extend_from_slice(commit.as_bytes());
         }
     }
 }

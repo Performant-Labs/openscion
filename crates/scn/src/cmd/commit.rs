@@ -2,40 +2,49 @@
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail, ensure};
-use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
-use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest};
+use scion_core::{Changeset, FileState, IdentityTime, RepoPath};
 
-use crate::client::{Ctx, id_from};
+use crate::client::{Ctx, now_unix_secs};
 
-/// Size of each `PutBlob` message.
-const CHUNK_BYTES: usize = 1 << 20;
+/// Arguments of `scn commit`.
+#[derive(clap::Args)]
+pub struct CommitArgs {
+    /// Base: ref name or changeset ID.
+    #[arg(long, default_value = "main")]
+    base: String,
+    /// Commit message.
+    #[arg(short, long)]
+    message: String,
+    /// `PATH=FILE`: put the content of local FILE at PATH. Repeatable.
+    #[arg(long = "put", value_name = "PATH=FILE", value_parser = parse_put)]
+    puts: Vec<(String, PathBuf)>,
+    /// Mark the put files executable.
+    #[arg(long)]
+    executable: bool,
+    /// PATH to delete. Repeatable.
+    #[arg(long = "delete", value_name = "PATH")]
+    deletes: Vec<String>,
+    /// Author as `Name <email>`.
+    #[arg(long, env = "SCION_AUTHOR", default_value = "scn <scn@localhost>")]
+    author: String,
+}
 
-/// Parses `PATH=FILE`.
-pub fn parse_put(spec: &str) -> Result<(String, PathBuf)> {
+fn parse_put(spec: &str) -> Result<(String, PathBuf), String> {
     let (path, file) = spec
         .split_once('=')
-        .with_context(|| format!("--put {spec:?}: expected PATH=FILE"))?;
+        .ok_or_else(|| format!("{spec:?}: expected PATH=FILE"))?;
     Ok((path.to_owned(), PathBuf::from(file)))
 }
 
 /// Uploads the files, creates the changeset, and prints its ID.
-pub async fn commit(
-    ctx: &mut Ctx,
-    base: &str,
-    message: &str,
-    puts: &[(String, PathBuf)],
-    executable: bool,
-    deletes: &[String],
-    author: &str,
-) -> Result<()> {
-    let (name, email) = parse_author(author)?;
+pub async fn commit(ctx: &mut Ctx, args: CommitArgs) -> Result<()> {
+    let (name, email) = parse_author(&args.author)?;
     // Each path and the local file to put there, or `None` to delete it.
     let mut edits = BTreeMap::new();
-    let puts = puts.iter().map(|(path, file)| (path, Some(file)));
-    for (path, file) in puts.chain(deletes.iter().map(|path| (path, None))) {
+    let puts = args.puts.iter().map(|(path, file)| (path, Some(file)));
+    for (path, file) in puts.chain(args.deletes.iter().map(|path| (path, None))) {
         let path = RepoPath::new(path.as_str()).with_context(|| format!("bad path {path:?}"))?;
         ensure!(
             !edits.contains_key(&path),
@@ -44,7 +53,7 @@ pub async fn commit(
         edits.insert(path, file);
     }
 
-    let parent = ctx.resolve(base).await?;
+    let parent = ctx.resolve(&args.base).await?;
     let mut changes = BTreeMap::new();
     for (path, file) in edits {
         let state = match file {
@@ -55,12 +64,13 @@ pub async fn commit(
                 // chunks from the file.
                 let data = std::fs::read(file)
                     .with_context(|| format!("cannot read {}", file.display()))?;
-                let content = put_blob(ctx, data)
+                let content = ctx
+                    .put_blob(data)
                     .await
                     .with_context(|| format!("cannot upload {}", file.display()))?;
                 Some(FileState::Regular {
                     content,
-                    executable,
+                    executable: args.executable,
                 })
             }
         };
@@ -77,46 +87,16 @@ pub async fn commit(
             tz_offset_minutes: 0,
         },
         committer: None,
-        message: message.as_bytes().to_vec(),
+        message: args.message.into_bytes(),
         changes,
     };
-    let reply = ctx
-        .client
-        .create_changeset(CreateChangesetRequest {
-            repo: ctx.repo.clone(),
-            changeset: changeset.encode(),
-        })
-        .await
-        .context("cannot create the changeset")?
-        .into_inner();
-    let id: ChangesetId = id_from(&reply.changeset_id)?;
+    let id = ctx.create_changeset(&changeset).await?;
     if ctx.json {
         println!("{}", serde_json::json!({ "changeset": id.to_string() }));
     } else {
         println!("{id}");
     }
     Ok(())
-}
-
-/// Uploads one file's content. The first message names the repo, and an empty
-/// file still sends one (empty) message.
-async fn put_blob(ctx: &mut Ctx, data: Vec<u8>) -> Result<BlobId> {
-    let repo = ctx.repo.clone();
-    let messages = data.len().div_ceil(CHUNK_BYTES).max(1);
-    // Copies one chunk at a time, when the stream asks for it.
-    let requests = (0..messages).map(move |i| {
-        let end = data.len().min((i + 1) * CHUNK_BYTES);
-        PutBlobRequest {
-            repo: if i == 0 { repo.clone() } else { String::new() },
-            data: data[i * CHUNK_BYTES..end].to_vec(),
-        }
-    });
-    let reply = ctx
-        .client
-        .put_blob(tokio_stream::iter(requests))
-        .await?
-        .into_inner();
-    id_from(&reply.blob_id)
 }
 
 /// Splits `Name <email>` into name and email bytes.
@@ -131,14 +111,6 @@ fn parse_author(author: &str) -> Result<(Vec<u8>, Vec<u8>)> {
         }
         _ => bail!("--author {author:?}: expected \"Name <email>\""),
     }
-}
-
-fn now_unix_secs() -> Result<i64> {
-    let secs = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .context("the system clock is before 1970")?
-        .as_secs();
-    i64::try_from(secs).context("the system clock is too far in the future")
 }
 
 #[cfg(test)]

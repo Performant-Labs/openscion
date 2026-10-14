@@ -1,5 +1,8 @@
-//! Metadata queries. Each takes a `&Connection`, so it runs the same inside or
-//! outside a transaction (a `Transaction` derefs to a `Connection`).
+//! Queries on the shared tables: repos, changesets, refs, trees and derived
+//! data. Tables owned by one module (lands, git import) keep their SQL there.
+//!
+//! Each function takes a `&Connection`, so it runs the same inside or outside
+//! a transaction (a `Transaction` derefs to a `Connection`).
 
 use rusqlite::{Connection, OptionalExtension, params};
 use scion_core::{Changeset, ChangesetId, Tree, TreeId};
@@ -25,7 +28,8 @@ pub struct RefState {
 ///
 /// Database errors.
 pub fn create_repo(c: &Connection, name: &str) -> Result<RepoId> {
-    c.execute("INSERT OR IGNORE INTO repos (name) VALUES (?1)", [name])?;
+    c.prepare_cached("INSERT OR IGNORE INTO repos (name) VALUES (?1)")?
+        .execute([name])?;
     repo_id(c, name)
 }
 
@@ -35,11 +39,10 @@ pub fn create_repo(c: &Connection, name: &str) -> Result<RepoId> {
 ///
 /// [`Error::NotFound`] if no repository has that name.
 pub fn repo_id(c: &Connection, name: &str) -> Result<RepoId> {
-    c.query_row("SELECT repo_id FROM repos WHERE name = ?1", [name], |row| {
-        row.get(0).map(RepoId)
-    })
-    .optional()?
-    .ok_or_else(|| Error::NotFound(format!("repo {name:?}")))
+    c.prepare_cached("SELECT repo_id FROM repos WHERE name = ?1")?
+        .query_row([name], |row| row.get(0).map(RepoId))
+        .optional()?
+        .ok_or_else(|| Error::NotFound(format!("repo {name:?}")))
 }
 
 /// Stores a changeset and adds it to `repo`. Every parent must already be in
@@ -54,20 +57,16 @@ pub fn insert_changeset(c: &Connection, repo: RepoId, cs: &Changeset) -> Result<
     for parent in &cs.parents {
         parent_gen = parent_gen.max(generation(c, repo, *parent)?);
     }
-    c.execute(
-        "INSERT OR IGNORE INTO changesets (id, gen, body) VALUES (?1, ?2, ?3)",
-        params![id.as_bytes(), parent_gen + 1, body],
-    )?;
+    c.prepare_cached("INSERT OR IGNORE INTO changesets (id, gen, body) VALUES (?1, ?2, ?3)")?
+        .execute(params![id.as_bytes(), parent_gen + 1, body])?;
     for (n, parent) in (0_i64..).zip(&cs.parents) {
-        c.execute(
+        c.prepare_cached(
             "INSERT OR IGNORE INTO changeset_parents (cs, n, parent) VALUES (?1, ?2, ?3)",
-            params![id.as_bytes(), n, parent.as_bytes()],
-        )?;
+        )?
+        .execute(params![id.as_bytes(), n, parent.as_bytes()])?;
     }
-    c.execute(
-        "INSERT OR IGNORE INTO repo_changesets (repo_id, cs) VALUES (?1, ?2)",
-        params![repo.0, id.as_bytes()],
-    )?;
+    c.prepare_cached("INSERT OR IGNORE INTO repo_changesets (repo_id, cs) VALUES (?1, ?2)")?
+        .execute(params![repo.0, id.as_bytes()])?;
     Ok(id)
 }
 
@@ -89,6 +88,18 @@ pub fn get_changeset(c: &Connection, repo: RepoId, id: ChangesetId) -> Result<Ch
     Changeset::decode(&body).map_err(|e| Error::Corrupt(format!("changeset {id}: {e}")))
 }
 
+/// Whether `repo` may see changeset `id`.
+///
+/// # Errors
+///
+/// Database errors.
+pub fn has_changeset(c: &Connection, repo: RepoId, id: ChangesetId) -> Result<bool> {
+    Ok(
+        c.prepare_cached("SELECT 1 FROM repo_changesets WHERE repo_id = ?1 AND cs = ?2")?
+            .exists(params![repo.0, id.as_bytes()])?,
+    )
+}
+
 /// The generation of a changeset that `repo` may see: 1 for a root, else 1 +
 /// the highest parent generation.
 ///
@@ -96,12 +107,11 @@ pub fn get_changeset(c: &Connection, repo: RepoId, id: ChangesetId) -> Result<Ch
 ///
 /// [`Error::NotFound`] if `repo` does not have it.
 pub fn generation(c: &Connection, repo: RepoId, id: ChangesetId) -> Result<i64> {
-    c.query_row(
+    c.prepare_cached(
         "SELECT gen FROM changesets JOIN repo_changesets ON cs = id
          WHERE repo_id = ?1 AND id = ?2",
-        params![repo.0, id.as_bytes()],
-        |row| row.get(0),
-    )
+    )?
+    .query_row(params![repo.0, id.as_bytes()], |row| row.get(0))
     .optional()?
     .ok_or_else(|| Error::NotFound(format!("changeset {id}")))
 }
@@ -128,19 +138,18 @@ pub fn first_parent(c: &Connection, id: ChangesetId) -> Result<Option<ChangesetI
 ///
 /// Database errors.
 pub fn get_ref(c: &Connection, repo: RepoId, name: &str) -> Result<Option<RefState>> {
-    c.query_row(
-        "SELECT target, version FROM refs WHERE repo_id = ?1 AND name = ?2",
-        params![repo.0, name],
-        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get(1)?)),
-    )
-    .optional()?
-    .map(|(target, version)| {
-        Ok(RefState {
-            target: to_id(&target)?,
-            version,
+    c.prepare_cached("SELECT target, version FROM refs WHERE repo_id = ?1 AND name = ?2")?
+        .query_row(params![repo.0, name], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get(1)?))
         })
-    })
-    .transpose()
+        .optional()?
+        .map(|(target, version)| {
+            Ok(RefState {
+                target: to_id(&target)?,
+                version,
+            })
+        })
+        .transpose()
 }
 
 /// Moves a ref if its version is still `expected`. `None` creates the ref
@@ -158,13 +167,11 @@ pub fn cas_ref(
 ) -> Result<bool> {
     generation(c, repo, target)?;
     let changed = match expected {
-        None => c.execute(
-            "INSERT OR IGNORE INTO refs (repo_id, name, target, version) VALUES (?1, ?2, ?3, 1)",
+        None => c.prepare_cached("INSERT OR IGNORE INTO refs (repo_id, name, target, version) VALUES (?1, ?2, ?3, 1)")?.execute(
             params![repo.0, name, target.as_bytes()],
         )?,
-        Some(version) => c.execute(
-            "UPDATE refs SET target = ?3, version = version + 1
-             WHERE repo_id = ?1 AND name = ?2 AND version = ?4",
+        Some(version) => c.prepare_cached("UPDATE refs SET target = ?3, version = version + 1
+             WHERE repo_id = ?1 AND name = ?2 AND version = ?4")?.execute(
             params![repo.0, name, target.as_bytes(), version],
         )?,
     };
@@ -210,10 +217,11 @@ pub fn put_derived(
     cs: ChangesetId,
     value: [u8; 32],
 ) -> Result<()> {
-    let inserted = c.execute(
-        "INSERT OR IGNORE INTO derived (kind, version, cs, value) VALUES (?1, ?2, ?3, ?4)",
-        params![kind, version, cs.as_bytes(), value],
-    )?;
+    let inserted = c
+        .prepare_cached(
+            "INSERT OR IGNORE INTO derived (kind, version, cs, value) VALUES (?1, ?2, ?3, ?4)",
+        )?
+        .execute(params![kind, version, cs.as_bytes(), value])?;
     if inserted == 0 && get_derived(c, kind, version, cs)? != Some(value) {
         return Err(Error::Corrupt(format!(
             "derived {kind} v{version} for {cs} differs from the stored value"
@@ -246,8 +254,9 @@ pub fn get_tree(c: &Connection, id: TreeId) -> Result<Tree> {
         .query_row([id.as_bytes()], |row| row.get(0))
         .optional()?
         .ok_or_else(|| Error::NotFound(format!("tree {id}")))?;
-    let tree = Tree::decode(&body).map_err(|e| Error::Corrupt(format!("tree {id}: {e}")))?;
-    if tree.id() != id {
+    let (tree, actual) =
+        Tree::decode_with_id(&body).map_err(|e| Error::Corrupt(format!("tree {id}: {e}")))?;
+    if actual != id {
         return Err(Error::Corrupt(format!("tree {id} does not match its ID")));
     }
     Ok(tree)

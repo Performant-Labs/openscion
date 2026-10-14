@@ -473,5 +473,9 @@ fn ids_parse_from_hex_and_bytes() {
     );
     assert!("abc".parse::<scion_core::ChangesetId>().is_err());
     assert!(scion_core::ChangesetId::try_from([0u8; 31].as_slice()).is_err());
-    assert_eq!(root().encode_with_id(), (root().encode(), root().id()));
+    let tree = tree();
+    assert_eq!(
+        Tree::decode_with_id(&tree.encode()),
+        Ok((tree.clone(), tree.id()))
+    );
 }
