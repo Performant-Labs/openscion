@@ -301,11 +301,13 @@ fn imported_commits(c: &Connection, repo: RepoId) -> Result<HashMap<ObjectId, Ch
 fn point_ref(c: &Connection, repo: RepoId, name: &str, tip: ChangesetId) -> Result<()> {
     let current = db::get_ref(c, repo, name)?;
     if let Some(current) = current {
-        if current.target == tip {
+        // Already there, or the ref already contains the tip (changes were
+        // landed on top of an earlier import): nothing to do.
+        if current.target == tip || db::is_ancestor(c, repo, tip, current.target)? {
             return Ok(());
         }
         if !db::is_ancestor(c, repo, current.target, tip)? {
-            return Err(Error::InvalidArgument(format!(
+            return Err(Error::FailedPrecondition(format!(
                 "ref {name:?} has diverged from git: it points at {}, which is not \
                  an ancestor of the imported tip {tip}; import into another ref",
                 current.target

@@ -34,6 +34,10 @@ pub enum Error {
     /// The request is malformed.
     #[error("{0}")]
     InvalidArgument(String),
+    /// The request is well formed, but the state does not allow it (for
+    /// example a ref that has diverged from the history being imported).
+    #[error("{0}")]
+    FailedPrecondition(String),
     /// A changeset does not apply to its parent tree.
     #[error(transparent)]
     Apply(#[from] ApplyError),
@@ -64,6 +68,7 @@ impl From<Error> for Status {
             Error::NotFound(_) => Status::not_found(e.to_string()),
             Error::InvalidArgument(_) | Error::Apply(_) => Status::invalid_argument(e.to_string()),
             Error::Aborted(_) => Status::aborted(e.to_string()),
+            Error::FailedPrecondition(_) => Status::failed_precondition(e.to_string()),
             Error::Corrupt(_) | Error::Db(_) | Error::Io(_) | Error::Git(_) => {
                 // Details stay in the server log, not in the reply.
                 tracing::error!(error = %e, "internal error");

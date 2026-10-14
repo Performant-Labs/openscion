@@ -579,7 +579,7 @@ fn main_ref(store: &Store) -> db::RefState {
 /// imported tip, and that the error names both.
 fn assert_diverged(result: Result<ImportReport, Error>, main: ChangesetId, tip: ChangesetId) {
     match result {
-        Err(Error::InvalidArgument(msg)) => {
+        Err(Error::FailedPrecondition(msg)) => {
             assert!(msg.contains("diverged from git"), "{msg}");
             assert!(msg.contains(&main.to_string()), "{msg}");
             assert!(msg.contains(&tip.to_string()), "{msg}");
@@ -626,8 +626,9 @@ fn import_never_moves_a_ref_off_a_land() {
     let landed = main_ref(&store);
     assert_eq!(landed.target, created);
 
-    // The same git tip again: `main` is ahead of it.
-    assert_diverged(try_import(&store, &git, "HEAD"), created, imported);
+    // The same git tip again: `main` already contains it, so nothing moves.
+    let again = try_import(&store, &git, "HEAD").unwrap();
+    assert_eq!((again.imported, again.tip), (0, imported));
     assert_eq!(main_ref(&store), landed);
 
     // A git descendant of that tip does not have the land either.
