@@ -22,7 +22,8 @@ service Scion {
   // content.
   rpc CreateChangeset(CreateChangesetRequest) returns (CreateChangesetResponse);
   // Rebases a changeset onto a ref and moves the ref. A retry with the same
-  // request key returns the same land.
+  // request key returns the same land. Fails with ABORTED if the ref keeps
+  // moving under the land; retry with the same key.
   rpc Land(LandRequest) returns (LandResponse);
   // Returns the current state of a land.
   rpc GetLand(GetLandRequest) returns (LandResponse);

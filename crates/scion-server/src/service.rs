@@ -240,6 +240,7 @@ impl Scion for ScionService {
     ) -> Result<Response<LandResponse>, Status> {
         let caller = caller(&request)?;
         let GetLandRequest { repo, land_id } = request.into_inner();
+        check_name("repo", &repo)?;
         let land_id = land_id
             .parse()
             .map_err(|_| Status::invalid_argument("land_id must be a number"))?;
