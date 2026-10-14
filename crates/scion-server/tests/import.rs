@@ -403,7 +403,7 @@ fn changesets_carry_git_metadata_and_first_parent_diffs() {
     );
 
     assert_eq!(changeset(&h.non_utf8).message, NON_UTF8_MESSAGE);
-    assert!(changeset(&h.root).parents.is_empty());
+    assert_eq!(changeset(&h.root).parents, []);
 }
 
 #[test]

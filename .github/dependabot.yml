@@ -11,6 +11,10 @@ updates:
     directory: /
     schedule:
       interval: weekly
+    ignore:
+      # Refs like @1.88 and @stable name toolchains, not action versions;
+      # @1.88 is the MSRV and must not move.
+      - dependency-name: dtolnay/rust-toolchain
     groups:
       actions:
         patterns: ["*"]
