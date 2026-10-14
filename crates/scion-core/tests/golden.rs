@@ -209,6 +209,8 @@ fn root_changeset_bytes() {
         "68aaac6287056ee56023fb6139c7c5b977d68345cc50d3d7ada2d8f4eec72c30"
     );
     assert_eq!(Changeset::decode(&expected).unwrap(), cs);
+    let id = cs.id();
+    assert_eq!(Changeset::decode_with_id(&expected).unwrap(), (cs, id));
 }
 
 #[test]
@@ -239,6 +241,8 @@ fn child_changeset_bytes() {
         "141e0659d73489d915d1a915797f8824e1302a3d42f95ea89252eb5de6944d41"
     );
     assert_eq!(Changeset::decode(&expected).unwrap(), cs);
+    let id = cs.id();
+    assert_eq!(Changeset::decode_with_id(&expected).unwrap(), (cs, id));
 }
 
 #[test]
@@ -260,6 +264,8 @@ fn merge_changeset_bytes() {
         "b91ced501e84d9b9c17d4ad531272b55a9c136298b19ff3bf26980837ddb1c1b"
     );
     assert_eq!(Changeset::decode(&expected).unwrap(), cs);
+    let id = cs.id();
+    assert_eq!(Changeset::decode_with_id(&expected).unwrap(), (cs, id));
 }
 
 #[test]

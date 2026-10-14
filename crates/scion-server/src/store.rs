@@ -2,6 +2,7 @@
 //! blobs.
 //!
 //! ```text
+//! <data>/lock                      locked by the one process that uses <data>
 //! <data>/scion.db                  metadata and trees (see migrations/)
 //! <data>/objects/blob/ab/cd..      one zstd file per blob, named by ID
 //! <data>/tmp/                      staging for atomic blob writes
@@ -9,11 +10,13 @@
 
 use std::collections::BTreeSet;
 use std::fs;
-use std::io::{ErrorKind, Read, Write};
+use std::io::{self, ErrorKind, Read, Write};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use rusqlite::{Connection, TransactionBehavior};
+use rustix::fs::FlockOperation;
+use rustix::io::Errno;
 use scion_core::BlobId;
 
 use crate::error::{Error, Result};
@@ -21,8 +24,12 @@ use crate::error::{Error, Result};
 const SCHEMA: &str = include_str!("../migrations/0001_init.sql");
 const SCHEMA_VERSION: u32 = 1;
 
-/// Largest object accepted or read back, uncompressed.
-pub const MAX_OBJECT_BYTES: usize = 1 << 30;
+/// Largest object accepted or read back, uncompressed: 100 MiB, the hard
+/// per-file limit on GitHub, so any file from a GitHub repository fits.
+// SHORTCUT: an upload is buffered in memory up to this size before it is
+// hashed and written, so each concurrent upload can hold 100 MiB. Upgrade:
+// stream uploads to a temp file and hash the chunks as they arrive.
+pub const MAX_OBJECT_BYTES: usize = 100 << 20;
 
 /// Handle to one data directory. Cheap to clone.
 #[derive(Clone)]
@@ -35,16 +42,28 @@ struct Inner {
     // Upgrade: a pool of read-only connections (WAL allows parallel readers).
     db: Mutex<Connection>,
     blobs: Blobs,
+    /// Keeps the data directory locked until the last clone is dropped.
+    _lock: fs::File,
 }
 
 impl Store {
-    /// Opens or creates a data directory.
+    /// Opens or creates a data directory and locks it for this `Store`.
+    ///
+    /// Lands are serialized in memory, so only one `Store` may use a data
+    /// directory at a time. The lock is released when the last clone of the
+    /// returned `Store` is dropped.
     ///
     /// # Errors
     ///
-    /// Fails if the directory or database cannot be created, or the schema is
-    /// newer than this build.
+    /// Fails if another `Store`, in this process or another, has the
+    /// directory open, if the directory or database cannot be created, or if
+    /// the schema is newer than this build.
     pub fn open(dir: &Path) -> Result<Self> {
+        fs::create_dir_all(dir)?;
+        // SHORTCUT: one process per data directory, so an import needs the
+        // server stopped. Upgrade: lands that re-plan when the ref moved
+        // under them, then allow a separate importer process.
+        let lock = lock_dir(dir)?;
         let blobs = Blobs::open(dir)?;
         let db = Connection::open(dir.join("scion.db"))?;
         db.execute_batch(
@@ -60,6 +79,7 @@ impl Store {
             inner: Arc::new(Inner {
                 db: Mutex::new(db),
                 blobs,
+                _lock: lock,
             }),
         })
     }
@@ -100,6 +120,30 @@ impl Store {
     }
 }
 
+/// Takes an exclusive lock on `<dir>/lock` without waiting. The lock lasts as
+/// long as the returned file is open.
+fn lock_dir(dir: &Path) -> Result<fs::File> {
+    let path = dir.join("lock");
+    let file = fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(&path)?;
+    match rustix::fs::flock(&file, FlockOperation::NonBlockingLockExclusive) {
+        Ok(()) => Ok(file),
+        Err(Errno::WOULDBLOCK) => Err(io::Error::new(
+            ErrorKind::WouldBlock,
+            format!(
+                "data directory {} is in use by another server or import ({} is locked)",
+                dir.display(),
+                path.display()
+            ),
+        )
+        .into()),
+        Err(e) => Err(io::Error::from(e).into()),
+    }
+}
+
 fn migrate(db: &Connection) -> Result<()> {
     let version: u32 = db.pragma_query_value(None, "user_version", |row| row.get(0))?;
     match version {
@@ -116,6 +160,17 @@ fn migrate(db: &Connection) -> Result<()> {
     }
 }
 
+/// What is stored under a blob ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobStatus {
+    /// No file.
+    Missing,
+    /// The file unpacks to content with this ID.
+    Valid,
+    /// A file exists but is not this blob: torn, truncated or overwritten.
+    Corrupt,
+}
+
 /// Immutable file contents, one zstd-compressed file per [`BlobId`].
 pub struct Blobs {
     root: PathBuf,
@@ -124,10 +179,16 @@ pub struct Blobs {
 
 impl Blobs {
     fn open(dir: &Path) -> Result<Self> {
-        let root = dir.join("objects").join("blob");
+        let objects = dir.join("objects");
+        let root = objects.join("blob");
         let tmp = dir.join("tmp");
         fs::create_dir_all(&root)?;
         fs::create_dir_all(&tmp)?;
+        // A blob file is only as durable as the directories above it. A batch
+        // flushes the fan-out directories it writes to; these are made once.
+        for path in [&root, &objects, &tmp, dir] {
+            fsync_dir(path)?;
+        }
         Ok(Self { root, tmp })
     }
 
@@ -155,7 +216,8 @@ impl Blobs {
     ///
     /// # Errors
     ///
-    /// [`Error::NotFound`] if absent, [`Error::Corrupt`] if it does not match.
+    /// [`Error::NotFound`] if absent, [`Error::Corrupt`] if the file is not
+    /// this blob, [`Error::Io`] if it cannot be read.
     pub fn get(&self, id: BlobId) -> Result<Vec<u8>> {
         let file = match fs::File::open(self.location(id).1) {
             Ok(file) => file,
@@ -164,25 +226,40 @@ impl Blobs {
             }
             Err(e) => return Err(e.into()),
         };
-        let mut raw = Vec::new();
-        zstd::stream::read::Decoder::new(file)?
-            .take(MAX_OBJECT_BYTES as u64 + 1)
-            .read_to_end(&mut raw)?;
-        if raw.len() > MAX_OBJECT_BYTES {
-            return Err(Error::Corrupt(format!(
-                "blob {id} unpacks to more than {MAX_OBJECT_BYTES} bytes"
-            )));
+        let corrupt = |why: String| Error::Corrupt(format!("blob {id}: {why}"));
+        // The whole file is read before unpacking, so a read failure stays an
+        // I/O error and only bad bytes count as corruption.
+        let limit = zstd::zstd_safe::compress_bound(MAX_OBJECT_BYTES);
+        let mut packed = Vec::new();
+        file.take(limit as u64 + 1).read_to_end(&mut packed)?;
+        if packed.len() > limit {
+            return Err(corrupt(format!("file is larger than {limit} bytes")));
         }
+        let raw = zstd::bulk::decompress(&packed, MAX_OBJECT_BYTES)
+            .map_err(|e| corrupt(format!("cannot unpack: {e}")))?;
         if BlobId::of(&raw) != id {
-            return Err(Error::Corrupt(format!("blob {id} does not match its ID")));
+            return Err(corrupt("content does not match the ID".into()));
         }
         Ok(raw)
     }
 
-    /// Whether a blob is stored.
-    #[must_use]
-    pub fn contains(&self, id: BlobId) -> bool {
-        self.location(id).1.exists()
+    /// Whether a blob is stored intact. Reads, unpacks and hashes the file.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Io`] if the file exists but cannot be read.
+    // SHORTCUT: holds the packed and the unpacked bytes, up to about 200 MiB
+    // per call. Upgrade: stream the unpacked bytes into the hasher.
+    pub fn verify(&self, id: BlobId) -> Result<BlobStatus> {
+        match self.get(id) {
+            Ok(_) => Ok(BlobStatus::Valid),
+            Err(Error::NotFound(_)) => Ok(BlobStatus::Missing),
+            Err(Error::Corrupt(why)) => {
+                tracing::warn!(%why, "stored blob is corrupt");
+                Ok(BlobStatus::Corrupt)
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// The fan-out directory and the file path of a blob.
@@ -209,11 +286,13 @@ pub struct BlobBatch<'a> {
 }
 
 impl BlobBatch<'_> {
-    /// Writes one blob. Safe to repeat.
+    /// Writes one blob, or keeps the stored file if it is intact. A file that
+    /// is not intact is replaced. Safe to repeat.
     ///
     /// # Errors
     ///
-    /// Fails if the content is larger than [`MAX_OBJECT_BYTES`] or the write fails.
+    /// Fails if the content is larger than [`MAX_OBJECT_BYTES`] or a read or
+    /// write fails.
     pub fn put(&mut self, raw: &[u8]) -> Result<BlobId> {
         if raw.len() > MAX_OBJECT_BYTES {
             return Err(Error::InvalidArgument(format!(
@@ -222,11 +301,16 @@ impl BlobBatch<'_> {
         }
         let id = BlobId::of(raw);
         let (dir, path) = self.blobs.location(id);
-        // SHORTCUT: an existing file is trusted. After a power loss between a
-        // write and its batch's `sync`, a torn file can remain; reads detect
-        // it by hash. Upgrade: rewrite on a failed read.
-        if path.exists() {
-            return Ok(id);
+        match self.blobs.verify(id)? {
+            BlobStatus::Valid => {
+                // Another batch may have written it and not synced yet, so
+                // this batch flushes its directory too.
+                self.dirs.insert(dir);
+                return Ok(id);
+            }
+            // The rename below replaces it in one step.
+            BlobStatus::Corrupt => tracing::warn!(blob = %id, "rewriting a corrupt blob file"),
+            BlobStatus::Missing => {}
         }
         let compressed = zstd::bulk::compress(raw, 3)?;
         // Write a temp file and flush it before the rename, so the name never
@@ -240,7 +324,7 @@ impl BlobBatch<'_> {
         Ok(id)
     }
 
-    /// Makes every blob written in this batch durable.
+    /// Makes every blob written or kept in this batch durable.
     ///
     /// # Errors
     ///
@@ -250,10 +334,10 @@ impl BlobBatch<'_> {
             return Ok(());
         }
         for dir in &self.dirs {
-            fsync(&fs::File::open(dir)?)?;
+            fsync_dir(dir)?;
         }
-        fsync(&fs::File::open(&self.blobs.root)?)?;
-        // One full flush of the drive cache covers everything above.
+        // Flushes the root directory, then the drive cache, which covers
+        // everything above.
         fs::File::open(&self.blobs.root)?.sync_all()?;
         Ok(())
     }
@@ -261,6 +345,37 @@ impl BlobBatch<'_> {
 
 /// A plain `fsync`: data reaches the drive, not necessarily past its cache.
 /// (`File::sync_all` is a full cache flush on macOS, about 20x slower.)
-fn fsync(file: &fs::File) -> std::io::Result<()> {
+fn fsync(file: &fs::File) -> io::Result<()> {
     rustix::fs::fsync(file).map_err(Into::into)
+}
+
+fn fsync_dir(path: &Path) -> io::Result<()> {
+    fsync(&fs::File::open(path)?)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_data_directory_opens_in_one_store_at_a_time() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = Store::open(dir.path()).unwrap();
+        let clone = first.clone();
+        match Store::open(dir.path()) {
+            Err(Error::Io(e)) => {
+                let msg = e.to_string();
+                assert!(msg.contains(&dir.path().display().to_string()), "{msg}");
+                assert!(msg.contains("in use"), "{msg}");
+            }
+            other => panic!("expected the second open to fail, got {:?}", other.err()),
+        }
+        drop(first);
+        assert!(
+            Store::open(dir.path()).is_err(),
+            "a live clone keeps the lock"
+        );
+        drop(clone);
+        Store::open(dir.path()).unwrap();
+    }
 }

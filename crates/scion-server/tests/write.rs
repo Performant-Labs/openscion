@@ -1,9 +1,13 @@
 //! `create_changeset`: validation, idempotency under concurrency, and the
-//! root tree it records.
+//! root tree it records. Blob uploads over damaged files, and stored data
+//! that does not match its ID.
 
-use rusqlite::Connection;
+use std::fs;
+
+use rusqlite::{Connection, params};
 use scion_core::{BlobId, Changeset, ChangesetId, Entry, FileState, IdentityTime, RepoPath};
 use scion_server::error::ApplyError;
+use scion_server::store::BlobStatus;
 use scion_server::write::{
     MAX_CHANGES, MAX_COMMIT_MESSAGE_BYTES, MAX_IDENTITY_BYTES, create_changeset,
 };
@@ -15,7 +19,7 @@ const REPO: &str = "main";
 /// A store with repo `main` (a root holding `a`, `dir/b`, `dir/c`, and a
 /// `main` ref) and repo `other` (its own root).
 struct Fixture {
-    _dir: TempDir,
+    dir: TempDir,
     store: Store,
     root: ChangesetId,
     other_root: ChangesetId,
@@ -50,7 +54,7 @@ fn fixture() -> Fixture {
         })
         .unwrap();
     Fixture {
-        _dir: dir,
+        dir,
         store,
         root,
         other_root,
@@ -245,4 +249,85 @@ fn created_changesets_have_the_expected_root_tree() {
         file(regular("a")),
         "the parent is unchanged"
     );
+}
+
+/// Overwrites the stored file of blob `new` with `bytes`, as a crash, a bad
+/// disk or a stray write could.
+fn damage_new(f: &Fixture, bytes: &[u8]) -> BlobId {
+    let id = BlobId::of(b"new");
+    let hex = id.to_string();
+    let file = f.dir.path().join("objects/blob").join(&hex[..2]);
+    fs::write(file.join(&hex[2..]), bytes).unwrap();
+    id
+}
+
+#[test]
+fn a_damaged_blob_is_rejected_until_put_rewrites_it() {
+    let packed = zstd::bulk::compress(b"new", 3).unwrap();
+    let damaged = [
+        ("truncated", packed[..packed.len() / 2].to_vec()),
+        ("not zstd", b"not a zstd frame".to_vec()),
+        ("other content", zstd::bulk::compress(b"old", 3).unwrap()),
+    ];
+    for (case, bytes) in damaged {
+        let f = fixture();
+        let id = damage_new(&f, &bytes);
+        let blobs = f.store.blobs();
+        assert_eq!(blobs.verify(id).unwrap(), BlobStatus::Corrupt, "{case}");
+        assert!(matches!(blobs.get(id), Err(Error::Corrupt(_))), "{case}");
+        let child = changeset(vec![f.root], &[("dir/new", Some(regular("new")))]).encode();
+        match create_changeset(&f.store, REPO, &child) {
+            Err(Error::InvalidArgument(why)) => {
+                assert!(why.contains("is corrupt"), "{case}: {why}");
+            }
+            other => panic!("{case}: expected InvalidArgument, got {other:?}"),
+        }
+
+        assert_eq!(blobs.put(b"new").unwrap(), id, "{case}");
+        assert_eq!(blobs.verify(id).unwrap(), BlobStatus::Valid, "{case}");
+        assert_eq!(blobs.get(id).unwrap(), b"new", "{case}");
+        create_changeset(&f.store, REPO, &child).unwrap();
+    }
+}
+
+#[test]
+fn concurrent_puts_of_one_blob_leave_it_intact() {
+    let f = fixture();
+    // Start from a damaged file, so the threads race to replace it too.
+    let id = damage_new(&f, b"torn");
+    let ids: Vec<BlobId> = std::thread::scope(|s| {
+        let handles: Vec<_> = (0..16)
+            .map(|_| s.spawn(|| f.store.blobs().put(b"new")))
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap().unwrap())
+            .collect()
+    });
+    assert!(ids.iter().all(|got| *got == id), "{ids:?}");
+    assert_eq!(f.store.blobs().verify(id).unwrap(), BlobStatus::Valid);
+    let staged = fs::read_dir(f.dir.path().join("tmp")).unwrap().count();
+    assert_eq!(staged, 0, "no temp file is left behind");
+}
+
+#[test]
+fn a_changeset_that_does_not_match_its_id_reads_as_corrupt() {
+    let f = fixture();
+    // A valid encoding, but of another changeset.
+    let other = changeset(vec![], &[("a", Some(regular("b")))]).encode();
+    let repo = f
+        .store
+        .write(|c| {
+            c.execute(
+                "UPDATE changesets SET body = ?1 WHERE id = ?2",
+                params![other, f.root.as_bytes()],
+            )?;
+            db::repo_id(c, REPO)
+        })
+        .unwrap();
+
+    match f.store.read(|c| db::get_changeset(c, repo, f.root)) {
+        Err(Error::Corrupt(why)) => assert!(why.contains("does not match its ID"), "{why}"),
+        other => panic!("expected Corrupt, got {other:?}"),
+    }
 }

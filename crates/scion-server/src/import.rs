@@ -22,7 +22,7 @@ use scion_core::{
 
 use crate::db::{self, RepoId};
 use crate::error::{Error, Result};
-use crate::store::{BlobBatch, Store};
+use crate::store::{BlobBatch, BlobStatus, MAX_OBJECT_BYTES, Store};
 use crate::tree;
 
 /// `git_import.git_algo` for SHA-1 object names.
@@ -67,8 +67,11 @@ pub struct ImportReport {
 ///
 /// # Errors
 ///
-/// [`Error::Git`] if git cannot be read or a path is not valid in Scion.
-/// [`Error::Corrupt`] if a verified commit's tree differs from git's.
+/// [`Error::Git`] if git cannot be read, or a path or file is not valid in
+/// Scion. [`Error::Corrupt`] if a verified commit's tree differs from git's or
+/// names a blob that is not stored intact. [`Error::InvalidArgument`] if
+/// `opts.target_ref` points at a changeset that the tip does not descend
+/// from; the commits stay imported and the ref is left alone.
 pub fn import_git(
     store: &Store,
     repo: &str,
@@ -105,12 +108,14 @@ pub fn import_git(
     let mut importer = Importer {
         git: &git,
         blobs: HashMap::new(),
+        put: Vec::new(),
     };
     let mut checker = Checker {
         git: &git,
         store,
         equal: HashSet::new(),
         blobs: HashMap::new(),
+        intact: HashSet::new(),
     };
     let mut done = 0;
     for batch in plan.todo.chunks(BATCH) {
@@ -124,6 +129,9 @@ pub fn import_git(
             prepared.push((commit, cs, git_tree));
         }
         blobs.sync()?;
+        // A put writes or reads back its blob, so the checker reads back only
+        // blobs from earlier runs.
+        checker.intact.extend(importer.put.drain(..));
         store.write(|c| {
             for (commit, cs, git_tree) in &prepared {
                 let root = record(c, repo_id, *commit, cs)?;
@@ -286,10 +294,23 @@ fn imported_commits(c: &Connection, repo: RepoId) -> Result<HashMap<ObjectId, Ch
 
 /// Points `name` at `tip`, creating it if missing. Leaves it alone if it is
 /// already there, so a repeated import changes nothing.
+///
+/// Moves an existing ref only forward, to a descendant of where it points.
+/// Anything else would drop the changesets on the ref that git does not
+/// have, such as lands made after an earlier import.
 fn point_ref(c: &Connection, repo: RepoId, name: &str, tip: ChangesetId) -> Result<()> {
     let current = db::get_ref(c, repo, name)?;
-    if current.is_some_and(|r| r.target == tip) {
-        return Ok(());
+    if let Some(current) = current {
+        if current.target == tip {
+            return Ok(());
+        }
+        if !db::is_ancestor(c, repo, current.target, tip)? {
+            return Err(Error::InvalidArgument(format!(
+                "ref {name:?} has diverged from git: it points at {}, which is not \
+                 an ancestor of the imported tip {tip}; import into another ref",
+                current.target
+            )));
+        }
     }
     // The caller's write transaction holds the database lock, so the version
     // read above is still current.
@@ -308,8 +329,11 @@ struct Importer<'a> {
     /// Blobs stored in this run, so each is read from git once.
     // SHORTCUT: grows with every distinct blob in the history (about 100
     // bytes each, so 1M blobs take about 100 MB). Upgrade: a bounded LRU; a
-    // miss only costs a git read, since `Blobs::put` skips stored blobs.
+    // miss costs a git read and a read-back of the stored blob, since
+    // `BlobBatch::put` keeps a stored blob only after checking it.
     blobs: HashMap<ObjectId, BlobId>,
+    /// Blobs put since the checker last took them.
+    put: Vec<BlobId>,
 }
 
 impl Importer<'_> {
@@ -389,7 +413,8 @@ impl Importer<'_> {
                 // delete first, so a file can become a directory and back.
                 match (before, after) {
                     (_, Some(GitEntry::File(kind, id))) => {
-                        let state = file_state(*kind, *id, |id| self.blob(id, batch))?;
+                        let state =
+                            file_state(*kind, *id, |id| self.blob(commit, &path, id, batch))?;
                         changes.insert(path, Some(state));
                     }
                     (Some(GitEntry::File(..)), _) => {
@@ -402,10 +427,27 @@ impl Importer<'_> {
         Ok(changes)
     }
 
-    /// Writes a git blob to `batch` and returns its Scion ID.
-    fn blob(&mut self, oid: ObjectId, batch: &mut BlobBatch<'_>) -> Result<BlobId> {
+    /// Writes the git blob for `path` in `commit` to `batch` and returns its
+    /// Scion ID.
+    fn blob(
+        &mut self,
+        commit: ObjectId,
+        path: &RepoPath,
+        oid: ObjectId,
+        batch: &mut BlobBatch<'_>,
+    ) -> Result<BlobId> {
         cached(&mut self.blobs, oid, || {
-            batch.put(&read_blob(self.git, oid)?.data)
+            let blob = read_blob(self.git, oid)?;
+            if blob.data.len() > MAX_OBJECT_BYTES {
+                return Err(Error::Git(format!(
+                    "commit {commit}: \"{}\" is larger than {MAX_OBJECT_BYTES} bytes, \
+                     the most Scion stores",
+                    path.as_bytes().escape_ascii()
+                )));
+            }
+            let id = batch.put(&blob.data)?;
+            self.put.push(id);
+            Ok(id)
         })
     }
 }
@@ -418,6 +460,9 @@ struct Checker<'a> {
     equal: HashSet<(ObjectId, TreeId)>,
     /// Blob IDs hashed from git content, apart from the importer's cache.
     blobs: HashMap<ObjectId, BlobId>,
+    /// Stored blobs known to be intact: put in this run, or read back by an
+    /// earlier check.
+    intact: HashSet<BlobId>,
 }
 
 impl Checker<'_> {
@@ -459,9 +504,17 @@ impl Checker<'_> {
                             return Err(differs(format!("git {expected:?}, Scion {state:?}")));
                         }
                         if let Some(blob) = state.blob()
-                            && !self.store.blobs().contains(blob)
+                            && !self.intact.contains(&blob)
                         {
-                            return Err(differs(format!("blob {blob} is not stored")));
+                            let problem = match self.store.blobs().verify(blob)? {
+                                BlobStatus::Valid => {
+                                    self.intact.insert(blob);
+                                    continue;
+                                }
+                                BlobStatus::Missing => "is not stored",
+                                BlobStatus::Corrupt => "is corrupt",
+                            };
+                            return Err(differs(format!("blob {blob} {problem}")));
                         }
                     }
                     (Some(_), Some(_)) => {

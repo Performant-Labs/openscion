@@ -126,6 +126,17 @@ impl Changeset {
         })
     }
 
+    /// Decodes a v1 changeset and returns its ID, hashing `bytes` directly.
+    /// Strict decoding means `bytes` is the canonical encoding, so no
+    /// re-encode is needed.
+    ///
+    /// # Errors
+    ///
+    /// As [`Changeset::decode`].
+    pub fn decode_with_id(bytes: &[u8]) -> Result<(Self, ChangesetId), DecodeError> {
+        Ok((Self::decode(bytes)?, ChangesetId::hash(bytes)))
+    }
+
     /// The content address of this changeset.
     #[must_use]
     pub fn id(&self) -> ChangesetId {

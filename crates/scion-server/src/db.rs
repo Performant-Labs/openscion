@@ -4,6 +4,8 @@
 //! Each function takes a `&Connection`, so it runs the same inside or outside
 //! a transaction (a `Transaction` derefs to a `Connection`).
 
+use std::collections::HashSet;
+
 use rusqlite::{Connection, OptionalExtension, params};
 use scion_core::{Changeset, ChangesetId, Tree, TreeId};
 
@@ -70,11 +72,12 @@ pub fn insert_changeset(c: &Connection, repo: RepoId, cs: &Changeset) -> Result<
     Ok(id)
 }
 
-/// Reads a changeset that `repo` may see.
+/// Reads a changeset that `repo` may see and checks it against its ID.
 ///
 /// # Errors
 ///
-/// [`Error::NotFound`] if `repo` does not have it.
+/// [`Error::NotFound`] if `repo` does not have it, [`Error::Corrupt`] if it
+/// does not decode or match.
 pub fn get_changeset(c: &Connection, repo: RepoId, id: ChangesetId) -> Result<Changeset> {
     let body: Vec<u8> = c
         .query_row(
@@ -85,7 +88,14 @@ pub fn get_changeset(c: &Connection, repo: RepoId, id: ChangesetId) -> Result<Ch
         )
         .optional()?
         .ok_or_else(|| Error::NotFound(format!("changeset {id}")))?;
-    Changeset::decode(&body).map_err(|e| Error::Corrupt(format!("changeset {id}: {e}")))
+    let (cs, actual) = Changeset::decode_with_id(&body)
+        .map_err(|e| Error::Corrupt(format!("changeset {id}: {e}")))?;
+    if actual != id {
+        return Err(Error::Corrupt(format!(
+            "changeset {id} does not match its ID"
+        )));
+    }
+    Ok(cs)
 }
 
 /// Whether `repo` may see changeset `id`.
@@ -130,6 +140,46 @@ pub fn first_parent(c: &Connection, id: ChangesetId) -> Result<Option<ChangesetI
         )
         .optional()?;
     parent.map(|bytes| to_id(&bytes)).transpose()
+}
+
+/// Whether `ancestor` is `descendant` or reachable from it through parents.
+///
+/// Walks every parent, not only first parents. A parent's generation is
+/// always below its child's, so the walk never goes below the generation of
+/// `ancestor`, and visits each changeset at most once.
+///
+/// # Errors
+///
+/// [`Error::NotFound`] if `repo` does not have either changeset.
+pub fn is_ancestor(
+    c: &Connection,
+    repo: RepoId,
+    ancestor: ChangesetId,
+    descendant: ChangesetId,
+) -> Result<bool> {
+    let floor = generation(c, repo, ancestor)?;
+    let mut parents = c.prepare_cached(
+        "SELECT parent, gen FROM changeset_parents JOIN changesets ON id = parent
+         WHERE cs = ?1",
+    )?;
+    let mut seen = HashSet::new();
+    let mut stack = vec![(descendant, generation(c, repo, descendant)?)];
+    while let Some((id, id_gen)) = stack.pop() {
+        if id == ancestor {
+            return Ok(true);
+        }
+        if id_gen <= floor || !seen.insert(id) {
+            continue;
+        }
+        let rows = parents.query_map([id.as_bytes()], |row| {
+            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
+        })?;
+        for row in rows {
+            let (parent, parent_gen) = row?;
+            stack.push((to_id(&parent)?, parent_gen));
+        }
+    }
+    Ok(false)
 }
 
 /// Where a ref points, if it exists.

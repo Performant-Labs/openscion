@@ -10,9 +10,13 @@ use std::process::{Command, Stdio};
 
 use gix::ObjectId;
 use rusqlite::{Connection, params};
-use scion_core::{ChangesetId, Entry, FileState, GitOid, IdentityTime, PathElem, RepoPath};
+use scion_core::{
+    BlobId, Changeset, ChangesetId, Entry, FileState, GitOid, IdentityTime, PathElem, RepoPath,
+};
+use scion_server::auth::Caller;
 use scion_server::import::{ImportOptions, ImportReport, import_git};
-use scion_server::{Error, Store, db, read, tree};
+use scion_server::land::{LandRequest, LandState, Lands};
+use scion_server::{Error, Store, db, read, tree, write};
 use tempfile::TempDir;
 
 const SUBMODULE: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -537,5 +541,168 @@ fn verification_catches_missing_content() {
     match try_import(&store, &git, &h.swap) {
         Err(Error::Corrupt(msg)) => assert!(msg.contains("is not stored"), "{msg}"),
         other => panic!("expected a verification error, got {other:?}"),
+    }
+}
+
+#[test]
+fn verification_catches_a_corrupt_blob() {
+    let (git, h) = fixture();
+    let (dir, store) = open_store();
+    import(&store, &git, &h.root);
+    // The next commit does not touch this file, so its import does not
+    // rewrite the blob, and its check reads the damaged file back.
+    let hex = BlobId::of(b"deep\n").to_string();
+    let file = dir
+        .path()
+        .join("objects/blob")
+        .join(&hex[..2])
+        .join(&hex[2..]);
+    fs::write(file, zstd::bulk::compress(b"other content\n", 3).unwrap()).unwrap();
+
+    match try_import(&store, &git, &h.swap) {
+        Err(Error::Corrupt(msg)) => {
+            assert!(msg.contains("src/nested/deep/file.txt"), "{msg}");
+            assert!(msg.contains("is corrupt"), "{msg}");
+        }
+        other => panic!("expected a verification error, got {other:?}"),
+    }
+}
+
+fn main_ref(store: &Store) -> db::RefState {
+    store
+        .read(|c| db::get_ref(c, db::repo_id(c, "r")?, "main"))
+        .unwrap()
+        .unwrap()
+}
+
+/// Asserts that an import failed because `main` is not an ancestor of the
+/// imported tip, and that the error names both.
+fn assert_diverged(result: Result<ImportReport, Error>, main: ChangesetId, tip: ChangesetId) {
+    match result {
+        Err(Error::InvalidArgument(msg)) => {
+            assert!(msg.contains("diverged from git"), "{msg}");
+            assert!(msg.contains(&main.to_string()), "{msg}");
+            assert!(msg.contains(&tip.to_string()), "{msg}");
+        }
+        other => panic!("expected a diverged ref, got {other:?}"),
+    }
+}
+
+#[test]
+fn import_never_moves_a_ref_off_a_land() {
+    let (git, h) = fixture();
+    let (_dir, store) = open_store();
+    let imported = import(&store, &git, "HEAD").tip;
+    assert_eq!(imported, changeset_of(&store, &h.submodule));
+
+    // A changeset created and landed on `main` after the import.
+    let file = FileState::Regular {
+        content: store.blobs().put(b"landed\n").unwrap(),
+        executable: false,
+    };
+    let created = Changeset {
+        parents: vec![imported],
+        author: IdentityTime {
+            name: b"Ada".to_vec(),
+            email: b"ada@example.com".to_vec(),
+            unix_secs: 1_700_000_200,
+            tz_offset_minutes: 0,
+        },
+        committer: None,
+        message: b"land\n".to_vec(),
+        changes: BTreeMap::from([(path("landed.txt"), Some(file))]),
+    };
+    let created = write::create_changeset(&store, "r", &created.encode()).unwrap();
+    let request = LandRequest {
+        repo: "r".into(),
+        changeset: created,
+        target_ref: "main".into(),
+        request_key: "k".into(),
+    };
+    let outcome = Lands::default()
+        .land(&store, &Caller("t".into()), &request)
+        .unwrap();
+    assert_eq!(outcome.state, LandState::Landed);
+    let landed = main_ref(&store);
+    assert_eq!(landed.target, created);
+
+    // The same git tip again: `main` is ahead of it.
+    assert_diverged(try_import(&store, &git, "HEAD"), created, imported);
+    assert_eq!(main_ref(&store), landed);
+
+    // A git descendant of that tip does not have the land either.
+    git.write("after.txt", "git moved on\n");
+    let next = git.commit("git moves on");
+    assert_diverged(
+        try_import(&store, &git, &next),
+        created,
+        changeset_of(&store, &next),
+    );
+    assert_eq!(main_ref(&store), landed, "the land is not discarded");
+
+    // The commits are imported, so another ref can take them.
+    let mut other = opts(&next);
+    other.target_ref = "git/main".to_owned();
+    let report = import_git(&store, "r", git.path(), &other).unwrap();
+    assert_eq!(report.imported, 0);
+    assert_eq!(
+        read::resolve_ref(&store, "r", "git/main").unwrap(),
+        report.tip
+    );
+}
+
+#[test]
+fn criss_cross_merges_import_and_the_ref_moves_only_to_descendants() {
+    let git = Git::init();
+    git.write("base.txt", "base\n");
+    git.commit("base");
+    git.run(&["checkout", "-q", "-b", "b"]);
+    git.write("b.txt", "b\n");
+    git.commit("b1");
+    git.run(&["checkout", "-q", "main"]);
+    git.write("a.txt", "a\n");
+    let a1 = git.commit("a1");
+    // Two merges of a1 and b1 with the parents swapped, each extended.
+    git.run(&["merge", "-q", "--no-ff", "b", "-m", "m1 = a1 + b1"]);
+    let m1 = git.head();
+    git.write("a.txt", "a2\n");
+    let a2 = git.commit("a2");
+    git.run(&["checkout", "-q", "b"]);
+    git.run(&["merge", "-q", "--no-ff", &a1, "-m", "m2 = b1 + a1"]);
+    let m2 = git.head();
+    git.write("c.txt", "c\n");
+    let b2 = git.commit("b2");
+    // A merge with two merge bases, a1 and b1.
+    git.run(&["checkout", "-q", "main"]);
+    git.run(&["merge", "-q", "--no-ff", "b", "-m", "criss-cross"]);
+    let tip = git.head();
+
+    let (_dir, store) = open_store();
+    import(&store, &git, &a1);
+    // a1 is only the second parent of m2.
+    import(&store, &git, &m2);
+    assert_eq!(main_ref(&store).target, changeset_of(&store, &m2));
+    // m1 and m2 merge the same commits, but neither descends from the other.
+    assert_diverged(
+        try_import(&store, &git, &m1),
+        changeset_of(&store, &m2),
+        changeset_of(&store, &m1),
+    );
+    assert_eq!(main_ref(&store).target, changeset_of(&store, &m2));
+
+    let report = import(&store, &git, &tip);
+    assert_eq!(
+        (report.commits, report.imported, report.verified),
+        (8, 3, 3),
+        "a2, b2 and the criss-cross merge are new; m1 was imported above"
+    );
+    assert_eq!(main_ref(&store).target, report.tip);
+    let merge = read::get_changeset(&store, "r", report.tip).unwrap();
+    assert_eq!(
+        merge.parents,
+        [changeset_of(&store, &a2), changeset_of(&store, &b2)]
+    );
+    for name in ["a.txt", "b.txt", "c.txt", "base.txt"] {
+        assert!(root_entry(&store, report.tip, name).is_some(), "{name}");
     }
 }

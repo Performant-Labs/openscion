@@ -1,10 +1,10 @@
 //! Writes: store blobs and create changesets. Neither moves a ref.
 
-use scion_core::{BlobId, Changeset, ChangesetId, RepoPath};
+use scion_core::{BlobId, Changeset, ChangesetId};
 
 use crate::db;
 use crate::error::{Error, Result};
-use crate::store::Store;
+use crate::store::{BlobStatus, Store};
 use crate::tree;
 
 /// Most path changes in one created changeset.
@@ -32,12 +32,13 @@ pub fn put_blob(store: &Store, repo: &str, data: &[u8]) -> Result<BlobId> {
 /// [`Error::NotFound`] if the repo does not exist. [`Error::InvalidArgument`]
 /// unless the bytes decode, the changeset has exactly one parent that the repo
 /// has, no committer, fits the request limits, and every blob it names is
-/// stored. [`Error::Apply`] if the changes do not apply to the parent's tree.
+/// stored intact. [`Error::Apply`] if the changes do not apply to the parent's
+/// tree. [`Error::Io`] if a blob cannot be read.
 pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<ChangesetId> {
     // SHORTCUT: limits are checked after a full decode, so one request can
     // still decode as many changes as fit in one gRPC message. Upgrade: a
     // decoder that stops at a count limit.
-    let cs = Changeset::decode(bytes)
+    let (cs, id) = Changeset::decode_with_id(bytes)
         .map_err(|e| Error::InvalidArgument(format!("bad changeset: {e}")))?;
     let parent = check_request(&cs)?;
     // The blob check touches only the object folder, so it runs before the
@@ -45,12 +46,7 @@ pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<Chang
     // SHORTCUT: blobs are shared by all repos, so a changeset may name a blob
     // that another repo uploaded and then read it. Safe with one principal.
     // Upgrade before multi-tenant auth: a repo_blobs table checked here.
-    if let Some((path, blob)) = first_missing_blob(store, &cs) {
-        return Err(Error::InvalidArgument(format!(
-            "blob {blob} for {path:?} is not stored; upload it with PutBlob first"
-        )));
-    }
-    let id = cs.id();
+    check_blobs(store, &cs)?;
     store.write(|c| {
         let repo_id = db::repo_id(c, repo)?;
         if db::has_changeset(c, repo_id, id)? {
@@ -97,10 +93,22 @@ fn check_request(cs: &Changeset) -> Result<ChangesetId> {
     Ok(parent)
 }
 
-/// The first put, in path order, whose blob is not stored.
-fn first_missing_blob<'a>(store: &Store, cs: &'a Changeset) -> Option<(&'a RepoPath, BlobId)> {
-    cs.changes
+/// Fails on the first put, in path order, whose blob is not stored intact.
+/// Reads every blob back, so a torn or overwritten file is not accepted.
+fn check_blobs(store: &Store, cs: &Changeset) -> Result<()> {
+    let puts = cs
+        .changes
         .iter()
-        .filter_map(|(path, state)| Some((path, state.as_ref()?.blob()?)))
-        .find(|&(_, blob)| !store.blobs().contains(blob))
+        .filter_map(|(path, state)| Some((path, state.as_ref()?.blob()?)));
+    for (path, blob) in puts {
+        let problem = match store.blobs().verify(blob)? {
+            BlobStatus::Valid => continue,
+            BlobStatus::Missing => "is not stored",
+            BlobStatus::Corrupt => "is corrupt",
+        };
+        return Err(Error::InvalidArgument(format!(
+            "blob {blob} for {path:?} {problem}; upload it with PutBlob"
+        )));
+    }
+    Ok(())
 }
