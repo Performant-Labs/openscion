@@ -412,19 +412,19 @@ fn rejects_unsorted_and_duplicate_paths() {
 #[test]
 fn rejects_too_many_changes_before_reading_them() {
     let two = W::header(2).bytes(b"a").u8(0).bytes(b"b").u8(0).0;
-    let at_limit = Changeset::decode_with_id_max_changes(&two, 2);
-    assert!(at_limit.is_ok());
-    assert_eq!(at_limit, Changeset::decode_with_id(&two));
+    assert_eq!(
+        Changeset::decode_with_id_max_changes(&two, 2).unwrap(),
+        Changeset::decode_with_id(&two).unwrap()
+    );
     assert_eq!(
         Changeset::decode_with_id_max_changes(&two, 1),
         Err(DecodeError::TooManyChanges(1))
     );
     // The count says u32::MAX changes and no change follows. The limit error,
-    // not UnexpectedEnd, shows that no change was read.
-    let huge = W::header(u32::MAX).0;
-    assert_eq!(Changeset::decode(&huge), Err(DecodeError::UnexpectedEnd));
+    // not UnexpectedEnd as in `rejects_lengths_past_the_end_without_allocating`,
+    // shows that no change was read.
     assert_eq!(
-        Changeset::decode_with_id_max_changes(&huge, 2),
+        Changeset::decode_with_id_max_changes(&W::header(u32::MAX).0, 2),
         Err(DecodeError::TooManyChanges(2))
     );
 }

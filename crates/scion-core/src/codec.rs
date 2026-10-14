@@ -19,7 +19,7 @@ const TAG_DIR: u8 = 4;
 const GIT_SHA1: u8 = 1;
 const GIT_SHA256: u8 = 2;
 
-/// Why bytes are not a canonical v1 object.
+/// Why bytes are not a canonical v1 object, or break a limit the caller set.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum DecodeError {
     /// The input ends before the object does, or a length points past the end.
@@ -111,7 +111,7 @@ impl Changeset {
     ///
     /// As [`Changeset::decode`].
     pub fn decode_with_id(bytes: &[u8]) -> Result<(Self, ChangesetId), DecodeError> {
-        Self::decode_with_id_max_changes(bytes, usize::MAX)
+        Ok((Self::decode(bytes)?, ChangesetId::hash(bytes)))
     }
 
     /// As [`Changeset::decode_with_id`], with at most `max_changes` changes.
@@ -126,8 +126,10 @@ impl Changeset {
         bytes: &[u8],
         max_changes: usize,
     ) -> Result<(Self, ChangesetId), DecodeError> {
-        let cs = Self::decode_max_changes(bytes, max_changes)?;
-        Ok((cs, ChangesetId::hash(bytes)))
+        Ok((
+            Self::decode_max_changes(bytes, max_changes)?,
+            ChangesetId::hash(bytes),
+        ))
     }
 
     fn decode_max_changes(bytes: &[u8], max_changes: usize) -> Result<Self, DecodeError> {

@@ -35,8 +35,6 @@ pub fn put_blob(store: &Store, repo: &str, data: &[u8]) -> Result<BlobId> {
 /// stored intact. [`Error::Apply`] if the changes do not apply to the parent's
 /// tree. [`Error::Io`] if a blob cannot be read.
 pub fn create_changeset(store: &Store, repo: &str, bytes: &[u8]) -> Result<ChangesetId> {
-    // The decoder stops at the change count, so a request with too many
-    // changes is refused before any change is read.
     let (cs, id) = Changeset::decode_with_id_max_changes(bytes, MAX_CHANGES)
         .map_err(|e| Error::InvalidArgument(format!("bad changeset: {e}")))?;
     let parent = check_request(&cs)?;
