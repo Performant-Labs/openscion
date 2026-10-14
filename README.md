@@ -97,8 +97,8 @@ the server returns the first result.
 | Blame and path history | Planned |
 | Users, permissions per folder | Planned |
 
-Measured on an Apple M2 Pro laptop, one server process: 200 agents landed
-10,000 changes in parallel at about 210 lands per second, with none lost or
+Measured on a laptop with one server process: 200 agents landed 10,000
+changes in parallel at about 210 lands per second, with none lost or
 duplicated. Importing a git repository with 23,871 commits took 50 seconds.
 Today the write rate is limited by one full disk flush per new file; batching
 those flushes across requests is the next step.
