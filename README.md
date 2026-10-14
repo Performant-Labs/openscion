@@ -127,6 +127,7 @@ with it.
 | [`crates/scion-proto`](crates/scion-proto) | gRPC API ([`proto/scion.proto`](proto/scion.proto)) |
 | [`crates/scion-server`](crates/scion-server) | Storage, commits, lands, reads, git import |
 | [`crates/scn`](crates/scn) | Command-line client |
+| [`docs/architecture.md`](docs/architecture.md) | How the parts fit together: storage, lands, reads, and the planned cache tiers |
 | [`docs/format-v1.md`](docs/format-v1.md) | The v1 byte format. Object IDs are hashes of these bytes. |
 
 ## Design notes
