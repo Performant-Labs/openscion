@@ -7,8 +7,10 @@ Scion is an independent implementation of the design that Anthropic described
 in [Redesigning source control](https://www.anthropic.com/engineering/redesigning-source-control).
 It is not affiliated with or endorsed by Anthropic.
 
-> **Status: early proof of concept.** The object format is done. The server,
-> client, and checkout are not built yet. Do not use it for real code.
+> **Status: early proof of concept.** Git import, server-side commits and
+> lands, and reads over the API work on one machine. Checkout, caching tiers
+> and access control beyond one token are not built yet. Do not use it for
+> real code.
 
 ## Idea
 
@@ -34,7 +36,26 @@ agent ── "src/a.rs changed" ──> scion-server ── rebase + move main �
 | Path | Contents |
 |---|---|
 | [`crates/scion-core`](crates/scion-core) | Object model and canonical byte format |
+| [`crates/scion-proto`](crates/scion-proto) | gRPC API ([`proto/scion.proto`](proto/scion.proto)) |
+| [`crates/scion-server`](crates/scion-server) | Storage, commits, lands, reads, git import |
+| [`crates/scn`](crates/scn) | Command-line client |
 | [`docs/format-v1.md`](docs/format-v1.md) | The v1 byte format. Object IDs are hashes of these bytes. |
+
+## Try it
+
+```sh
+cargo build --release
+export SCION_TOKEN=dev SCION_SERVER=http://127.0.0.1:7878
+./target/release/scion-server --data /tmp/scion import /path/to/a/git/repo
+./target/release/scion-server --data /tmp/scion serve &
+
+./target/release/scn log -n 5
+./target/release/scn cat main:README.md
+echo hello > hello.txt
+cs=$(./target/release/scn commit -m "add hello" --put hello.txt=hello.txt)
+./target/release/scn land "$cs"
+./target/release/scn bench --agents 200 --lands 10000
+```
 
 ## Build and test
 
