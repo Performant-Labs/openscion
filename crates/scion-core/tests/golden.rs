@@ -410,6 +410,26 @@ fn rejects_unsorted_and_duplicate_paths() {
 }
 
 #[test]
+fn rejects_too_many_changes_before_reading_them() {
+    let two = W::header(2).bytes(b"a").u8(0).bytes(b"b").u8(0).0;
+    let at_limit = Changeset::decode_with_id_max_changes(&two, 2);
+    assert!(at_limit.is_ok());
+    assert_eq!(at_limit, Changeset::decode_with_id(&two));
+    assert_eq!(
+        Changeset::decode_with_id_max_changes(&two, 1),
+        Err(DecodeError::TooManyChanges(1))
+    );
+    // The count says u32::MAX changes and no change follows. The limit error,
+    // not UnexpectedEnd, shows that no change was read.
+    let huge = W::header(u32::MAX).0;
+    assert_eq!(Changeset::decode(&huge), Err(DecodeError::UnexpectedEnd));
+    assert_eq!(
+        Changeset::decode_with_id_max_changes(&huge, 2),
+        Err(DecodeError::TooManyChanges(2))
+    );
+}
+
+#[test]
 fn rejects_bad_paths() {
     let long = vec![b'a'; 4097];
     let deep = vec!["a"; 257].join("/");

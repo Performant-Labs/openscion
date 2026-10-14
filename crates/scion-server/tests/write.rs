@@ -162,6 +162,19 @@ fn bad_requests_are_rejected_and_store_nothing() {
             "more than",
         ),
         (
+            // The count is the last field when there are no changes. Set it
+            // to u32::MAX and send no changes: the limit error, not "ends
+            // early", shows the decoder stopped before reading any change.
+            "change count above the limit, no changes sent",
+            {
+                let mut bytes = changeset(vec![f.root], &[]).encode();
+                let count = bytes.len() - 4;
+                bytes[count..].copy_from_slice(&u32::MAX.to_be_bytes());
+                bytes
+            },
+            "more than",
+        ),
+        (
             "message too long",
             ok(|cs| cs.message = vec![b'm'; MAX_COMMIT_MESSAGE_BYTES + 1]),
             "message",
@@ -205,6 +218,21 @@ fn bad_requests_are_rejected_and_store_nothing() {
         Err(Error::NotFound(_))
     ));
     assert_eq!(f.store.read(count_changesets).unwrap(), before);
+}
+
+#[test]
+fn exactly_max_changes_passes_the_limit() {
+    let f = fixture();
+    let mut cs = changeset(vec![f.root], &[]);
+    cs.changes = (0..MAX_CHANGES)
+        .map(|i| (path(&format!("f{i}")), None))
+        .collect();
+    // Each change deletes a missing file, so the request gets past the limit
+    // and fails only when the changes are applied.
+    match create_changeset(&f.store, REPO, &cs.encode()) {
+        Err(Error::Apply(ApplyError::DeleteMissing(_))) => {}
+        other => panic!("expected DeleteMissing, got {other:?}"),
+    }
 }
 
 #[test]

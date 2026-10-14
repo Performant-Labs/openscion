@@ -188,10 +188,10 @@ started.
 
 **CreateChangeset** (`write.rs`):
 
-1. Decode strictly.
-2. Check the request: exactly one parent, no committer, at most 100,000
-   changes, a message of at most 1 MiB, author name and email of at most
-   1 KiB each.
+1. Decode strictly, with at most 100,000 changes. A larger change count is
+   refused before any change is read.
+2. Check the request: exactly one parent, no committer, a message of at most
+   1 MiB, author name and email of at most 1 KiB each.
 3. Read back every blob it names, outside the database lock.
 4. In one write transaction: if the repo already has this ID, return it (a
    retry). The parent must be in the repo. Then `tree::store_changeset`.
@@ -423,7 +423,6 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/store.rs` (`Inner::db`) | One SQLite connection behind a mutex, so reads wait for writes. | A pool of read-only connections. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
 | `scion-server/src/store.rs` (`Store::open`) | One process per data directory, so an import needs the server stopped. | Let a separate importer process share the directory. Lands already re-plan when the ref moves (`MAX_ATTEMPTS`). |[#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/store.rs` (`Blobs::verify`) | Holds the packed and the unpacked bytes, up to about 200 MiB per call. | Stream the unpacked bytes into the hasher. | [#20](https://github.com/bnsd55/open-scion/issues/20) |
-| `scion-server/src/write.rs` (`create_changeset`) | Limits are checked after a full decode. | A decoder that stops at a count limit. |[#28](https://github.com/bnsd55/open-scion/issues/28) |
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/land.rs` (`MAX_ATTEMPTS`) | Imports move refs without the land lock, so a land retries 3 times, then returns `ABORTED`. | Route every ref move through the per-ref lander. |[#27](https://github.com/bnsd55/open-scion/issues/27) |
 | `scion-server/src/land.rs` (`Lands::land`) | An in-process lock serializes lands per ref, so this works with one server process. | One lander per ref that rebases a batch and moves the ref once. | [#18](https://github.com/bnsd55/open-scion/issues/18) |
