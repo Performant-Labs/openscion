@@ -60,3 +60,7 @@ release.
   where to continue. `scn merge-base`, `scn is-ancestor` (exit 0 or 1) and
   `scn diff`. Every `scn` error now exits 2, so it never reads as the "no"
   of `scn is-ancestor`.
+- Derived data is derived in bounded steps, one transaction each, so other
+  requests run between steps after a new kind or a version bump. Each step
+  removes some rows of older versions. `scion-server derive --kind
+  root_tree` fills a ref's history ahead of reads and removes the rest.
