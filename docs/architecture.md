@@ -146,6 +146,12 @@ replaces it.
   (`fullfsync = OFF`), except in checkpoints (`checkpoint_fullfsync`).
   Elsewhere the commit's `fsync` already flushes the cache. A land waits for
   the flush after it releases the ref's lock, so queued lands share it.
+- A read waits too. If `Store::read` saw a commit that no full flush covers
+  yet, it waits for one after it releases the database lock. So no reply
+  shows a commit that a power loss can undo, such as a ref target from
+  `ResolveRef` or a land state from `GetLand`. Where `fsync` already flushes
+  the drive cache, no read waits. A land reads with `Store::read_unflushed`,
+  because it flushes before it replies.
 - A blob is durable after `BlobBatch::sync`: a plain `fsync` of each blob file
   when written, then of each changed fan-out directory, then a shared full
   flush.
@@ -546,7 +552,6 @@ limit and its upgrade path. This is the list on `main` today.
 | `scion-server/src/store.rs` (`MAX_OBJECT_BYTES`) | An upload is buffered in memory, up to 100 MiB, before it is hashed and written. | Stream to a temp file and hash the chunks. | [#16](https://github.com/bnsd55/open-scion/issues/16) |
 | `scion-server/src/store.rs` (`Inner::db`) | One SQLite connection behind a mutex, so reads wait for writes. | A pool of read-only connections. | [#17](https://github.com/bnsd55/open-scion/issues/17) |
 | `scion-server/src/store.rs` (`Store::open`) | One process per data directory, so an import needs the server stopped. | Let a separate importer process share the directory. Lands already re-plan when the ref moves (`MAX_ATTEMPTS`). | [#27](https://github.com/bnsd55/open-scion/issues/27) |
-| `scion-server/src/store.rs` (`Store::flush`) | Between a commit and its full flush, other calls can read the commit, and a power loss can undo what they saw. | Hide commits until their flush, or a lander that batches lands. | [#18](https://github.com/bnsd55/open-scion/issues/18) |
 | `scion-server/src/store.rs` (`BlobBatch::keep`) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | [#35](https://github.com/bnsd55/open-scion/issues/35) |
 | `scion-server/src/write.rs` (`create_changeset`) | Blobs are shared by all repos. Safe with one principal. | A `repo_blobs` table, checked in `CreateChangeset`. | [#13](https://github.com/bnsd55/open-scion/issues/13) |
 | `scion-server/src/land.rs` (`MAX_ATTEMPTS`) | Imports move refs without the land lock, so a land retries 3 times, then returns `ABORTED`. | Route every ref move through the per-ref lander. | [#27](https://github.com/bnsd55/open-scion/issues/27) |
