@@ -139,7 +139,12 @@ Each tier keeps what it fetched, so a second checkout on the machine sends
 nothing past the daemon. The tiers serve only checkouts; the other `scn`
 commands talk to the server. The daemon's data directory must be private to
 your user (mode 0700, not a shared path such as `/tmp`), because its socket
-lives there.
+lives there. Each directory above it must be owned by root or by you, and
+must not be writable by group or others unless it has the sticky bit (as
+`/tmp` has). `scn` checks the same for the socket. The error names the
+directory; `chmod go-w DIR` fixes it. With umask 002 (a private group per
+user), new directories are group-writable, so they are refused until you run
+that.
 
 ```sh
 export SCION_UPSTREAM_TOKEN=dev                  # what each tier sends upstream
