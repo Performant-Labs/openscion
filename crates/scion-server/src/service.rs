@@ -183,11 +183,17 @@ pub async fn serve(
         ObjectsService::new(worker, access, quotas).into_server(),
         auth,
     );
+    // The health service answers `grpc.health.v1.Check` and `Watch` on the
+    // same port, without a token: a probe carries none. The store opens
+    // before this call, so the server starts serving.
+    let (health, shutdown) =
+        listen::health(&["scion.v1.Scion", "scion.v1.Objects"], shutdown).await;
     let router = |server: Server| {
         server
             .timeout(REQUEST_TIMEOUT)
             .add_service(scion)
             .add_service(objects)
+            .add_service(health)
     };
     limits
         .serve(
