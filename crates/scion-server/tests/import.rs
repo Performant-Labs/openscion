@@ -22,7 +22,8 @@ use scion_server::auth::Caller;
 use scion_server::deadline::Deadline;
 use scion_server::import::{BUSY_TRIES, CHECKS, ImportOptions, ImportReport, import_git};
 use scion_server::land::{LandRequest, LandState, Lands};
-use scion_server::{Error, Store, db, read, tree, write};
+use scion_server::meta::{MetaTx as _, RefState};
+use scion_server::{Error, Store, read, tree, write};
 use tempfile::TempDir;
 
 const SUBMODULE: &str = "0123456789abcdef0123456789abcdef01234567";
@@ -319,13 +320,16 @@ fn import_matches_git_and_repeats_as_a_no_op() {
     assert_eq!(report.tip, changeset_of(&store, &h.submodule));
     assert_eq!(read::resolve_ref(&store, "r", "main").unwrap(), report.tip);
 
-    let before = store.read(|c| Ok(row_counts(c))).unwrap();
+    let before = store.read(|c| Ok(row_counts(&*c))).unwrap();
     let again = import(&store, &git, "HEAD");
     assert_eq!((again.commits, again.imported, again.verified), (7, 0, 0));
     assert_eq!(again.tip, report.tip);
-    assert_eq!(store.read(|c| Ok(row_counts(c))).unwrap(), before);
+    assert_eq!(store.read(|c| Ok(row_counts(&*c))).unwrap(), before);
     let main = store
-        .read(|c| db::get_ref(c, db::repo_id(c, "r")?, "main"))
+        .read(|c| {
+            let repo = c.repo_id("r")?;
+            c.get_ref(repo, "main")
+        })
         .unwrap()
         .unwrap();
     assert_eq!(main.version, 1, "a repeated import does not move the ref");
@@ -535,7 +539,8 @@ fn verification_catches_a_tree_that_differs_from_git() {
     // The next commit applies its changes on top, so it inherits the file.
     store
         .write(|c| {
-            let root = tree::derive_root_tree(c, db::repo_id(c, "r")?, first.tip)?;
+            let repo = c.repo_id("r")?;
+            let root = tree::derive_root_tree(c, repo, first.tip)?;
             let extra = BTreeMap::from([(
                 path("extra.txt"),
                 Some(FileState::Regular {
@@ -607,9 +612,12 @@ fn verification_catches_a_corrupt_blob() {
     }
 }
 
-fn main_ref(store: &Store) -> db::RefState {
+fn main_ref(store: &Store) -> RefState {
     store
-        .read(|c| db::get_ref(c, db::repo_id(c, "r")?, "main"))
+        .read(|c| {
+            let repo = c.repo_id("r")?;
+            c.get_ref(repo, "main")
+        })
         .unwrap()
         .unwrap()
 }
@@ -760,7 +768,7 @@ fn identity() -> IdentityTime {
 
 /// Creates a changeset on `base` that puts `path`, through the write path.
 fn create(store: &Store, base: ChangesetId, path: &str) -> ChangesetId {
-    let repo = store.read(|c| db::repo_id(c, "r")).unwrap();
+    let repo = store.read(|c| c.repo_id("r")).unwrap();
     let upload = store.blobs().upload().unwrap();
     let upload = upload.append(path.as_bytes()).unwrap();
     let file = FileState::Regular {
@@ -808,7 +816,7 @@ fn an_import_process_shares_the_data_directory_with_lands() {
 
     // A land whose base is not on main builds main's path index at the
     // start, and leaves main alone.
-    let repo = store.read(|c| db::repo_id(c, "r")).unwrap();
+    let repo = store.read(|c| c.repo_id("r")).unwrap();
     let side = Changeset {
         parents: vec![],
         author: identity(),
@@ -816,9 +824,7 @@ fn an_import_process_shares_the_data_directory_with_lands() {
         message: b"side".to_vec(),
         changes: BTreeMap::new(),
     };
-    let side = store
-        .write(|c| db::insert_changeset(c, repo, &side))
-        .unwrap();
+    let side = store.write(|c| c.insert_changeset(repo, &side)).unwrap();
     let out = land(&store, &lands, create(&store, side, "s.txt"));
     assert_eq!(out.state, LandState::Rejected, "{}", out.detail);
     assert_eq!(main_ref(&store).target, start);
@@ -915,7 +921,7 @@ fn a_second_server_process_is_refused() {
 /// Creates the import's repo up front, so the import's first write is a
 /// batch, not the repo's create.
 fn make_repo(store: &Store) {
-    store.write(|c| db::create_repo(c, "r")).unwrap();
+    store.write(|c| c.create_repo("r")).unwrap();
 }
 
 /// A store that shares its data directory, so an import keeps its write

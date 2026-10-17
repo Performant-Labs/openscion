@@ -8,8 +8,9 @@ use scion_proto::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{GetLandRequest, LogRequest, PutBlobRequest};
 use scion_server::access::Access;
+use scion_server::meta::{MetaTx as _, RefState};
 use scion_server::quotas::Quotas;
-use scion_server::{Store, db, service};
+use scion_server::{Store, service};
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::ReceiverStream;
 use tonic::metadata::AsciiMetadataValue;
@@ -61,9 +62,8 @@ fn store() -> (tempfile::TempDir, Store) {
     let blob = store.blobs().put(b"# hello\n").unwrap();
     store
         .write(|c| {
-            let repo = db::create_repo(c, REPO)?;
-            let root = db::insert_changeset(
-                c,
+            let repo = c.create_repo(REPO)?;
+            let root = c.insert_changeset(
                 repo,
                 &Changeset {
                     parents: vec![],
@@ -85,8 +85,8 @@ fn store() -> (tempfile::TempDir, Store) {
                     .into(),
                 },
             )?;
-            db::cas_ref(c, repo, "main", None, root)?;
-            db::add_repo_blob(c, repo, blob)?;
+            c.cas_ref(repo, "main", None, root)?;
+            c.add_repo_blob(repo, blob)?;
             Ok(root)
         })
         .unwrap();
@@ -96,9 +96,12 @@ fn store() -> (tempfile::TempDir, Store) {
 type Stop = tokio::sync::oneshot::Sender<()>;
 
 /// Where `main` of `REPO` points.
-fn main_ref(store: &Store) -> db::RefState {
+fn main_ref(store: &Store) -> RefState {
     store
-        .read(|c| db::get_ref(c, db::repo_id(c, REPO)?, "main"))
+        .read(|c| {
+            let repo = c.repo_id(REPO)?;
+            c.get_ref(repo, "main")
+        })
         .unwrap()
         .unwrap()
 }
@@ -354,8 +357,8 @@ async fn a_stream_holds_its_slot_until_the_stream_ends() {
     // `README` is the big one.
     store
         .write(|c| {
-            let repo = db::repo_id(c, REPO)?;
-            db::add_repo_blob(c, repo, blob)?;
+            let repo = c.repo_id(REPO)?;
+            c.add_repo_blob(repo, blob)?;
             let cs = Changeset {
                 parents: vec![],
                 author: scion_core::IdentityTime {
@@ -375,9 +378,9 @@ async fn a_stream_holds_its_slot_until_the_stream_ends() {
                 )]
                 .into(),
             };
-            let id = db::insert_changeset(c, repo, &cs)?;
-            let version = db::get_ref(c, repo, "main")?.unwrap().version;
-            assert!(db::cas_ref(c, repo, "main", Some(version), id)?);
+            let id = c.insert_changeset(repo, &cs)?;
+            let version = c.get_ref(repo, "main")?.unwrap().version;
+            assert!(c.cas_ref(repo, "main", Some(version), id)?);
             Ok(())
         })
         .unwrap();
