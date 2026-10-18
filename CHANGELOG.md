@@ -155,6 +155,11 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Changed
 
+- `fsck` and `gc` run against a Postgres-backed store (`#180`), through
+  the same metadata interface as on a data directory: both used to
+  refuse it. The collector's batches on Postgres hold one advisory key
+  per schema and at most 256 rows each, so a writer waits at most one
+  batch behind the collector.
 - `scn` errors say what to check next: one `check:` line under the error,
   keyed to the failure — a refused address, a certificate the client
   does not trust, a wrong token — and `scn mount` refuses a missing or
