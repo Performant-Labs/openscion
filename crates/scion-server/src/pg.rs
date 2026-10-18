@@ -1918,7 +1918,8 @@ impl MetaTx for PgTx<'_> {
         let size: i64 = self
             .c
             .query_opt(
-                "SELECT octet_length(body) FROM trees WHERE id = $1",
+                // octet_length of a bytea is int4; the read wants int8.
+                "SELECT octet_length(body)::bigint FROM trees WHERE id = $1",
                 &[P::bytes(&id_bytes(id.as_bytes()))],
             )?
             .ok_or_else(|| Error::NotFound(format!("tree {id}")))?
@@ -2411,10 +2412,21 @@ impl MetaTx for PgTx<'_> {
                 P::i64(i64::try_from(limit).unwrap_or(i64::MAX)),
             ],
         )?;
-        Ok(rows
-            .iter()
-            .map(|row| FsckDerivedRow(row.get(0), row.get(1), row.get(2), row.get(3), row.get(4)))
-            .collect())
+        rows.iter()
+            .map(|row| -> Result<FsckDerivedRow> {
+                // d.version is BIGINT here and u32 in the row: read the
+                // int8 first, like every numeric expression here.
+                let version: i64 = row.get(1);
+                Ok(FsckDerivedRow(
+                    row.get(0),
+                    u32::try_from(version)
+                        .map_err(|_| Error::Corrupt(format!("derived version {version}")))?,
+                    row.get(2),
+                    row.get(3),
+                    row.get(4),
+                ))
+            })
+            .collect()
     }
 }
 
