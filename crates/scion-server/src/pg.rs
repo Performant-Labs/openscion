@@ -81,6 +81,9 @@ struct PgInner {
     write_woken: Condvar,
     /// The walks in flight of this backend's derivations.
     derive: crate::derived::DeriveFlights,
+    /// The import's test hooks and busy-retry count, as the SQLite store
+    /// keeps its own.
+    hooks: crate::store::ImportHooks,
 }
 
 /// Clients for [`Pg::read`], so at most [`READERS`](crate::store::READERS)
@@ -649,6 +652,7 @@ impl Pg {
                 writers: Mutex::new(0),
                 write_woken: Condvar::new(),
                 derive: crate::derived::DeriveFlights::new(crate::store::DERIVE_WALKS_CAP),
+                hooks: crate::store::ImportHooks::default(),
             }),
         })
     }
@@ -741,6 +745,12 @@ impl Pg {
     /// The walks in flight of this backend's derivations.
     pub(crate) fn derive_flights(&self) -> &crate::derived::DeriveFlights {
         &self.inner.derive
+    }
+
+    /// The import's test hooks and busy-retry count.
+    #[must_use]
+    pub fn hooks(&self) -> &crate::store::ImportHooks {
+        &self.inner.hooks
     }
 
     /// How many writers wait for the write client right now.
