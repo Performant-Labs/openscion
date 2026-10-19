@@ -219,6 +219,11 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- A silent TLS peer holds its connection's place for at most the
+  handshake timeout, not twice that: one deadline from the accept
+  bounds the TLS handshake and the HTTP/2 preface that follows it
+  together, so the preface timer gets what is left of the deadline
+  after the handshake ends.
 - A `Diff` call's rename search could index every large added file for
   one deleted file, far past the budget that bounds it: one file's work
   was its index of every added file it could be like, and the budget
