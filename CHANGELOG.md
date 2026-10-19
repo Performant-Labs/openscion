@@ -225,6 +225,15 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- A blame walk checks the call's deadline before each step, the first
+  diff too (`#299`), and one diff reads no version past 1,048,576
+  lines: a request file over the cap answers `RESOURCE_EXHAUSTED`, as
+  one whose memory share is more than the whole budget does, and a
+  version over the cap in the file's history counts as absent, as one
+  whose bytes do not fit the budget does. Before, the first step's
+  diff ran past every bound: two versions of a file at the blob limit
+  that share nothing kept a worker for hours, with no deadline check
+  inside the diff.
 - A damaged backend marker is refused, in both directions: a marker
   whose first line is neither `postgres` nor absent used to be read as
   absent, so a Postgres-backed directory opened as a fresh, empty
@@ -240,6 +249,7 @@ The first release: the server, its cache tiers, and the `scn` client.
   `--max-principal-pending-lands` refuse 0: those values used to mean
   that the sweep rejects every pending land, or that every call and
   land is refused, with no word of it at start.
+
 - A fill of a kind over every parent (the commit graph) no longer holds
   a parent once per child that reached it in its walk: the seen set now
   checks pushes, so the walk's queue is as wide as the graph's frontier
