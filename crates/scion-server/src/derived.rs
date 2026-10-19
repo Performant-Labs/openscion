@@ -147,6 +147,27 @@ fn get_until<K: Kind>(
     value
 }
 
+/// The bytes of memory that one entry of a derive walk's frontier holds:
+/// a [`ChangesetId`] and a generation. An estimate: a merge's parents also
+/// sit in `next` once each, so a merge-heavy history can hold a little
+/// more per visited changeset.
+const BYTES_PER_WALKED: usize = 40;
+
+/// The bytes a walk takes per step: the step's growth lands in `seen` and
+/// again in `pending`, and `next` holds the DAG's frontier, so a step of
+/// [`STEP`] visits costs about twice [`STEP`] entries plus the frontier.
+fn walk_step_bytes() -> usize {
+    (2 * STEP + 1) * BYTES_PER_WALKED
+}
+
+/// The bytes of memory that all bounded derive walks of one store share:
+/// a walk takes `walk_step_bytes()` per step for what its frontier grows
+/// by, so together the walks in flight hold no more than this, however
+/// deep the repo. A walk over a history too deep for it stops at its
+/// step boundary, and the call answers busy; the unbounded forms (fsck,
+/// import, the derive command) finish the walk.
+const DERIVE_WALK_BUDGET: usize = 1 << 30;
+
 /// The derive walks of one [`Store`]: which are in flight, and the cap on
 /// how many may be. Every `Store` in the process keeps its own, so repo 1
 /// of one store never joins the walk of repo 1 of another.
@@ -161,6 +182,12 @@ pub(crate) struct DeriveFlights {
     /// The cap on walks in flight. Each walk holds the write connection in
     /// turns, so walks beyond the cap only repeat work and starve writes.
     walks_cap: usize,
+    /// The bytes the bounded walks of this store may hold for their
+    /// frontiers, as one pool they take from per step. A walk over the
+    /// budget stops at its step boundary, and the call answers busy, so a
+    /// retry resumes when the budget has room again. The unbounded forms
+    /// (fsck, import, the derive command) take none.
+    walk_bytes: crate::memory::Bytes,
     /// The operator metrics, set once by the server before it serves:
     /// the walks in flight and the walks in the wait are gauges there.
     /// Empty in import, fsck and gc, which export none.
@@ -174,6 +201,21 @@ impl DeriveFlights {
             in_flight: Mutex::new(0),
             woken: Condvar::new(),
             walks_cap,
+            walk_bytes: crate::memory::Bytes::named(DERIVE_WALK_BUDGET, "derive walk"),
+            metrics: std::sync::OnceLock::new(),
+        }
+    }
+
+    /// A flights set whose bounded walks share `walk_bytes`. For tests of
+    /// the byte budget, which use a pool a chain can outgrow.
+    #[cfg(test)]
+    pub(crate) fn with_walk_bytes(walks_cap: usize, walk_bytes: crate::memory::Bytes) -> Self {
+        Self {
+            flights: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(0),
+            woken: Condvar::new(),
+            walks_cap,
+            walk_bytes,
             metrics: std::sync::OnceLock::new(),
         }
     }
@@ -182,6 +224,12 @@ impl DeriveFlights {
     /// server serves.
     pub(crate) fn set_metrics(&self, metrics: std::sync::Arc<crate::metrics::Metrics>) {
         let _ = self.metrics.set(metrics);
+    }
+
+    /// The bytes pool the bounded walks of this store share. Cheap: the
+    /// pool is a shared handle.
+    pub(crate) fn walk_bytes(&self) -> crate::memory::Bytes {
+        self.walk_bytes.clone()
     }
 }
 
@@ -403,10 +451,15 @@ fn in_one_walk<K: Kind>(
 /// removes up to [`STEP`] rows of older versions of `K`. So an error or a
 /// crash keeps every step before it, and the next call goes on from there.
 ///
-/// The walk keeps the changesets without a value in memory, 40 bytes each,
-/// so that it visits each one once. A walk over every parent also keeps the
-/// set of the changesets it visited; the set keeps `next` deduplicated, so
-/// it holds at most one entry per visited changeset.
+/// The walk keeps the changesets without a value in memory, about 40 bytes
+/// each ([`BYTES_PER_WALKED`]), so that it visits each one once. A walk
+/// over every parent also keeps the set of the changesets it visited; the
+/// set keeps `next` deduplicated, so it holds at most one entry per
+/// visited changeset. A walk that answers a request holds its frontier in
+/// the store's byte budget ([`DERIVE_WALK_BUDGET`]): over the budget it
+/// stops at its step boundary, and the call answers `Unavailable` so a
+/// retry resumes. The unbounded forms (fsck, import, the derive command)
+/// take no bytes.
 ///
 /// # Errors
 ///
@@ -438,12 +491,21 @@ fn fill_until<K: Kind>(
     deadline: Option<&Deadline>,
 ) -> Result<K::Value> {
     let check = || deadline.map_or(Ok(()), Deadline::check);
-    let pending = match walk_all::<K>(store, repo, cs, check)? {
+    // A walk that answers a request holds its frontier inside the store's
+    // byte budget, so that however deep the repo, the walks in flight hold
+    // no more than it. The unbounded forms (fsck, import, the derive
+    // command) pass no deadline and take no bytes.
+    let budget = deadline.map(|_| store.derive_flights().walk_bytes());
+    let mut held = Vec::new();
+    let pending = match walk_all::<K>(store, repo, cs, check, budget.as_ref(), &mut held)? {
         ControlFlow::Break(value) => return Ok(value),
         ControlFlow::Continue(pending) => pending,
     };
-    derive_steps::<K>(store, repo, &pending, deadline, check)?
-        .ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
+    // The walk's frontier stays in memory through the derives, so its
+    // bytes stay taken until they are done.
+    let value = derive_steps::<K>(store, repo, &pending, deadline, check)?;
+    drop(held);
+    value.ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
 }
 
 /// Fills `K` for `cs` and its history, then removes every
@@ -537,10 +599,13 @@ fn walk_all<K: Kind>(
     repo: RepoId,
     cs: ChangesetId,
     check: impl Fn() -> Result<()>,
+    budget: Option<&crate::memory::Bytes>,
+    held: &mut Vec<crate::memory::Held>,
 ) -> Result<ControlFlow<K::Value, Vec<ChangesetId>>> {
     let first = store.read_unflushed(|c| {
         Ok(match Walk::start::<K>(c, repo, cs)? {
             ControlFlow::Continue(mut walk) => {
+                take_walk_bytes(budget, held, &walk)?;
                 walk.step::<K>(c, STEP)?;
                 ControlFlow::Continue(walk)
             }
@@ -553,9 +618,34 @@ fn walk_all<K: Kind>(
     };
     while !walk.next.is_empty() {
         check()?;
+        take_walk_bytes(budget, held, &walk)?;
         store.read_unflushed(|c| walk.step::<K>(c, STEP))?;
     }
     Ok(ControlFlow::Continue(walk.into_pending()))
+}
+
+/// Takes the walk's bytes for one more step: the frontier it already
+/// holds, plus one step's growth, from the store's pool. Over the budget,
+/// the walk stops at its step boundary: the steps before it stay, and the
+/// call answers busy, so a retry resumes when the budget has room.
+fn take_walk_bytes(
+    budget: Option<&crate::memory::Bytes>,
+    held: &mut Vec<crate::memory::Held>,
+    walk: &Walk,
+) -> Result<()> {
+    let Some(budget) = budget else {
+        return Ok(());
+    };
+    match budget.try_take(walk_step_bytes()) {
+        Ok(one) => held.push(one),
+        Err(_) => {
+            return Err(Error::Unavailable(format!(
+                "the derive walk is over its byte budget, at a frontier of {} bytes; retry",
+                walk.bytes()
+            )));
+        }
+    }
+    Ok(())
 }
 
 /// Where a walk of [`fill`] stands.
@@ -631,6 +721,13 @@ impl Walk {
     fn into_pending(mut self) -> Vec<ChangesetId> {
         self.pending.sort_unstable();
         self.pending.into_iter().map(|(_, id)| id).collect()
+    }
+
+    /// The bytes of memory the walk holds, by the [`BYTES_PER_WALKED`
+    /// ] estimate: one entry each in `seen`, `pending` and `next` per
+    /// changeset it visited or waits to visit.
+    fn bytes(&self) -> usize {
+        (self.seen.len() + self.pending.len() + self.next.len()) * BYTES_PER_WALKED
     }
 }
 
@@ -783,7 +880,7 @@ fn require(c: &mut dyn MetaTx, repo: RepoId, cs: ChangesetId) -> Result<()> {
 mod tests {
     use crate::backend::Backend;
     use crate::db::SqliteTx;
-    use crate::store::Store;
+    use crate::store::{DERIVE_WALKS_CAP, Store};
     use rusqlite::Connection;
     use std::cell::Cell;
     use std::collections::HashMap;
@@ -1388,7 +1485,8 @@ mod tests {
         let tip = ids[4];
         // One fill walks. Another fill derives the history before the first
         // one's steps run.
-        let walked = walk_all::<ChangedPathsV1>(&store, repo, tip, || Ok(()));
+        let walked =
+            walk_all::<ChangedPathsV1>(&store, repo, tip, || Ok(()), None, &mut Vec::new());
         let ControlFlow::Continue(pending) = walked.unwrap() else {
             panic!("no value is stored yet");
         };
@@ -1431,6 +1529,91 @@ mod tests {
                 n as u64
             );
         }
+    }
+
+    /// A walk whose frontier outgrows the store's byte budget stops at
+    /// its step boundary and the call answers busy, naming the frontier;
+    /// a retry once the budget has room resumes and finishes. The walk's
+    /// memory at the stop is past the budget by at most one step's
+    /// growth, never more.
+    #[test]
+    fn a_derive_walk_over_its_byte_budget_stops_busy_and_a_retry_resumes() {
+        // The walk of a chain of 12 takes six steps (STEP is 2 in tests);
+        // the store's budget holds seven steps' worth, and this test holds
+        // two of them, as the walks of other callers would.
+        let budget = 7 * walk_step_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::Sqlite(
+            Store::open_with_walk_bytes(
+                dir.path(),
+                DERIVE_WALKS_CAP,
+                crate::memory::Bytes::named(budget, "derive walk"),
+            )
+            .unwrap(),
+        );
+        let (repo, ids) = store.write(|c| store_chain(c, &chain(12))).unwrap();
+        let tip = ids[11];
+        let held = store
+            .derive_flights()
+            .walk_bytes()
+            .try_take(2 * walk_step_bytes())
+            .unwrap();
+        let deadline = Deadline::new(std::time::Instant::now() + Duration::from_secs(60));
+        let busy = get_by::<Ancestry>(&store, repo, tip, &deadline);
+        let Err(Error::Unavailable(why)) = &busy else {
+            panic!("not busy: {busy:?}");
+        };
+        assert!(why.contains("byte budget"), "{why}");
+        // The frontier the walk stopped at: the budget plus at most one
+        // step's growth, never more.
+        let frontier: usize = why
+            .rsplit_once("a frontier of ")
+            .and_then(|(_, rest)| rest.split(' ').next())
+            .and_then(|n| n.parse().ok())
+            .expect("the busy answer names the frontier");
+        assert!(
+            frontier <= budget + walk_step_bytes(),
+            "a frontier of {frontier} bytes on a budget of {budget} bytes"
+        );
+        // The steps before the stop stay: the walk stored nothing, and
+        // neither did the derives it never reached.
+        assert_eq!(
+            rows_of(&store, Ancestry::NAME, Ancestry::VERSION),
+            [] as [(Vec<u8>, Vec<u8>); 0]
+        );
+        // A retry while the budget is still held stops busy again.
+        assert!(matches!(
+            get_by::<Ancestry>(&store, repo, tip, &deadline),
+            Err(Error::Unavailable(_))
+        ));
+        // With room again, a retry resumes and finishes.
+        drop(held);
+        get_by::<Ancestry>(&store, repo, tip, &deadline).unwrap();
+        assert_eq!(rows_of(&store, Ancestry::NAME, Ancestry::VERSION).len(), 12);
+    }
+
+    /// The unbounded forms (fsck, import, the derive command) take no
+    /// bytes: a history the budget cannot hold still derives.
+    #[test]
+    fn an_unbounded_derive_walk_takes_no_bytes() {
+        let budget = walk_step_bytes();
+        let dir = tempfile::tempdir().unwrap();
+        let store = Backend::Sqlite(
+            Store::open_with_walk_bytes(
+                dir.path(),
+                DERIVE_WALKS_CAP,
+                crate::memory::Bytes::named(budget, "derive walk"),
+            )
+            .unwrap(),
+        );
+        let (repo, ids) = store.write(|c| store_chain(c, &chain(12))).unwrap();
+        assert_eq!(
+            get_unbounded::<Ancestry>(&store, repo, ids[11])
+                .unwrap()
+                .len(),
+            12
+        );
+        assert_eq!(rows_of(&store, Ancestry::NAME, Ancestry::VERSION).len(), 12);
     }
 
     #[test]

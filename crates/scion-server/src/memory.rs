@@ -28,6 +28,8 @@ pub struct Bytes(Arc<Pool>);
 
 #[derive(Debug)]
 struct Pool {
+    /// What the pool's callers hold, for the errors to name.
+    name: &'static str,
     cap: usize,
     free: Mutex<usize>,
     woke: Condvar,
@@ -50,7 +52,15 @@ impl Bytes {
     /// A pool of `cap` bytes, all free.
     #[must_use]
     pub fn new(cap: usize) -> Self {
+        Self::named(cap, "blame")
+    }
+
+    /// A pool of `cap` bytes, all free, whose callers hold `name`: what
+    /// the errors name when bytes do not fit or wait too long.
+    #[must_use]
+    pub fn named(cap: usize, name: &'static str) -> Self {
         Self(Arc::new(Pool {
+            name,
             cap,
             free: Mutex::new(cap),
             woke: Condvar::new(),
@@ -115,8 +125,8 @@ impl Bytes {
             // with the deadline's code, as every other deadline does.
             if timeout.timed_out() && *free < n {
                 return Err(Error::DeadlineExceeded(format!(
-                    "a blame of {n} bytes waited past its deadline for the budget of {} bytes",
-                    self.0.cap
+                    "a {} of {n} bytes waited past its deadline for the budget of {} bytes",
+                    self.0.name, self.0.cap
                 )));
             }
         }
@@ -164,8 +174,8 @@ impl Bytes {
     fn refuse_over_cap(&self, n: usize) -> Result<()> {
         if n > self.0.cap {
             return Err(Error::ResourceExhausted(format!(
-                "a blame of {n} bytes does not fit the budget of {} bytes",
-                self.0.cap
+                "a {} of {n} bytes does not fit the budget of {} bytes",
+                self.0.name, self.0.cap
             )));
         }
         Ok(())
