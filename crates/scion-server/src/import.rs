@@ -916,8 +916,8 @@ mod tests {
     use crate::store::Store;
     use std::fs;
     use std::process::Command;
+    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
-    use std::sync::{Arc, Barrier};
     use std::thread;
     use std::time::Duration;
 
@@ -1019,20 +1019,32 @@ mod tests {
             .unwrap();
 
         // The land's transaction has moved main but not committed, so the
-        // import still reads root, then waits to write.
-        let started = Arc::new(Barrier::new(2));
+        // import still reads root, then waits to write. Channels, not a
+        // barrier: a step whose release never comes fails in seconds with
+        // its name, and cannot trap its partner.
+        let (in_tx, in_rx) = std::sync::mpsc::channel::<()>();
+        let (moved_tx, moved_rx) = std::sync::mpsc::channel::<()>();
         let land = {
-            let (server, started) = (server.clone(), Arc::clone(&started));
+            let (server, in_tx, moved_rx) = (server.clone(), in_tx, moved_rx);
             thread::spawn(move || {
                 server.write(|c| {
                     let moved = c.cas_ref(repo, "main", Some(1), x)?;
-                    started.wait();
+                    in_tx.send(()).unwrap();
+                    moved_rx
+                        .recv_timeout(Duration::from_secs(30))
+                        .unwrap_or_else(|_| panic!("the import never looked again"));
                     thread::sleep(Duration::from_millis(300));
                     Ok(moved)
                 })
             })
         };
-        started.wait();
+        in_rx
+            .recv_timeout(Duration::from_secs(30))
+            .unwrap_or_else(|_| panic!("the land never moved the ref"));
+        // The import starts its check while the land's transaction still
+        // holds the write lock: it reads `root`, then waits to write, like
+        // it would against a live land.
+        moved_tx.send(()).unwrap();
         let moved = point_ref(&importer, repo, "main", tip);
         assert!(land.join().unwrap().unwrap());
         // The swap lost, and the check again sees that main has diverged.
