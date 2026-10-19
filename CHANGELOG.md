@@ -225,6 +225,13 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- A damaged backend marker is refused, in both directions: a marker
+  whose first line is neither `postgres` nor absent used to be read as
+  absent, so a Postgres-backed directory opened as a fresh, empty
+  SQLite store, which looks like a server with no data at all. The
+  error says what to check. The fresh-directory claim that preceded
+  the durable marker write is gone: `write_marker` writes the same
+  first line, durable, so no crash can leave a partial marker behind.
 - The `serve` flags are all checked before the data directory opens:
   a bad flag answers with its own error, instead of taking the data
   directory's one-server lock or creating a file in an empty directory.
