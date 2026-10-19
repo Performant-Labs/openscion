@@ -225,6 +225,12 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- A directory that the server, a cache tier or `scn` makes is mode 0700,
+  whatever the umask (`#303`). On a default Ubuntu account (umask 002),
+  the first command on a new data directory failed: the server refused
+  the group-writable directory it had just made. A directory that
+  already exists keeps its mode for the existing checks, and a
+  group-writable parent that the user made is still refused (#302).
 - The mount tests' serve-lock probes no longer race a parallel test's
   fork: a fork copies the process's open lock files to the child until
   the child execs, and macOS is slow to exec, so a parallel test's fork
