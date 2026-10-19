@@ -242,7 +242,13 @@ The first release: the server, its cache tiers, and the `scn` client.
   of frame-header file reads sat between the lock's take and its
   release. Kinds that never read lengths (the commit graph, the path
   history) read no blob files at all.
-
+- A land's check of a base that the path index does not reach kept
+  every history node row it read, with no cap on their bytes: a row is
+  up to 64 KiB, and one check reads one or more per part of each of the
+  land's paths, so only the deadline stopped the read. The check's
+  cache now clears its rows once they pass the same byte cap a log
+  page's nodes stop at, so the answer never changes and only re-reads
+  cost more.
 - A silent TLS peer holds its connection's place for at most the
   handshake timeout, not twice that: one deadline from the accept
   bounds the TLS handshake and the HTTP/2 preface that follows it
