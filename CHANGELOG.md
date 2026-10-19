@@ -239,6 +239,12 @@ The first release: the server, its cache tiers, and the `scn` client.
   way). The tests that fork or read a serve lock now run one at a time
   under a gate, and each stand-in server they start runs in its own
   process group, killed and reaped whole on drop.
+- A blame call whose wait for the memory budget ended as the bytes it
+  needed came free is served, where it was refused before: the take
+  rechecks the budget after the wait, and refuses only a budget that
+  still does not hold the bytes. That refusal now answers
+  `DEADLINE_EXCEEDED`, the code every other deadline gives, instead of
+  `RESOURCE_EXHAUSTED`; the doc says so.
 
 - docs/architecture.md said a tier forwards `ResolveRef` and caches
   `GetRootTree`; it refuses both with `UNIMPLEMENTED` (`#307`), as its own
