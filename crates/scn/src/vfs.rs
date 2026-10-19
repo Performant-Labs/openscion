@@ -225,6 +225,11 @@ pub struct Vfs {
     blobs: Blobs,
     /// Where the changes of this mount live.
     overlay: PathBuf,
+    /// Whether the mount takes writes: v0.1 mounts are read-only unless
+    /// `scn mount --unstable-writable` said otherwise, because a symlinked
+    /// parent directory in the overlay can still redirect a write outside
+    /// it.
+    writable: bool,
     /// The secret that a mount path names and every file handle carries.
     /// Not a protection: see section 8 of the docs.
     secret: [u8; 16],
@@ -279,6 +284,25 @@ impl Vfs {
             uid: rustix::process::geteuid().as_raw(),
             gid: rustix::process::getegid().as_raw(),
             overlay,
+            writable: false,
+        }
+    }
+
+    /// Takes writes on this mount, or not: `scn mount --unstable-writable`
+    /// is the only caller that passes true. A read-only VFS answers every
+    /// mutating call with `EROFS`, before it looks at its arguments.
+    #[must_use]
+    pub fn writable(mut self, on: bool) -> Self {
+        self.writable = on;
+        self
+    }
+
+    /// Refuses a mutating call on a read-only mount.
+    fn want_write(&self) -> Result<(), nfsstat3> {
+        if self.writable {
+            Ok(())
+        } else {
+            Err(nfsstat3::NFS3ERR_ROFS)
         }
     }
 
@@ -657,6 +681,7 @@ impl NFSFileSystem for Vfs {
     }
 
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
+        self.want_write()?;
         let mut nodes = self.nodes.write().await;
         match nodes.by_id.get(&id) {
             Some(node) if node.kind.is_dir() => {
@@ -756,6 +781,7 @@ impl NFSFileSystem for Vfs {
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         use std::io::Seek as _;
 
+        self.want_write()?;
         let mut nodes = self.nodes.write().await;
         let file = match nodes.by_id.get(&id) {
             None => return Err(nfsstat3::NFS3ERR_STALE),
@@ -785,6 +811,7 @@ impl NFSFileSystem for Vfs {
         filename: &filename3,
         attr: sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
+        self.want_write()?;
         let mut nodes = self.nodes.write().await;
         let dir_path = self.ensure_listed(&mut nodes, dirid).await?;
         let path = Self::child(dir_path.as_ref(), filename.as_ref())?;
@@ -805,6 +832,7 @@ impl NFSFileSystem for Vfs {
         dirid: fileid3,
         filename: &filename3,
     ) -> Result<fileid3, nfsstat3> {
+        self.want_write()?;
         let mut nodes = self.nodes.write().await;
         let dir_path = self.ensure_listed(&mut nodes, dirid).await?;
         let path = Self::child(dir_path.as_ref(), filename.as_ref())?;
@@ -824,6 +852,7 @@ impl NFSFileSystem for Vfs {
         dirid: fileid3,
         dirname: &filename3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
+        self.want_write()?;
         let mut nodes = self.nodes.write().await;
         let dir_path = self.ensure_listed(&mut nodes, dirid).await?;
         let path = Self::child(dir_path.as_ref(), dirname.as_ref())?;
@@ -839,6 +868,7 @@ impl NFSFileSystem for Vfs {
     }
 
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
+        self.want_write()?;
         let mut nodes = self.nodes.write().await;
         let dir_path = self.ensure_listed(&mut nodes, dirid).await?;
         let path = Self::child(dir_path.as_ref(), filename.as_ref())?;
@@ -894,6 +924,7 @@ impl NFSFileSystem for Vfs {
         to_dirid: fileid3,
         to_filename: &filename3,
     ) -> Result<(), nfsstat3> {
+        self.want_write()?;
         let mut nodes = self.nodes.write().await;
         let from_dir = self.ensure_listed(&mut nodes, from_dirid).await?;
         let to_dir = self.ensure_listed(&mut nodes, to_dirid).await?;
@@ -1048,6 +1079,7 @@ impl NFSFileSystem for Vfs {
         symlink: &nfspath3,
         _attr: &sattr3,
     ) -> Result<(fileid3, fattr3), nfsstat3> {
+        self.want_write()?;
         let mut nodes = self.nodes.write().await;
         let dir_path = self.ensure_listed(&mut nodes, dirid).await?;
         let path = Self::child(dir_path.as_ref(), linkname.as_ref())?;
@@ -1717,7 +1749,10 @@ mod tests {
             root,
             &reply.ticket,
             overlay.path().to_path_buf(),
-        );
+        )
+        // The unit tests of the VFS carry writes: a `--unstable-writable`
+        // mount is what they exercise.
+        .writable(true);
         Test {
             vfs,
             dirs: [data, overlay],

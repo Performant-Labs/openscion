@@ -30,6 +30,11 @@ pub struct MountArgs {
     /// Serve NFS, but do not try to mount: print the command instead.
     #[arg(long)]
     no_mount: bool,
+    /// Take writes on the mount, for the v0.1 unstable write path: a
+    /// symlinked parent directory in the overlay can still redirect a
+    /// write outside it, so the mount is read-only without this.
+    #[arg(long)]
+    unstable_writable: bool,
 }
 
 /// Arguments of `scn unmount`.
@@ -50,6 +55,9 @@ pub struct MountRecord {
     pub rev: String,
     /// The process that serves the NFS server.
     pub pid: u32,
+    /// Whether the mount takes writes: `--unstable-writable` sets it. A
+    /// record that predates the flag was a read-only mount.
+    pub writable: bool,
 }
 
 /// Serves the ref over the network filesystem on a free loopback port,
@@ -98,7 +106,8 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
         root,
         &reply.ticket,
         overlay.join(CHANGES),
-    );
+    )
+    .writable(args.unstable_writable);
     let secret = vfs.secret_name();
 
     // The identity of the serving process: an exclusive lock on the
@@ -116,6 +125,7 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
         overlay: overlay.clone(),
         rev: args.rev.clone(),
         pid: std::process::id(),
+        writable: args.unstable_writable,
     })?;
     // The bind is the one step that can still fail before serving: on
     // its failure, remove the record, so the next mount takes over.
@@ -424,6 +434,10 @@ fn parse_sessions(json: &serde_json::Value) -> Result<Vec<MountRecord>> {
                         .and_then(serde_json::Value::as_u64)
                         .ok_or_else(|| anyhow!("record {n} has no pid"))?,
                 )?,
+                writable: record
+                    .get("writable")
+                    .and_then(serde_json::Value::as_bool)
+                    .unwrap_or(false),
             })
         })
         .collect()
@@ -457,6 +471,7 @@ pub fn write_sessions(file: &Path, sessions: &[MountRecord]) -> Result<()> {
                 "overlay": record.overlay.display().to_string(),
                 "rev": record.rev,
                 "pid": record.pid,
+                "writable": record.writable,
             })
         })
         .collect();
@@ -662,6 +677,7 @@ mod tests {
             overlay: PathBuf::from("/tmp/overlay"),
             rev: "main".to_owned(),
             pid: 123,
+            writable: false,
         };
         let sessions = vec![record.clone()];
         write_sessions(&file, &sessions).unwrap();
@@ -674,6 +690,7 @@ mod tests {
             overlay: PathBuf::from("/tmp/overlay-2"),
             rev: "dev".to_owned(),
             pid: 5,
+            writable: false,
         };
         let mut sessions = read_sessions(&file).unwrap();
         sessions.retain(|known| known.dir != other.dir);
@@ -687,6 +704,24 @@ mod tests {
         assert_eq!(gone.overlay, other.overlay);
         write_sessions(&file, &[]).unwrap();
         assert_eq!(read_sessions(&file).unwrap(), Vec::new());
+    }
+
+    /// A record that predates the flag has no `writable` key: it parses
+    /// as a read-only mount.
+    #[test]
+    fn a_record_without_the_writable_key_is_read_only() {
+        let home = tempfile::tempdir().unwrap();
+        let file = home.path().join("mounts.json");
+        let old = serde_json::json!([{
+            "dir": "/tmp/view",
+            "overlay": "/tmp/overlay",
+            "rev": "main",
+            "pid": 123,
+        }]);
+        std::fs::write(&file, serde_json::to_vec(&old).unwrap()).unwrap();
+        let found = read_sessions(&file).unwrap();
+        assert_eq!(found.len(), 1);
+        assert!(!found[0].writable, "the old record is a read-only mount");
     }
 
     #[test]
@@ -718,6 +753,7 @@ mod tests {
             overlay: overlay.clone(),
             rev: "main".to_owned(),
             pid: 1,
+            writable: false,
         };
         let mut changes = overlay_changes(&record).unwrap();
         changes.sort_by(|(a, _), (b, _)| a.as_bytes().cmp(b.as_bytes()));
@@ -816,6 +852,7 @@ mod silent_failures {
             overlay: PathBuf::from(format!("{dir}/overlay")),
             rev: "main".to_owned(),
             pid,
+            writable: false,
         }
     }
 
@@ -833,6 +870,7 @@ mod silent_failures {
             overlay: overlay.clone(),
             rev: "main".to_owned(),
             pid: 4242,
+            writable: false,
         };
         add_session(&file, &r).unwrap();
         // The recorded server is live: this process holds its serve lock.
@@ -862,6 +900,7 @@ mod silent_failures {
             overlay: overlay.clone(),
             rev: "main".to_owned(),
             pid: 4243,
+            writable: false,
         };
         add_session(&file, &r).unwrap();
         // The serve lock is held, like a live server holds it, and the
@@ -978,6 +1017,7 @@ mod silent_failures {
             overlay: overlay.clone(),
             rev: "main".to_owned(),
             pid: sleeper.id(),
+            writable: false,
         };
         // The stale record is taken over, and the sleeper lives on. The
         // lock state is polled with a ceiling: macOS may tear a released
@@ -1005,6 +1045,7 @@ mod silent_failures {
             overlay: overlay.clone(),
             rev: "main".to_owned(),
             pid: server.id(),
+            writable: false,
         };
         // This test process holds the serve lock, like the serving
         // process would; the pid it recorded points at the child.
@@ -1028,6 +1069,7 @@ mod silent_failures {
             overlay: overlay.clone(),
             rev: "main".to_owned(),
             pid: std::process::id(),
+            writable: false,
         };
         let lock = hold_serve_lock(&overlay).unwrap();
         assert!(
