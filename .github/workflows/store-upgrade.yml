@@ -79,6 +79,14 @@ jobs:
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - name: the ancestors of the stores carry no ACL
+        run: |
+          # The private-dir check refuses a data directory whose ancestors
+          # carry an ACL beyond their mode bits, and the ubuntu-24.04
+          # runner gives /home a default ACL. The check names this fix.
+          if command -v setfacl > /dev/null && getfacl /home 2> /dev/null | grep -q '^default:'; then
+            sudo setfacl -b /home
+          fi
       - name: prove the tagged ladder
         env:
           STORE_UPGRADE_TAGS: ${{ inputs.tags }}
