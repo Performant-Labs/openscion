@@ -42,8 +42,10 @@ jobs:
           SOAK_P99_FACTOR: "2"
           # The samples and the logs stream into this directory while the
           # run goes; the upload job reads it from the same runner disk.
-          # The runner is ephemeral and single-job, so a fixed path is
-          # safe (scripts/soak-runner-setup.md).
+          # The runner is registered for this one rental and removed
+          # after (scripts/soak-runner-setup.md), so a fixed path is
+          # safe. NOT --ephemeral: the workflow's two jobs both need the
+          # runner, and an ephemeral one de-registers after the first.
           RUNNER_TEMP: /home/runner/soak-72h
         run: |
           # The soak's own cap: 260000 s ≈ 72.2 h covers the 4320 min of

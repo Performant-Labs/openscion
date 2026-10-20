@@ -15,8 +15,15 @@ fresh token - uploads them. With one `scion-soak` runner, the upload
 job lands on the same machine and reads the same disk.
 
 `scripts/soak-runner-setup.md` registers the runner on a fresh Ubuntu
-VM (`config.sh --ephemeral --labels scion-soak`), sizes the disk at
-about 300 GB for the store (one 30-minute release run: 334 MB ->
-8.95 GB beside 22,930 lands, slowing as it goes) plus system and
-margin, and deletes the VM after: `--ephemeral` de-registers the
-runner with its one job, so the VM is disposable.
+VM as a normal runner (NOT `--ephemeral`: the workflow's two jobs both
+need it, and an ephemeral runner de-registers after the first, leaving
+the upload waiting forever), sizes the disk at about 300 GB for the
+store (one 30-minute release run: 334 MB -> 8.95 GB beside 22,930
+lands, slowing as it goes) plus system and margin, and removes the
+runner (`config.sh remove`) and the VM after. Because the repository
+is public, the doc also names the fork-PR risk - a fork workflow can
+target the runner's label while it is up - and the owner's two doors:
+the fork-PR approval policy is tightened to all external contributors
+before the runner is registered and put back to
+`first_time_contributors` after, and the runner exists only for the
+rental.
