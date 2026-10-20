@@ -24,9 +24,10 @@
 #
 # Tags: every release tag that is an ancestor of HEAD and not HEAD itself,
 # oldest first, capped to the newest 8 (the summary says when the cap
-# bites; 0.x cadence makes that a later worry). With no tag the script
-# prints `skipped: no release tag yet` in the step summary and exits 0:
-# the job starts at v0.1.0 and says so, it never passes silently.
+# bites; 0.x cadence makes that a later worry). Until the first release
+# tag exists, the ladder is the pinned stand-in commits below (marked
+# SHORTCUT there): the prove legs run on every trigger, never a skip --
+# a job that skips every night tests nothing.
 #
 #   STORE_UPGRADE_TAGS  tags or refs to use instead of tag resolution,
 #                       oldest first (the workflow's tags input goes here;
@@ -64,7 +65,16 @@ summary() {
 }
 
 # release_tags: every release tag that is an ancestor of HEAD and not HEAD
-# itself, oldest first, capped to the newest 8.
+# itself, oldest first, capped to the newest 8. Until the first tag:
+# SHORTCUT: two pinned commits whose stores differ in schema version, so
+# every leg of the job has something real to prove; the first release tag
+# replaces them (the resolution never sees them again, because a release
+# tag is an ancestor of HEAD and the pins are on main).
+STANDIN_TAGS=(
+  afe1c4db878f38fa22bd6adddd57a8c410668db5 # read rules per folder: schema 8
+  32a6117bf54510450b1bfea10b6c873dcb383207 # view memo: schema 9
+)
+
 release_tags() {
   local head tag
   head=$(git -C "$ROOT" rev-parse HEAD)
@@ -75,11 +85,13 @@ release_tags() {
 }
 
 # --resolve-tags: print the tag list and exit, so a workflow can key its
-# caches before any build runs. No tags: say why, exit 0.
+# caches before any build runs. An empty ladder is a pinned-stand-ins
+# ladder, never a skip: a run that proves nothing must not pass.
 if [ "${1:-}" = "--resolve-tags" ]; then
   tags=$(release_tags)
   if [ -z "$tags" ]; then
-    summary "skipped: no release tag yet"
+    summary "no release tag yet: the ladder is the pinned stand-in commits"
+    printf '%s\n' "${STANDIN_TAGS[@]}"
     exit 0
   fi
   printf '%s\n' "$tags"
@@ -107,8 +119,8 @@ if [ -n "${STORE_UPGRADE_TAGS:-}" ]; then
 else
   tags=$(release_tags)
   if [ -z "$tags" ]; then
-    summary "skipped: no release tag yet"
-    exit 0
+    summary "no release tag yet: the ladder is the pinned stand-in commits"
+    tags=$(printf '%s\n' "${STANDIN_TAGS[@]}")
   fi
 fi
 count=$(printf '%s\n' "$tags" | grep -c . || true)

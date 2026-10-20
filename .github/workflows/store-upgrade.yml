@@ -53,11 +53,11 @@ jobs:
             tags=$(scripts/store-upgrade.sh --resolve-tags) || exit 1
           fi
           if [ -z "$tags" ]; then
-            echo "count=0" >> "$GITHUB_OUTPUT"
-          else
-            printf '%s\n' "$tags"
-            echo "count=$(printf '%s\n' "$tags" | wc -l | tr -d ' ')" >> "$GITHUB_OUTPUT"
+            echo "::error::the tag ladder resolved to nothing: the stand-ins must cover it"
+            exit 1
           fi
+          printf '%s\n' "$tags"
+          echo "count=$(printf '%s\n' "$tags" | wc -l | tr -d ' ')" >> "$GITHUB_OUTPUT"
 
   # One job: the ladder is short (a cap of 8 lives in the script), and the
   # tagged builds share nothing, so a matrix would only duplicate the
