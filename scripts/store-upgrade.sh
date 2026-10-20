@@ -284,8 +284,10 @@ readback() {
 direct() {
   local ref=$1 dir=$2 port out schema
   note "direct: HEAD opens the store of $ref"
-  "$BIN/scion-server" --data "$dir/store" fsck >"$dir/fsck-head.log" 2>&1 ||
+  "$BIN/scion-server" --data "$dir/store" fsck >"$dir/fsck-head.log" 2>&1 || {
+    tail -n 20 "$dir/fsck-head.log" >&2
     die "direct ($ref): HEAD cannot open the store"
+  }
   schema=$(sqlite3 "$dir/store/scion.db" 'PRAGMA user_version')
   [ "$schema" = "$HEAD_SCHEMA" ] ||
     die "direct ($ref): after the open the schema is $schema, not HEAD's $HEAD_SCHEMA"
