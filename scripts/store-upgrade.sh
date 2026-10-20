@@ -111,7 +111,10 @@ mkdir -p "$WORK"
 # changed (the section the old make_repo wrote); other agents may add
 # branch tracking to the same config while this run goes, and that is
 # not this run's doing.
-git -C "$ROOT" config --local --list | grep '^user\.' > "$WORK/git-config.before"
+# A runner's config may hold no identity at all: an empty guard file is
+# fine, and grep's "nothing matched" must not kill the script (set -e
+# with pipefail).
+git -C "$ROOT" config --local --list | grep '^user\.' > "$WORK/git-config.before" || true
 
 # The tags of this run: the caller's override, or the resolved ladder.
 if [ -n "${STORE_UPGRADE_TAGS:-}" ]; then
