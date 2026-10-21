@@ -270,12 +270,16 @@ for backend in sqlite postgres; do
       # Each loop's in-flight client dies with the loop: freeze the loop
       # first (no new attempt can start), kill its children - the
       # timeout, which hands the TERM to the checkout it watches - and
-      # only then the loop. A child killed after its parent is re-parented
-      # and lost, and one left alive runs up to its own 60 s timeout
-      # into the next cell, where its failure would be someone else's.
+      # only then the loop, which CONT wakes so the queued TERM lands.
+      # A child killed after its parent is re-parented and lost, and one
+      # left alive runs up to its own 60 s timeout into the next cell,
+      # where its failure would be someone else's.
       while read -r pid; do kill -STOP "$pid" 2> /dev/null || true; done < "$WORK/capacity-readers.pids"
       while read -r pid; do pkill -TERM -P "$pid" 2> /dev/null || true; done < "$WORK/capacity-readers.pids"
       while read -r pid; do kill -TERM "$pid" 2> /dev/null || true; done < "$WORK/capacity-readers.pids"
+      # A stopped process queues its TERM until it runs again: CONT
+      # delivers it, or the wait below never returns.
+      while read -r pid; do kill -CONT "$pid" 2> /dev/null || true; done < "$WORK/capacity-readers.pids"
       while read -r pid; do wait "$pid" 2> /dev/null || true; done < "$WORK/capacity-readers.pids"
       rss_end=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')
       # Lands served, from the server's counter, while it still serves:
