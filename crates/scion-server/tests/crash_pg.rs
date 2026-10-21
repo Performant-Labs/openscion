@@ -118,7 +118,10 @@ struct PgServer {
 }
 
 impl PgServer {
-    fn spawn(data: &Path, schema: &str, log: &Path) -> Self {
+    /// Spawns the process and returns at once, before the start's own
+    /// work - the schema upgrade - has run. The caller that kills
+    /// during that work measures from here, not from the serving line.
+    fn spawn_raw(data: &Path, schema: &str, log: &Path) -> Self {
         // One start, one log: a fresh file, so the address this spawn
         // waits for is this spawn's, never an earlier run's.
         let file = fs::OpenOptions::new()
@@ -139,11 +142,17 @@ impl PgServer {
             .spawn()
             .unwrap();
         drop(file);
-        let mut server = Self {
+        Self {
             child,
             url: String::new(),
             log: log.to_path_buf(),
-        };
+        }
+    }
+
+    /// Spawns, and returns once the log says `serving`: the start's own
+    /// work, the schema upgrade included, has run by then.
+    fn spawn(data: &Path, schema: &str, log: &Path) -> Self {
+        let mut server = Self::spawn_raw(data, schema, log);
         let start = Instant::now();
         loop {
             if let Some(status) = server.child.try_wait().unwrap() {
@@ -396,6 +405,7 @@ fn a_kill_during_a_land_leaves_the_ref_old_or_new() {
     // asserts the whole invariant against the seam.
     let mut saw_old = false;
     let mut saw_new = false;
+    let mut reps = 0usize;
     let mut head = warm;
     for (k, (name, cs)) in cuts.iter().enumerate() {
         let call_name = name.clone();
@@ -403,7 +413,11 @@ fn a_kill_during_a_land_leaves_the_ref_old_or_new() {
         let mut server = PgServer::spawn(&data, &schema, &log);
         let url = server.url.clone();
         let handle = std::thread::spawn(move || land(&url, call_cs.as_bytes(), &call_name));
-        std::thread::sleep(step * u32::try_from(k % 7 + 1).unwrap());
+        // The move sits at the very end of a land, so the factors run
+        // past the whole measured land (up to 11/8 of it): a kill after
+        // the reply still shows the new ending.
+        let factor = k % 11 + 1;
+        std::thread::sleep(step * u32::try_from(factor).unwrap());
         server.kill_and_wait();
         let _ = handle.join();
 
@@ -414,6 +428,7 @@ fn a_kill_during_a_land_leaves_the_ref_old_or_new() {
         // land rebased onto.
         let target = ref_target(&data);
         let moved = target != head;
+        reps += 1;
         if moved {
             assert!(
                 has_changeset(&data, target),
@@ -464,7 +479,8 @@ fn a_kill_during_a_land_leaves_the_ref_old_or_new() {
     }
     assert!(
         saw_old && saw_new,
-        "the kills never straddled the land (old seen: {saw_old}, new: {saw_new})"
+        "the kills never straddled the land (old seen: {saw_old}, new: {saw_new}) \
+         over {reps} reps, steps of an eighth of the measured land up to 11/8"
     );
 }
 
@@ -485,10 +501,13 @@ fn a_kill_during_a_schema_upgrade_leaves_one_whole_version() {
     // the harness derives are the same one.
     let schema = Backend::test_schema(&data).expect("the test names a schema");
     drop_schema(&schema);
-
-    // A whole start from empty: its time sets the step of the kills. Its
-    // last version is this build's count of Postgres migrations.
     create_schema(&schema);
+
+    // A whole start from empty, measured from the PROCESS to the serving
+    // line: its eighth sets the step of the kills, so their placement
+    // does not depend on the speed of the machine.
+    // eighth sets the step of the kills, so their placement does not
+    // depend on the speed of the machine.
     let started = Instant::now();
     let mut first = PgServer::spawn(&data, &schema, &log);
     let step = started.elapsed() / 8;
@@ -496,14 +515,25 @@ fn a_kill_during_a_schema_upgrade_leaves_one_whole_version() {
     first.kill_and_wait();
     assert!(last >= 1, "the first start left no schema");
 
-    // Kill 1, 2, 3 steps into the next start's upgrade, each from a
-    // fresh empty schema, until one comes after the last migration.
+    // Kill 1, 2, 3 steps into the next start's own work, each from a
+    // fresh empty schema. The spawn does not wait: the sleep starts
+    // when the process starts, so the kill can fall inside the upgrade.
+    // A kill whose log already says `serving` came after the upgrade
+    // committed; that rep ends the loop, the way the last migration
+    // already stands.
+    let mut during = 0usize;
+    let mut total = 0usize;
     for k in 1..64 {
         drop_schema(&schema);
         create_schema(&schema);
-        let mut server = PgServer::spawn(&data, &schema, &log);
-        std::thread::sleep(step * k);
-        server.kill_and_wait();
+        let mut cut = PgServer::spawn_raw(&data, &schema, &log);
+        std::thread::sleep(step * u32::try_from(k).unwrap());
+        let served = bound_addr(&log).is_some();
+        cut.kill_and_wait();
+        total += 1;
+        if !served {
+            during += 1;
+        }
         let version = schema_version(&schema);
         assert!(
             (0..=last).contains(&version),
@@ -520,9 +550,18 @@ fn a_kill_during_a_schema_upgrade_leaves_one_whole_version() {
         );
         let root = seed_repo(&data);
         let head_out = resolve_ref(&verify.url, "main");
-        assert_eq!(head_out, root.as_bytes().to_vec(), "the ref the restart serves");
-        if version == last {
+        assert_eq!(
+            head_out,
+            root.as_bytes().to_vec(),
+            "the ref the restart serves"
+        );
+        if served {
             break;
         }
     }
+    assert!(
+        during > 0,
+        "no kill came during the upgrade: {during} of {total} kills \
+         landed before the log said serving"
+    );
 }
