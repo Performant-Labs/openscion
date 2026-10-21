@@ -169,6 +169,22 @@ fn numeric_columns_parse_and_dashes_say_what_failed() {
 }
 
 #[test]
+fn the_growth_column_names_both_backends() {
+    let doc = std::fs::read_to_string(Path::new(DOC)).expect("docs/operations.md exists");
+    let section = capacity_section(&doc);
+    // The growth column is each backend's own store: SQLite's data
+    // directory, Postgres's own database (pg_database_size). The doc
+    // must not excuse Postgres from the column any more.
+    assert!(
+        !section.contains("the column misses what the database holds"),
+        "the capacity section still excuses Postgres from the growth column"
+    );
+    for fact in ["pg_database_size", "pg_wal"] {
+        assert!(section.contains(fact), "the growth paragraph omits {fact}");
+    }
+}
+
+#[test]
 fn the_caption_pins_the_filesystem_row() {
     let doc = std::fs::read_to_string(Path::new(DOC)).expect("docs/operations.md exists");
     let section = capacity_section(&doc);

@@ -26,7 +26,10 @@
 #
 # Set CAPACITY_MACHINE to the runner's public name and spec; the table's
 # caption carries it. Set RUN_URL to the workflow run's URL for the
-# footer. The store-size column is the SQLite store's growth; the
+# footer. The store-size column is each backend's own store: the
+# SQLite data directory (du), the Postgres cell's own database
+# (pg_database_size, which counts the tables, indexes and TOAST but no
+# WAL - the WAL is pg_wal's, outside the database's size).
 # Postgres cells carry "-" there, because the database's disk is the
 # service container's, not a file tree this script can measure.
 #
@@ -133,7 +136,17 @@ for backend in sqlite postgres; do
         tail -n 20 "$WORK/import-$backend.log" >&2
         die "the $backend import failed"
       }
-      STORE_START=$(du -sk "$WORK/server" | cut -f1)
+      # The cell's store size at its start: the data directory on
+      # SQLite, the database's own size on Postgres (pg_database_size
+      # counts the tables, indexes and TOAST of the one database the
+      # cell owns; the WAL is pg_wal's, not the database's, so nothing
+      # of it lands in the column). The cell's database was dropped and
+      # recreated above, so nothing of another cell is inside it.
+      if [ "$backend" = postgres ]; then
+        STORE_START=$(psql "$SCION_PG_URL" -X -At -c           'SELECT pg_database_size(current_database())' | awk '{ print int($1 / 1024) }')
+      else
+        STORE_START=$(du -sk "$WORK/server" | cut -f1)
+      fi
       start_scion
       server_pid() {
         SERVER_PID=$(lsof -t -iTCP:"$SERVER_PORT" -sTCP:LISTEN 2> /dev/null | head -n 1)
@@ -232,7 +245,12 @@ for backend in sqlite postgres; do
       c99=$(pct "$WORK/read-times.csv" 0.99)
       [ -n "$c50" ] || c50="-"
       [ -n "$c99" ] || c99="-"
-      store_end=$(du -sk "$WORK/server" | cut -f1)
+      case $backend in
+        sqlite) store_end=$(du -sk "$WORK/server" | cut -f1) ;;
+        postgres)
+          store_end=$(psql "$SCION_PG_URL" -X -At             -c 'SELECT pg_database_size(current_database())' | awk '{ print int($1 / 1024) }')
+          ;;
+      esac
       growth=$(( (store_end - STORE_START) * 1000 / (LANDS * REPS) ))
       echo "$backend,$w,$r,$land_p99,$c50,$c99,$reader_timeouts,$errors,$rss_end,$growth" \
         >> "$WORK/capacity.csv"

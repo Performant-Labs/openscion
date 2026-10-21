@@ -855,9 +855,12 @@ different edge applies it to the run's `capacity.csv` artifact, which
 the footer's workflow run keeps. A cell whose bench died names no land
 percentile (`-` there).
 
-The store growth column measures the cell's data directory; on
-Postgres the database's own disk is its service container's, so the
-column misses what the database holds. RSS is the server's
+The store growth column measures each backend's own store: the
+SQLite data directory (`du`), and on Postgres the cell's own database
+(`pg_database_size`, which counts the tables, indexes and TOAST; the
+WAL is `pg_wal`'s, outside the database's size, so the column names no
+WAL). The Postgres database is dropped and created per cell, so the
+column is the cell's own lands' bytes there too. RSS is the server's
 at the end of the cell: a capacity cell is minutes long, not the hours a
 warm-up would need, so it is a level, not a leak bound - the leak bound
 is the soak's.
