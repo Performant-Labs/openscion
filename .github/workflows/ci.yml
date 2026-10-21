@@ -165,10 +165,57 @@ jobs:
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-workspace-crates: true
-      - run: cargo test -p open-scion-server
+      - run: cargo test -p open-scion-server --test query
         env:
           # The Postgres job proves backend parity, not more cases; the
           # SQLite jobs already run 2000.
+          PROPTEST_CASES: "64"
+          SCION_TEST_BACKEND: postgres
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+
+  # The graph walk is the one Postgres test that minutes on its own
+  # (the ancestry walk over a 20,001-changeset ladder), so it runs in
+  # its own job, beside the rest: the wall of each job is minutes,
+  # not the sum of both.
+  test-postgres-query:
+    name: test (postgres query)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 30
+    services:
+      postgres:
+        image: postgres:17.11
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-workspace-crates: true
+      # The gap between the two Postgres jobs is exactly the file this
+      # loop skips: read from tests/, not hand-copied, so a new test
+      # file lands in one job by default.
+      - run: |
+          targets=""
+          for f in crates/scion-server/tests/*.rs; do
+            t=$(basename "$f" .rs)
+            [ "$t" = query ] && continue
+            targets="$targets --test $t"
+          done
+          cargo test -p open-scion-server --lib --bins $targets
+        env:
           PROPTEST_CASES: "64"
           SCION_TEST_BACKEND: postgres
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
@@ -212,9 +259,9 @@ jobs:
           cache-workspace-crates: true
       # The Linux lint job never compiles macOS-only code (the ACL FFI
       # module among it), so clippy runs here too, before the tests:
-      # same warm cache, a couple of minutes on a job that already
-      # builds everything, and no second macOS runner to book.
-      - run: cargo clippy --workspace --lib --bins -- -D warnings
+      # same warm cache, on a job that already builds everything, and
+      # no second macOS runner to book. --all-targets covers lib and
+      # bins; one pass.
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo test --workspace
         env:
