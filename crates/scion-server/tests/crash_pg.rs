@@ -20,14 +20,14 @@ use std::time::{Duration, Instant};
 use scion_core::{Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_proto::runtime::auth::Bearer;
 use scion_proto::v1::{
-    objects_client::ObjectsClient, scion_client::ScionClient, LandRequest, LandResponse,
-    LandState, ResolveRefRequest,
+    LandRequest, LandResponse, LandState, ResolveRefRequest, objects_client::ObjectsClient,
+    scion_client::ScionClient,
 };
+use scion_server::Backend;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::write;
-use scion_server::Backend;
-use tonic::transport::{Channel, Endpoint};
 use tonic::Status;
+use tonic::transport::{Channel, Endpoint};
 
 const REPO: &str = "r";
 const TOKEN: &str = "crash-pg-token";
@@ -281,8 +281,13 @@ fn resolve_ref(url: &str, name: &str) -> Vec<u8> {
 }
 
 fn author() -> IdentityTime {
-    IdentityTime::new(b"Ada".to_vec(), b"ada@example.com".to_vec(), 1_700_000_000, 0)
-        .expect("identity fits the format")
+    IdentityTime::new(
+        b"Ada".to_vec(),
+        b"ada@example.com".to_vec(),
+        1_700_000_000,
+        0,
+    )
+    .expect("identity fits the format")
 }
 
 /// Repo `r` with a root changeset and `main` at it, through the same
@@ -401,7 +406,10 @@ fn has_changeset(data: &Path, id: ChangesetId) -> bool {
 fn warm_land(server: &PgServer, changeset: ChangesetId, key: &str) -> Duration {
     let started = Instant::now();
     let reply = land(&server.url, changeset.as_bytes(), key);
-    assert_eq!(reply.expect("the warm land lands").state(), LandState::Landed);
+    assert_eq!(
+        reply.expect("the warm land lands").state(),
+        LandState::Landed
+    );
     started.elapsed()
 }
 
@@ -439,7 +447,12 @@ fn a_kill_during_a_land_leaves_the_ref_old_or_new() {
     // land, and the next rep's changeset rebases onto whatever main is
     // by then.
     let cuts: Vec<_> = (0..REPS)
-        .map(|k| (format!("cut{k}"), seed_wide_changeset(&data, &format!("cut{k}"))))
+        .map(|k| {
+            (
+                format!("cut{k}"),
+                seed_wide_changeset(&data, &format!("cut{k}")),
+            )
+        })
         .collect();
 
     // Kill mid-land, rep after rep, each with its own changeset and
