@@ -17,7 +17,6 @@ const READERS: [u32; 3] = [0, 5, 20];
 
 /// The numeric columns, in order, after backend/writers/readers.
 const NUMERIC_COLUMNS: usize = 7;
-
 /// The table's data rows: the markdown lines after the `|---|` rule of
 /// the first table in the Capacity section.
 fn table_rows(section: &str) -> Vec<Vec<String>> {
@@ -102,12 +101,15 @@ fn every_cell_of_the_grid_has_a_row_in_order() {
 #[test]
 fn numeric_columns_parse_and_dashes_say_what_failed() {
     let doc = std::fs::read_to_string(Path::new(DOC)).expect("docs/operations.md exists");
-    // Column indexes in the row: 3 lands/min, 4 land p99, 7 errors.
+    // Column indexes in the row: 3 land p99, 6 timeouts, 7 errors.
     for row in table_rows(capacity_section(&doc)) {
         let all_dash = row[3..].iter().all(|c| c.as_str() == "-");
         if all_dash {
             continue; // the skeleton: no run has filled this cell yet
         }
+        let timeouts: u64 = row[6]
+            .parse()
+            .unwrap_or_else(|_| panic!("timeouts does not parse: {row:?}"));
         let errors: u64 = row[7]
             .parse()
             .unwrap_or_else(|_| panic!("errors does not parse: {row:?}"));
@@ -118,10 +120,10 @@ fn numeric_columns_parse_and_dashes_say_what_failed() {
                 continue;
             }
             // A dash is allowed only where a failed bench left the land
-            // percentile unknown, and only in a cell that had errors:
-            // the cell is the data, and the errors column says so.
+            // percentile unknown, and only in a cell that had errors or
+            // timeouts: the cell is the data, and those columns say so.
             assert!(
-                at == 1 && errors > 0,
+                at == 0 && errors + timeouts > 0,
                 "a dash without a failing cell must not publish: {row:?}"
             );
         }
