@@ -76,6 +76,10 @@ jobs:
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # The instrumented build is one build: both matrix cells and
+          # the gate share it, and the first run to finish saves it.
+          key: coverage-instrumented
       # cargo-llvm-cov, pinned by version and the release tarball's
       # sha256 (the same discipline the action pins follow), downloaded
       # with curl so no third-party action enters the supply chain.
@@ -133,15 +137,17 @@ jobs:
         run: cargo llvm-cov clean --workspace
       - name: measure
         run: |
+          set -o pipefail
           ( while sleep 30; do date -u +%T; df -h / | tail -1; free -m | awk 'NR==2'; du -sh target 2>/dev/null; done ) &
           watcher=$!
           nice -n 19 cargo llvm-cov --no-report --workspace \
-            ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"}
+            ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
+            | tee measure.log
+          status=$?
           kill "$watcher"
+          exit "$status"
         env:
           PROPTEST_CASES: "64"
-          CARGO_BUILD_JOBS: "2"
-          RUST_TEST_THREADS: "2"
           SCION_TEST_BACKEND: ${{ matrix.value }}
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
       # The measure's own profraw set, merged into the one profdata the
@@ -178,6 +184,9 @@ jobs:
         with:
           tool: protoc
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+        with:
+          # Same instrumented build the measures saved.
+          key: coverage-instrumented
       - run: |
           curl -fsSL -o /tmp/cargo-llvm-cov.tgz \
             https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz
