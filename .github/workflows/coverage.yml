@@ -36,7 +36,10 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: false
+  # A pull_request run may cancel the run before it; a push to main
+  # may not — every land's measurement has to finish. (This file has
+  # no pull_request trigger, so the expression reads false on main.)
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: never
@@ -180,6 +183,7 @@ jobs:
           # RUSTFLAGS and the profile environment, plain cargo builds the
           # workspace against them. --no-run is deprecated in v0.9.1 and
           # means 'report without tests', not 'build without tests'.
+          # shellcheck disable=SC1090
           source <(cargo llvm-cov show-env --sh)
           nice -n 19 cargo build --workspace --tests \
             | tee measure.log
