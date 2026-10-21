@@ -359,7 +359,19 @@ stepwise() {
 # guard has the last word: a changed local config fails the run.
 cleanup() {
   local status=$?
-  local ref dir
+  local ref dir log pid
+  # The servers `start` backgrounded die on every exit path, TERM then
+  # KILL: a die between start and stop_one must not orphan one.
+  for log in $(find "$WORK" -name '*.log.pid' 2>/dev/null); do
+    pid=$(cat "$log" 2>/dev/null) || continue
+    kill "$pid" 2>/dev/null || true
+  done
+  sleep 2
+  for log in $(find "$WORK" -name '*.log.pid' 2>/dev/null); do
+    pid=$(cat "$log" 2>/dev/null) || continue
+    kill -9 "$pid" 2>/dev/null || true
+    rm -f "$log"
+  done
   for ref in $tags; do
     dir="$WORK/$(printf '%s' "$ref" | tr -c 'A-Za-z0-9._-' '_')"
     git -C "$ROOT" worktree remove --force "$dir/src" > /dev/null 2>&1 || true

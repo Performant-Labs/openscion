@@ -41,10 +41,43 @@ eval "$(awk '
   in_fn && /^\}$/ { in_fn = 0 }
 ' "$HERE/store-upgrade.sh")"
 
-WORK=${WORK:?WORK must name the run directory}
+WORK=${WORK:-$ROOT/.scn-drills/backup-n1}
 N1_REF=${STORE_UPGRADE_TAGS:?STORE_UPGRADE_TAGS must name the N-1 ref \
 (a pinned main SHA before v0.1.0, the release tag after)}
 mkdir -p "$WORK"
+DRILL_WORK_MADE=1
+
+# kill_drill_servers: every server `start` backgrounded, via its
+# $dir/$name.log.pid. TERM first, a pause, then KILL: a server that
+# ignores TERM still dies, and the drill never orphans one on any exit
+# path. stop_one already handled its file on the happy path, so a pid
+# file left here means a die.
+kill_drill_servers() {
+  local log pid
+  for log in $(find "$WORK" -name '*.log.pid' 2>/dev/null); do
+    pid=$(cat "$log" 2>/dev/null) || continue
+    kill "$pid" 2>/dev/null || true
+  done
+  sleep 2
+  for log in $(find "$WORK" -name '*.log.pid' 2>/dev/null); do
+    pid=$(cat "$log" 2>/dev/null) || continue
+    kill -9 "$pid" 2>/dev/null || true
+    rm -f "$log"
+  done
+}
+
+# The drill's own exit guard: the servers it started die on every path,
+# and a run directory this script made does not outlive it. One a caller
+# named (CI's $RUNNER_TEMP) is left for the caller.
+cleanup() {
+  kill_drill_servers
+  [ -n "${DRILL_WORK_MADE:-}" ] && rm -rf "$WORK"
+  return 0
+}
+trap cleanup EXIT
+trap 'exit 129' HUP
+trap 'exit 130' INT
+trap 'exit 143' TERM
 
 # HEAD's pair, built the way the ladder's run builds it: this
 # repository's source, one target directory.
