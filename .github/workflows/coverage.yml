@@ -171,8 +171,13 @@ jobs:
         if: inputs.phase == 'build'
         run: |
           set -o pipefail
-          nice -n 19 cargo llvm-cov --no-run --workspace -q \
-            ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
+          # The README's recipe for building the instrumented binaries
+          # without running anything: show-env exports the instrumentation
+          # RUSTFLAGS and the profile environment, plain cargo builds the
+          # workspace against them. --no-run is deprecated in v0.9.1 and
+          # means 'report without tests', not 'build without tests'.
+          source <(cargo llvm-cov show-env --sh)
+          nice -n 19 cargo build --workspace --tests \
             | tee measure.log
       - name: measure
         if: inputs.phase != 'build'
