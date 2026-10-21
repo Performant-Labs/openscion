@@ -812,6 +812,7 @@ checking out through a cache and a daemon beside it.
 |---|---|
 | Commit | the `git rev-parse HEAD` of the run that produced the table |
 | Runner | the hosted runner class, by its public label and spec |
+| Filesystem | the filesystem the run measured, from the run's `machine.txt` artifact (`df -T` on the work directory); the `ubuntu-24.04` class's root disk is ext4 ([support.md](support.md)) |
 | Repetitions | 2 per cell; the table reports the cell's whole run, and the run's raw samples are the workflow run's `capacity.csv` artifact |
 
 | backend | writers | readers | land p99 ms | checkout p50 ms | checkout p99 ms | timeouts | errors | server RSS MiB | store KiB per 1k lands |
@@ -847,8 +848,9 @@ is part of the data, not a failure of the run: the envelope's edge IS
 where errors start, so a cell whose clients failed is recorded with its
 error count and stands in the table. The edge, the point where a cell
 stops being an answer: a checkout p99 over 5 seconds, a land p99 over
-5 seconds, or a client error outside the accepted classes of the soak -
-in the table, that is a cell with errors above 0. A reader who wants a
+5 seconds, or a client error outside the accepted classes of the soak
+([scripts/soak.sh](../scripts/soak.sh), `classifies`, each class with
+its why) - in the table, that is a cell with errors above 0. A reader who wants a
 different edge applies it to the run's `capacity.csv` artifact, which
 the footer's workflow run keeps. A cell whose bench died names no land
 percentile (`-` there).

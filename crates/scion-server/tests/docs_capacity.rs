@@ -169,6 +169,22 @@ fn numeric_columns_parse_and_dashes_say_what_failed() {
 }
 
 #[test]
+fn the_caption_pins_the_filesystem_row() {
+    let doc = std::fs::read_to_string(Path::new(DOC)).expect("docs/operations.md exists");
+    let section = capacity_section(&doc);
+    // The caption carries a filesystem row, measured per run (the
+    // machine.txt artifact the script writes), with the runner class's
+    // root filesystem named.
+    let row = section
+        .lines()
+        .find_map(|line| line.strip_prefix("| Filesystem | "))
+        .unwrap_or_else(|| panic!("the capacity caption has no Filesystem row"));
+    for fact in ["machine.txt", "ext4", "support.md"] {
+        assert!(row.contains(fact), "the Filesystem row omits {fact}: {row}");
+    }
+}
+
+#[test]
 fn the_caption_names_both_edges() {
     let doc = std::fs::read_to_string(Path::new(DOC)).expect("docs/operations.md exists");
     let section = capacity_section(&doc);
