@@ -15,8 +15,6 @@ const BACKENDS: [&str; 2] = ["sqlite", "postgres"];
 const WRITERS: [u32; 3] = [2, 50, 200];
 const READERS: [u32; 3] = [0, 5, 20];
 
-/// The numeric columns, in order, after backend/writers/readers.
-const NUMERIC_COLUMNS: usize = 7;
 /// The table's data rows: the markdown lines after the `|---|` rule of
 /// the first table in the Capacity section.
 fn table_rows(section: &str) -> Vec<Vec<String>> {
