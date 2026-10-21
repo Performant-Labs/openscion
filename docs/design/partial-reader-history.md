@@ -16,10 +16,17 @@ A **view changeset** is the changeset a partial reader sees in place
 of a real one. It is an ordinary `Changeset` over view trees, stored
 beside the real ones and content-addressed by its own ID:
 
-- **Parents.** Each real parent maps to its view changeset ID. A real
-  changeset with no view (all its paths hidden) contracts out of the
-  graph: its view children take its mapped parents as their own, so
-  the projected graph keeps the visible history's order and edges.
+- **Parents.** Each real parent maps to its nearest visible ancestor:
+  the first changeset on the parent's first-parent path that has a
+  view, walking past every all-hidden changeset. A merge maps each of
+  its real parents this way, de-duplicates the mapped IDs, and drops
+  any mapped parent that is an ancestor of another mapped parent. A
+  merge left with one mapped parent is a plain view changeset; with
+  zero, a root of the projected graph. Two visible children of one
+  hidden changeset share that changeset's mapped ancestor, so the
+  projected graph can give one view changeset two view children —
+  which an ordinary graph also has (a merge), and the walk reads the
+  same way.
 - **Body.** The changes list, restricted to paths the rule set covers,
   with each entry's tree replaced by the view tree ([#121]'s
   derivation, reused per directory). A changeset whose list comes out
@@ -31,7 +38,7 @@ beside the real ones and content-addressed by its own ID:
   different rules never agree on an ID, and one reader's IDs are
   stable across restarts and servers.
 
-A worked example. Five real changesets on `main`, a reader whose rules
+A worked example. Six real changesets on `main`, a reader whose rules
 cover only `docs/`:
 
 | real | touches | view |
@@ -41,21 +48,31 @@ cover only `docs/`:
 | c3 | `docs/api`, `src/lib` | v3, parents [v1] |
 | c4 | `src/only` (all hidden) | — contracts |
 | c5 | `docs/plan` | v5, parents [v3] |
+| c6 | merge of c5 and a hidden branch | v6, parents [v5] — the hidden side maps to v5, deduplicates away, so v6 has one parent |
 
-The reader's history is v1 → v3 → v5. c2 and c4 do not exist; v3's
+The reader's history is v1 → v3 → v5 → v6. c2 and c4 do not exist; v3's
 body lists only `docs/api`; every view changeset's message and author
 are the constant ones of §2 (O1), so c3's real message never shows.
 
 ## 2. The leak channels, and what closes each
 
 - **Commit metadata.** A real message or author names hidden paths or
-  activity. Close: O1 or O2 below.
+  activity. Close: O1 or O2 below. Under O1 the constant fields are
+  every field of a changeset but its body and parents: the author is
+  the repo's service identity, the message is the constant text of
+  §3 O1, the committer time is the real changeset's time truncated to
+  the hour (order shows, minutes do not), and the change time inside
+  each entry keeps its real value (the reader sees those bytes in its
+  checkout anyway). **Generations are recomputed on the projected
+  graph** — a real generation counts hidden changesets, so it leaks
+  hidden depth; the projected generation is the reader's position in
+  its own history, which is the only ancestry the reply may name.
 - **Graph shape.** Merge edges and contracting changesets reveal that
-  hidden work happened. Close: the projection keeps only edges the
-  mapped graph has after contraction, and merges whose both sides are
-  hidden contract with their parents. A merge with one visible side
-  keeps that side's edge and the merge shape (two parents) but not the
-  hidden side's ID.
+  hidden work happened. Close: the mapped graph of §1 — every edge
+  runs between view IDs, so no hidden edge, hidden merge or hidden
+  branch shows; a merge of two visible sides keeps its two-parent
+  shape, a merge with one visible side becomes a plain changeset on
+  that side, and a merge with none contracts out.
 - **Counts and sizes.** The number of view changesets, their byte
   sizes and reply timing reveal activity between visible ones. Close:
   document that counts are the projected history's (the reader's
@@ -68,9 +85,13 @@ are the constant ones of §2 (O1), so c3's real message never shows.
   cache at a steady cost once built, and while building, the read
   waits on the projection with a deadline, not a variable-time walk.
 - **Ancestry.** `MergeBase`/`IsAncestor` over real IDs answer questions
-  about hidden work. Close: they answer over the projected graph only;
-  a real ID a partial reader sends that is not one of its view IDs
-  errors as invalid, never as ancestry.
+  about hidden work. Close: they answer over the projected graph only.
+- **Existence.** A reply that says "unknown ID" for one ID and "not
+  yours" for another is an oracle for what a repo holds. Close: an ID
+  the reader sent that is not one of its view IDs — whether it exists
+  in the real repo or not at all — gets the SAME answer, the same
+  text, in the same time class: the not-found of the projected
+  history, nothing more.
 
 ## 3. The two picks
 
@@ -90,7 +111,12 @@ are the constant ones of §2 (O1), so c3's real message never shows.
     expiry); the writer sends it back with its upload receipts; the
     server re-derives the view from the token's head. Trade-off: one
     MAC key to keep and rotate; the head is exact and the token is
-    useless for another reader or rule set.
+    useless for another reader or rule set. The key is a NEW MAC key
+    derived from the server's existing ticket seed (tickets.rs signs
+    read tickets with Ed25519; a land's base token is a symmetric
+    MAC the same server verifies, so it needs no public half, and
+    deriving it from the ticket seed keeps one secret to rotate and
+    one rotation path).
   - **O2 — name the view head and resolve server-side.** The writer
     names its view head; the server resolves it to the real head by
     the rule-set digest. Trade-off: no key to keep, but the resolution
@@ -102,6 +128,13 @@ are the constant ones of §2 (O1), so c3's real message never shows.
 - **Work per new rule set.** The projection walks each real changeset
   once: map parents, restrict the body, hash. The tree part reuses
   [#121]'s `view_trees` rows; the changeset part is a linear pass.
+  A land pays the same per ACTIVE rule set (a rule set with a
+  materialized projection of this repo): the new changeset projects
+  once per rule set, ~1 ms each (one body restriction + one hash),
+  done INLINE in the land's commit, in the same transaction, so a
+  reader never sees a real head without its projection. A rule set
+  with no materialized projection projects on its own schedule (§4
+  below) and does not slow the land.
   Back-of-envelope for 100,000 changesets: 100k rows read (~200 MB of
   bodies at 2 KB each), 100k restricted bodies hashed (~1 s of BLAKE3
   at 1 GB/s for the hashing, the reads dominate) — minutes cold,
