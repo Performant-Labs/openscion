@@ -22,7 +22,7 @@ permissions:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 env:
   CARGO_TERM_COLOR: never
@@ -105,20 +105,28 @@ jobs:
       # built, and the proof below reads its printed list. The takeover
       # test stays out: it stops the shared database, as in ci.yml's
       # jobs.
+      - name: the runner's disk and memory, before the build
+        run: df -h / | tail -1; free -m | awk 'NR==2'
       - name: clean the coverage workspace, once
         run: cargo llvm-cov clean --workspace
       - name: measure, the default backend
         run: |
+          ( while sleep 30; do date -u +%T; df -h / | tail -1; free -m | awk 'NR==2'; du -sh target 2>/dev/null; done ) &
+          watcher=$!
           cargo llvm-cov --no-report --workspace \
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"}
+          kill "$watcher"
         env:
           PROPTEST_CASES: "64"
           CARGO_BUILD_JOBS: "2"
           RUST_TEST_THREADS: "2"
       - name: measure, the postgres backend
         run: |
+          ( while sleep 30; do date -u +%T; df -h / | tail -1; free -m | awk 'NR==2'; du -sh target 2>/dev/null; done ) &
+          watcher=$!
           cargo llvm-cov --no-report --workspace \
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"}
+          kill "$watcher"
         env:
           PROPTEST_CASES: "64"
           CARGO_BUILD_JOBS: "2"
