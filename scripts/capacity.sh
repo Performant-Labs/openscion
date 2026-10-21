@@ -247,6 +247,20 @@ done
 
 # The artifacts go where the workflow finds them.
 mkdir -p "${RUNNER_TEMP:-/tmp}/capacity-artifacts"
+
+# The machine, measured - not quoted: the runner image's published spec
+# is a fact GitHub can change, so the run records what it actually ran
+# on, and the envelope page states those values next to the run's link.
+{
+  echo "nproc=$(nproc)"
+  echo "memory_kib=$(awk '/MemTotal/ { print $2 }' /proc/meminfo)"
+  echo "kernel=$(uname -r)"
+  echo "filesystem=$(df -T "$WORK" | awk 'NR == 2 { print $2 }')"
+  echo "disk_total_kib=$(df -k "$WORK" | awk 'NR == 2 { print $2 }')"
+  echo "disk_free_kib=$(df -k "$WORK" | awk 'NR == 2 { print $4 }')"
+  echo "work_dir=$WORK"
+  echo "runner_image=${ImageOS:-}${ImageVersion:+ $ImageVersion}"
+} > "${RUNNER_TEMP:-/tmp}/capacity-artifacts/machine.txt"
 cp "$WORK/capacity.csv" "${RUNNER_TEMP:-/tmp}/capacity-artifacts/" 2> /dev/null || true
 cp "$WORK"/*.log "${RUNNER_TEMP:-/tmp}/capacity-artifacts/" 2> /dev/null || true
 cp "$WORK"/bench-*.json "${RUNNER_TEMP:-/tmp}/capacity-artifacts/" 2> /dev/null || true
