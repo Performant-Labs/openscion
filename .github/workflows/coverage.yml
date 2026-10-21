@@ -176,10 +176,12 @@ jobs:
             /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
             /usr/local/share/boost /usr/lib/jvm 2>/dev/null || true
           sudo docker image prune -af >/dev/null 2>&1 || true
-          sudo fallocate -l 4G /swapfile
-          sudo chmod 600 /swapfile
-          sudo mkswap /swapfile
-          sudo swapon /swapfile
+          # The image may already run a swap file (this one does);
+          # only grow the machine when it has none.
+          if [ -z "$(swapon --show)" ]; then
+            sudo fallocate -l 4G /covswap && sudo chmod 600 /covswap               && sudo mkswap /covswap && sudo swapon /covswap || true
+          fi
+          swapon --show || true
           df -h / | tail -1; free -m | awk 'NR==2'
       - name: stale profiles go, the cached build stays
         run: rm -f target/coverage/*.profraw target/coverage/*.profdata target/coverage/*-profraw-list
