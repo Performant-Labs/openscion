@@ -81,6 +81,10 @@ jobs:
       - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
         with:
           tool: protoc
+      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+        if: inputs.phase != 'build'
+        with:
+          tool: cargo-nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # The instrumented build is one build: both matrix cells and
@@ -190,11 +194,18 @@ jobs:
               avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9'); \
               [ "$avail" -gt 3 ] || { echo 'the runner is out of disk'; df -h /; exit 2; }; done ) &
           watcher=$!
-          nice -n 19 cargo llvm-cov --no-report --workspace -q \
+          # nextest isolates every test in its own process with its own
+          # timeout: eight measure runs lost the runner mid-suite with
+          # no log that survived, so the killer test names itself here
+          # instead of eating the runner. The measure's output goes to
+          # a file, not the step log: the agent buffers what it streams.
+          nice -n 19 cargo llvm-cov nextest --workspace --no-report \
+            --timeout 300s --retries 1 --final-status-level slow \
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
-            | tee measure.log
+            > measure.log 2>&1
           status=$?
           kill "$watcher"
+          tail -30 measure.log
           exit "$status"
         env:
           PROPTEST_CASES: "64"
