@@ -84,7 +84,15 @@ pub async fn bench(ctx: &Ctx, args: BenchArgs) -> Result<()> {
     let mut tasks = JoinSet::new();
     for agent in 0..agents {
         let count = per_agent.min(lands.saturating_sub(agent * per_agent));
-        tasks.spawn(run_agent(ctx.clone(), agent, count, start, base, deadline, started));
+        tasks.spawn(run_agent(
+            ctx.clone(),
+            agent,
+            count,
+            start,
+            base,
+            deadline,
+            started,
+        ));
     }
     let mut stats = Stats::default();
     while let Some(agent) = tasks.join_next().await {
