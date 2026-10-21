@@ -123,20 +123,7 @@ struct PgServer {
     child: Child,
     url: String,
     log: PathBuf,
-    schema: String,
     name: String,
-}
-
-/// The one-server advisory key of a schema: the same fold `pg.rs`
-/// derives (`SERVER_LOCK` plus the schema's BLAKE3's first 8 bytes),
-/// pinned here because the key is private to the backend.
-fn schema_lock_key(schema: &str) -> i64 {
-    const SERVER_LOCK: i64 = 0x5343_494F_4E53_5256;
-    SERVER_LOCK.wrapping_add(i64::from_be_bytes(
-        blake3::hash(schema.as_bytes()).as_bytes()[..8]
-            .try_into()
-            .expect("8 of 32 bytes"),
-    ))
 }
 
 impl PgServer {
@@ -172,7 +159,6 @@ impl PgServer {
             child,
             url: String::new(),
             log: log.to_path_buf(),
-            schema: schema.to_owned(),
             name: name.clone(),
         }
     }
@@ -201,23 +187,24 @@ impl PgServer {
     }
 
     /// Kills the process and waits for the death, then for Postgres to
-    /// free the dead server's one-server advisory lock: the backend
-    /// that held it died with the process, but Postgres gives the lock
-    /// up only while cleaning that session away, which a loaded runner
-    /// can stretch past any fixed sleep. The next start goes out only
-    /// when the lock is really gone, or the test names the wait that
-    /// never ended.
+    /// end every session the dead server opened: the backend that held
+    /// the one-server lock died with the process, but Postgres gives
+    /// the lock up only while cleaning that session away, which a
+    /// loaded runner can stretch past any fixed sleep - and a session
+    /// that was mid-start at the kill can take the lock AFTER any
+    /// lock-only check said the database was clear. The wait therefore
+    /// watches the sessions of this one server, by the name every its
+    /// connection carries, and no lock. The next start goes out only
+    /// when they are gone, or the test names the wait that never ended.
+    /// (A lock of the schema's own key that the test's own harness
+    /// holds between reps is not this server's, and must not hold the
+    /// wait.)
     fn kill_and_wait(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait(); // needs &mut: the kill rides it
-        let key = schema_lock_key(&self.schema);
         let mut client = raw(&pg_url());
         let start = Instant::now();
         loop {
-            // A session that was mid-start at the kill can appear in
-            // pg_stat_activity, and take the lock, AFTER a lock-only
-            // check said the database was clear: the wait must see the
-            // sessions of this one server end, not one lock.
             let sessions = client
                 .query_opt(
                     "SELECT 1 FROM pg_stat_activity WHERE application_name = $1",
@@ -225,24 +212,12 @@ impl PgServer {
                 )
                 .expect("the session query answers")
                 .is_some();
-            // pg_locks splits the int8 advisory key into classid (the
-            // high 32 bits) and objid (the low 32), both oid.
-            let held = client
-                .query_opt(
-                    "SELECT 1 FROM pg_locks WHERE locktype = 'advisory' \
-                     AND classid = (($1::bigint >> 32) & 4294967295)::oid \
-                     AND objid = ($1::bigint & 4294967295)::oid",
-                    &[&key],
-                )
-                .expect("the lock query answers")
-                .is_some();
-            if !sessions && !held {
+            if !sessions {
                 return;
             }
             assert!(
                 start.elapsed() < Duration::from_secs(10),
-                "the dead server's sessions ({sessions}) or lock ({held}) \
-                 never ended"
+                "the dead server's sessions never ended"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
@@ -253,6 +228,31 @@ impl Drop for PgServer {
     fn drop(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait();
+        // A server that ends here is one a loop round is done with: its
+        // sessions must be gone before the next round's spawn takes the
+        // one-server lock, or that spawn races a dying session. The
+        // poll is the kill's own, with its ceiling; a drop that runs
+        // during unwinding must not panic, so a wait that never ends
+        // only names itself in the log.
+        let mut client = raw(&pg_url());
+        let start = Instant::now();
+        loop {
+            let sessions = client
+                .query_opt(
+                    "SELECT 1 FROM pg_stat_activity WHERE application_name = $1",
+                    &[&self.name],
+                )
+                .expect("the session query answers")
+                .is_some();
+            if !sessions {
+                return;
+            }
+            if start.elapsed() >= Duration::from_secs(10) {
+                eprintln!("crash_pg: the dropped server's sessions were still live after 10 s");
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
@@ -623,7 +623,7 @@ fn a_kill_during_a_schema_upgrade_leaves_one_whole_version() {
         // The next start finishes the upgrade and serves: a mixed schema
         // would fail this open, not silently serve. The repo is seeded
         // beside the running server, through the same seam.
-        let verify = PgServer::spawn(&data, &schema, &log);
+        let mut verify = PgServer::spawn(&data, &schema, &log);
         assert_eq!(
             schema_version(&schema),
             last,
@@ -636,6 +636,9 @@ fn a_kill_during_a_schema_upgrade_leaves_one_whole_version() {
             root.as_bytes().to_vec(),
             "the ref the restart serves"
         );
+        // The round is done: end this server through the wait, not
+        // Drop, so the next round's spawn cannot race its sessions.
+        verify.kill_and_wait();
         if served {
             break;
         }
