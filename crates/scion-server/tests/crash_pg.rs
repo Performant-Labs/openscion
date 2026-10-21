@@ -94,6 +94,67 @@ fn create_schema(schema: &str) {
         .expect("the test schema is created");
 }
 
+/// A real server of this database opens on one database-wide
+/// one-server key, so two tests of this binary that run real servers
+/// at the same time refuse each other. One mutex, held by a test for
+/// its whole run, serializes them. Poisoning says only that a test
+/// died; the next one still runs.
+static ONE_SERVER: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+fn one_server() -> std::sync::MutexGuard<'static, ()> {
+    ONE_SERVER
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// Names whoever holds a server's one-server key before the test
+/// panics on the refusal: every advisory row on the key, joined to its
+/// session, and every session named the schema, with the fields that
+/// tell the holder. A server of this database opens on the one key
+/// `SERVER_LOCK` (the server opens without a schema), so the dump
+/// reads that key's two halves, and the schema's sessions beside it.
+fn dump_the_holders(schema: &str) {
+    const SERVER_LOCK: i64 = 0x5343_494F_4E53_5256;
+    let mut client = raw(&pg_url());
+    let rows = client.query(
+        "SELECT a.pid, coalesce(a.application_name, ''), \
+         coalesce(a.client_port::text, ''), coalesce(a.backend_start::text, ''), \
+         coalesce(a.state, ''), coalesce(a.wait_event_type, ''), \
+         coalesce(a.wait_event, ''), coalesce(left(a.query, 80), '') \
+         FROM pg_locks l JOIN pg_stat_activity a ON a.pid = l.pid \
+         WHERE l.locktype = 'advisory' \
+           AND l.classid = (($1::bigint >> 32) & 4294967295)::bigint \
+           AND l.objid = ($1::bigint & 4294967295)::bigint \
+         UNION ALL \
+         SELECT a.pid, coalesce(a.application_name, ''), \
+         coalesce(a.client_port::text, ''), coalesce(a.backend_start::text, ''), \
+         coalesce(a.state, ''), coalesce(a.wait_event_type, ''), \
+         coalesce(a.wait_event, ''), coalesce(left(a.query, 80), '') \
+         FROM pg_stat_activity a WHERE a.application_name = $1::text \
+            OR a.application_name = $2",
+        &[&SERVER_LOCK, &schema],
+    );
+    match rows {
+        Ok(rows) => {
+            eprintln!("--- the one-server key's holders and the schema's sessions ---");
+            for row in rows {
+                eprintln!(
+                    "pid={} name={} port={} start={} state={} wait={}/{} q={}",
+                    row.get::<_, i64>(0),
+                    row.get::<_, String>(1),
+                    row.get::<_, String>(2),
+                    row.get::<_, String>(3),
+                    row.get::<_, String>(4),
+                    row.get::<_, String>(5),
+                    row.get::<_, String>(6),
+                    row.get::<_, String>(7),
+                );
+            }
+        }
+        Err(e) => eprintln!("the holder dump failed: {e}"),
+    }
+}
+
 /// The `max(schema_migrations.version)` a kill left, or 0.
 fn schema_version(schema: &str) -> i64 {
     let mut client = raw(&pg_url());
@@ -172,6 +233,7 @@ impl PgServer {
         let start = Instant::now();
         loop {
             if let Some(status) = server.child.try_wait().unwrap() {
+                dump_the_holders(schema);
                 let log = fs::read_to_string(&server.log).unwrap_or_default();
                 panic!("the server exited with {status}:\n{log}");
             }
@@ -454,6 +516,7 @@ fn a_kill_during_a_land_leaves_the_ref_old_or_new() {
         println!("skipping: Postgres only");
         return;
     }
+    let _one = one_server();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     let log = dir.path().join("server.log");
@@ -579,6 +642,7 @@ fn a_kill_during_a_schema_upgrade_leaves_one_whole_version() {
         println!("skipping: Postgres only");
         return;
     }
+    let _one = one_server();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     let log = dir.path().join("server.log");
