@@ -18,6 +18,8 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
+mod common;
+
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_proto::runtime::auth::Bearer;
 use scion_proto::v1::{
@@ -28,7 +30,7 @@ use scion_server::Backend;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::write;
 use tonic::Status;
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::Channel;
 
 const REPO: &str = "r";
 const TOKEN: &str = "crash-pg-token";
@@ -41,14 +43,6 @@ const FILES: usize = 300;
 /// the kills have produced both endings, a ref that moved and one that
 /// did not.
 const REPS: usize = 12;
-
-/// The connect timeout of every client here: a server that died mid-open
-/// is unavailable, and a call that hangs on it would eat the budget.
-const CONNECT_TIMEOUT: Duration = Duration::from_secs(5);
-
-/// The deadline of every call here: the kill cuts the call, and a server
-/// that stays silent past this is a finding, not a wait.
-const CALL_TIMEOUT: Duration = Duration::from_secs(30);
 
 fn pg_url() -> String {
     std::env::var("SCION_TEST_POSTGRES_URL").expect("SCION_TEST_POSTGRES_URL")
@@ -337,18 +331,11 @@ impl Drop for PgServer {
     }
 }
 
-/// The channel this file builds per call: its background tasks live on
-/// the runtime that built it, so every helper connects and calls inside
-/// ONE runtime, with this file's timeouts (5 s to connect, 30 s per
-/// call) until a shared builder lands.
+/// The channel of one call: the shared builder's timeouts, connected
+/// inside the caller's runtime, because a channel's background tasks
+/// live on the runtime that built it.
 async fn channel(url: &str) -> Channel {
-    Endpoint::from_shared(url.to_owned())
-        .unwrap()
-        .connect_timeout(CONNECT_TIMEOUT)
-        .timeout(CALL_TIMEOUT)
-        .connect()
-        .await
-        .expect("the client connects")
+    common::channel(url).await.expect("the client connects")
 }
 
 /// `Scion.Land` as one call on a fresh connection.
