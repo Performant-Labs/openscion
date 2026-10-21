@@ -1,21 +1,23 @@
 # The statement-coverage gate: the roadmap's v0.8.0 bar, measured over
 # production code with a pinned tool, the exclusions checked in
 # (scripts/coverage-exclusions.txt). The gate runs on the merged report
-# of two measures: the default backend and the Postgres backend, so a
-# whole production backend (pg.rs) is not invisible to the number.
+# of the measure partitions: the default backend and the Postgres
+# backend, so a whole production backend (pg.rs) is not invisible to
+# the number.
 #
 # No pull_request trigger on purpose: the PR lane does not pay for the
 # coverage build, and an edit to this file is not a workflow-lane PR
 # that every open PR must merge. The same reason bench.yml and soak.yml
 # are their own files.
 #
-# The work is split across three runners: four runs in a row lost the
-# runner mid-measure ("The hosted runner lost communication"), and one
-# job that builds and runs the whole workspace twice does not leave the
-# runner's agent enough room. Job `measure` builds and runs one
-# instrumented backend and uploads its merged profile as an artifact;
-# job `gate` rebuilds the instrumented binaries without running tests
-# (--no-run) and reports the two downloaded profiles together.
+# The work is partitioned: nine runs lost the runner mid-suite at
+# around the suite's end — a full instrumented suite is the heaviest
+# thing this repository runs, and the runner's agent stops answering
+# part-way through it, with every log. Each partition runs a hash
+# slice of the suite under nextest (every test its own process, its
+# own timeout), uploads its profiles, and the gate job rebuilds the
+# instrumented binaries without tests and merges every partition's
+# profiles into the one number it checks.
 
 name: coverage
 on:
@@ -37,8 +39,9 @@ permissions:
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
   # A pull_request run may cancel the run before it; a push to main
-  # may not — every land's measurement has to finish. (This file has
-  # no pull_request trigger, so the expression reads false on main.)
+  # may not — a run in progress finishes and verifies the head it ran
+  # on. (This file has no pull_request trigger, so the expression
+  # reads false on main.)
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -50,7 +53,7 @@ env:
 
 jobs:
   measure:
-    name: coverage, ${{ matrix.backend }}
+    name: coverage, ${{ matrix.backend }}, slice ${{ matrix.slice }}
     runs-on: ubuntu-24.04
     timeout-minutes: 60
     strategy:
@@ -60,9 +63,19 @@ jobs:
           - backend: the default backend
             value: ""
             name: sqlite
+            slice: 1
+          - backend: the default backend
+            value: ""
+            name: sqlite
+            slice: 2
           - backend: the postgres backend
             value: postgres
             name: postgres
+            slice: 1
+          - backend: the postgres backend
+            value: postgres
+            name: postgres
+            slice: 2
     services:
       postgres:
         image: postgres:17.11
@@ -90,11 +103,10 @@ jobs:
           tool: cargo-nextest
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
-          # The instrumented build is one build: both matrix cells and
+          # The instrumented build is one build: every matrix cell and
           # the gate share it, and the first run to finish saves it —
-          # even a failed one: the cold build is the stretch where the
-          # runner's agent has been lost, and a saved cache turns every
-          # later run into the warm six-minute measure.
+          # even a failed one, so one green build phase turns every
+          # later run into the warm measure.
           key: coverage-instrumented
           cache-on-failure: true
       # cargo-llvm-cov, pinned by version and the release tarball's
@@ -126,7 +138,6 @@ jobs:
       # keeps an existing profdata when no profraw is present.
       - name: the profile's name, from the checkout's shape
         run: echo "COVERAGE_PROFILE=$(basename "$GITHUB_WORKSPACE").profdata" >> "$GITHUB_ENV"
-
       # A vacuous exclusion is the same bug class as the soak's zero
       # counts: a pattern that matches no tracked file excludes nothing
       # and promises a number the report does not hold. The gate reads
@@ -141,29 +152,23 @@ jobs:
             fi
           done < <(sed 's/^[[:space:]]*//; s/#.*//; s/[[:space:]]*$//' scripts/coverage-exclusions.txt | grep -v '^$')
           [ "$ok" = 1 ]
-      # One measure per job, the way cargo-llvm-cov v0.9.1's README
-      # documents merging runs under different test conditions: one
-      # `clean --workspace` first, then the measure with `--no-report`
-      # — which itself disables the clean, and `--no-clean` is not only
-      # unneeded but refused beside `--no-report` in this version. The
-      # takeover test stays out: it stops the shared database, as in
-      # ci.yml's jobs.
       - name: the runner's disk and memory, before the build
         run: df -h / | tail -1; free -m | awk 'NR==2'
       # A leaner instrumented build: no debuginfo (coverage needs the
       # coverage mapping, not DWARF), stripped binaries, and a linker
-      # that keeps less of its working set in RAM. The agent that
-      # dies is the largest process when the linker and the agent
-      # share a 7 GB machine.
+      # that keeps less of its working set in RAM. The agent that dies
+      # is the largest process when the linker and the agent share a
+      # 7 GB machine. The swap file gives the suite's tail somewhere to
+      # go instead of the OOM killer.
       - name: lean build settings for the instrumented build
         run: |
           mkdir -p .cargo
           printf '[profile.dev]\ndebug = false\nstrip = true\n\n[profile.test]\ndebug = false\nstrip = true\n' > .cargo/config.toml
           echo "RUSTFLAGS=-C link-arg=-Wl,--no-keep-memory" >> "$GITHUB_ENV"
-      # The instrumented build is far larger than the plain one, and a
-      # runner whose disk fills loses its agent mid-measure — six runs
-      # in a row, always near the same minute. The image ships dozens
-      # of gigabytes of toolchains this job never touches; they go.
+      - name: the runner's disk and memory, before the build
+        run: df -h / | tail -1; free -m | awk 'NR==2'
+      # The image ships dozens of gigabytes of toolchains this job
+      # never touches; they go.
       - name: free the runner's disk for the instrumented build
         run: |
           df -h / | tail -1
@@ -171,7 +176,11 @@ jobs:
             /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
             /usr/local/share/boost /usr/lib/jvm 2>/dev/null || true
           sudo docker image prune -af >/dev/null 2>&1 || true
-          df -h / | tail -1
+          sudo fallocate -l 4G /swapfile
+          sudo chmod 600 /swapfile
+          sudo mkswap /swapfile
+          sudo swapon /swapfile
+          df -h / | tail -1; free -m | awk 'NR==2'
       - name: stale profiles go, the cached build stays
         run: rm -f target/coverage/*.profraw target/coverage/*.profdata target/coverage/*-profraw-list
       - name: build only, this run warms the cache
@@ -191,23 +200,25 @@ jobs:
         if: inputs.phase != 'build'
         run: |
           set -o pipefail
-          # The watcher doubles as a guard: a runner whose disk fills
-          # loses its agent mid-build, with every log — so the measure
-          # fails itself, loudly, while there is still disk to log it.
+          # The watcher doubles as a guard: a runner whose disk fills or
+          # whose memory drains loses its agent mid-suite, with every
+          # log — so the measure fails itself, loudly, while there is
+          # still room to log the numbers.
           ( while sleep 30; do date -u +%T; df -h / | tail -1; free -m | awk 'NR==2'; du -sh target 2>/dev/null; \
               avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9'); \
-              [ "$avail" -gt 3 ] || { echo 'the runner is out of disk'; df -h /; exit 2; }; done ) &
+              mem=$(free -m | awk 'NR==2 {print $7}'); \
+              { [ "$avail" -gt 3 ] && [ "$mem" -gt 600 ]; } || { echo 'the runner is out of disk or memory'; df -h /; free -m; ps aux --sort=-rss | head -12; exit 2; }; done ) &
           watcher=$!
           # nextest isolates every test in its own process with its own
-          # timeout: nine measure runs lost the runner mid-suite with
-          # no log that survived, so the killer test names itself here
-          # instead of eating the runner. The measure's output goes to
-          # a file, not the step log: the agent buffers what it streams.
-          # The profile is a file, not CLI flags: the flags ride behind
-          # nextest's own parser, the profile does not.
+          # timeout, and the hash partition takes a slice of the suite:
+          # the full instrumented suite is more than one runner's
+          # agent survives, so no runner carries more than a slice.
+          # The measure's output goes to a file, not the step log: the
+          # agent buffers what it streams.
           mkdir -p .config
-          printf '[profile.default]\ntimeout = "300s"\nretries = 1\nslow-timeout = { period = "60s", terminate-after = 2 }\nfinal-status-level = "slow"\n' > .config/nextest.toml
+          printf '[profile.default]\ntimeout = "300s"\nretries = 1\nslow-timeout = { period = "60s", terminate-after = 2 }\n' > .config/nextest.toml
           nice -n 19 cargo llvm-cov nextest --workspace --no-report \
+            --partition hash:${{ matrix.slice }}/2 \
             > measure.log 2>&1
           status=$?
           kill "$watcher"
@@ -217,23 +228,14 @@ jobs:
           PROPTEST_CASES: "64"
           SCION_TEST_BACKEND: ${{ matrix.value }}
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
-      # The measure's own profraw set, merged into the one profdata the
-      # gate job downloads: a profdata is far smaller than its profraw
-      # set, and the report here runs without tests, so the summary is
-      # the per-backend number for the PR body's table.
-      - name: the measure's own report
-        if: inputs.phase != 'build'
-        run: |
-          set -o pipefail
-          cargo llvm-cov report --summary-only \
-            ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
-            | tee target/coverage/backend-summary.txt
-      - name: upload the measure's profile
+      # The slice's own profraw set, uploaded raw: the gate job merges
+      # every partition's profiles into the one number it checks.
+      - name: upload the slice's profiles
         if: inputs.phase != 'build'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: coverage-${{ matrix.name }}
-          path: target/coverage/${{ env.COVERAGE_PROFILE }}
+          name: coverage-${{ matrix.name }}-${{ matrix.slice }}
+          path: target/coverage/*.profraw
           if-no-files-found: error
       - name: the profiles leave the cache, the build stays
         if: always()
@@ -248,7 +250,7 @@ jobs:
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
-          name: measure-log-${{ matrix.name }}
+          name: measure-log-${{ matrix.name }}-${{ matrix.slice }}
           path: measure.log
           if-no-files-found: ignore
 
@@ -285,7 +287,7 @@ jobs:
           if [ -n "$regex" ]; then
             echo "COVERAGE_IGNORE=$regex" >> "$GITHUB_ENV"
           fi
-      - name: the profiles of both measures
+      - name: the profiles of every slice
         uses: actions/download-artifact@d3f86a106a0bac45b974a628896c90dbdf5c8093 # v4.3.0
         with:
           pattern: coverage-*
@@ -293,14 +295,23 @@ jobs:
           merge-multiple: true
       - name: the runner's disk and memory, before the build
         run: df -h / | tail -1; free -m | awk 'NR==2'
+      - name: lean build settings for the instrumented build
+        run: |
+          mkdir -p .cargo
+          printf '[profile.dev]\ndebug = false\nstrip = true\n\n[profile.test]\ndebug = false\nstrip = true\n' > .cargo/config.toml
+          echo "RUSTFLAGS=-C link-arg=-Wl,--no-keep-memory" >> "$GITHUB_ENV"
       # The report needs the instrumented binaries, but no test run:
-      # --no-run builds them and reports what the profiles hold. The
-      # gate reads the merged number, and the proof below reads its
-      # printed list.
+      # show-env plus a plain build provide them, the downloaded
+      # profiles carry the counts, and the report step merges every
+      # profile in the target dir into the number the gate checks. The
+      # proof below reads its printed list.
       - name: the merged report, and the gate
         run: |
           set -o pipefail
-          nice -n 19 cargo llvm-cov --no-run --summary-only --fail-under-lines 80 \
+          # shellcheck disable=SC1090
+          source <(cargo llvm-cov show-env --sh)
+          nice -n 19 cargo build --workspace --tests
+          cargo llvm-cov report --summary-only --fail-under-lines 80 \
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
             | tee target/coverage/report-summary.txt
           # The proof the filter applies: no excluded file may appear
