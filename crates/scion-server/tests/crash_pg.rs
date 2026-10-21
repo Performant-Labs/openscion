@@ -123,6 +123,7 @@ struct PgServer {
     child: Child,
     url: String,
     log: PathBuf,
+    schema: String,
     name: String,
 }
 
@@ -159,6 +160,7 @@ impl PgServer {
             child,
             url: String::new(),
             log: log.to_path_buf(),
+            schema: schema.to_owned(),
             name: name.clone(),
         }
     }
@@ -187,18 +189,20 @@ impl PgServer {
     }
 
     /// Kills the process and waits for the death, then for Postgres to
-    /// end every session the dead server opened: the backend that held
+    /// end every session the dead server opened. The backend that held
     /// the one-server lock died with the process, but Postgres gives
     /// the lock up only while cleaning that session away, which a
     /// loaded runner can stretch past any fixed sleep - and a session
     /// that was mid-start at the kill can take the lock AFTER any
     /// lock-only check said the database was clear. The wait therefore
-    /// watches the sessions of this one server, by the name every its
-    /// connection carries, and no lock. The next start goes out only
-    /// when they are gone, or the test names the wait that never ended.
-    /// (A lock of the schema's own key that the test's own harness
-    /// holds between reps is not this server's, and must not hold the
-    /// wait.)
+    /// watches this one server's sessions, and no lock. A session's
+    /// name is one of two: the URL's (`scion-test-N`) until its first
+    /// statement, and the schema's after (the store's setup renames
+    /// every session it opens), so both names hold the wait. The next
+    /// start goes out only when no session of either name remains, or
+    /// the test names the wait that never ended. (A lock of the
+    /// schema's own key that the test's harness holds between rounds
+    /// is not this server's, and must not hold the wait.)
     fn kill_and_wait(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait(); // needs &mut: the kill rides it
@@ -207,8 +211,10 @@ impl PgServer {
         loop {
             let sessions = client
                 .query_opt(
-                    "SELECT 1 FROM pg_stat_activity WHERE application_name = $1",
-                    &[&self.name],
+                    "SELECT 1 FROM pg_stat_activity \
+                     WHERE (application_name = $1 OR application_name = $2) \
+                       AND pid <> pg_backend_pid()",
+                    &[&self.name, &self.schema],
                 )
                 .expect("the session query answers")
                 .is_some();
