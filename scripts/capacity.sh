@@ -213,14 +213,9 @@ for backend in sqlite postgres; do
       note "cell $backend w$w r$r: $((lands_end - lands_before)) lands landed"
       reader_failures=0
       reader_log="$WORK/reads-$backend-w$w-r$r.log"
-      [ -f "$reader_log" ] || reader_log=
-      if [ -n "$reader_log" ]; then
-        reader_timeouts=$(grep -c '^timeout after 60s' "$reader_log" || true)
-        reader_failures=$(grep -c '^checkout failed' "$reader_log" || true)
-      else
-        reader_timeouts=0
-        reader_failures=0
-      fi
+      [ -f "$reader_log" ] || { touch "$reader_log"; }
+      reader_timeouts=$(count_reader_timeouts "$reader_log")
+      reader_failures=$(count_reader_failures "$reader_log")
       errors=$((reader_failures + bench_fail))
       # The lands counter's growth stays a check (a cell whose bench
       # died mid-budget names it in the errors column), but it is not a
@@ -245,6 +240,7 @@ for backend in sqlite postgres; do
         note "cell $backend w$w r$r: $reader_timeouts timeouts, $errors errors (readers $reader_failures, bench $bench_fail) - recorded, next cell"
       fi
       rm -f "$WORK/read-times.csv"
+      rm -rf "$WORK"/reads.*
     done
   done
 done

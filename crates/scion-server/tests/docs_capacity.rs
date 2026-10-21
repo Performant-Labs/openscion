@@ -1,7 +1,8 @@
 //! The capacity table of docs/operations.md (issue #387) cannot drift
 //! from the envelope's shape: every cell of the grid (3 writers x 3
-//! readers x 2 backends) is a row, numbers parse or a row is all `-`
-//! (no half-filled cell publishes), the caption states the edges, and
+//! readers x 2 backends) is a row, numbers parse or the percentile
+//! group is all `-` together (no half-filled cell publishes), the
+//! caption states the edges, and
 //! the footer names a commit that exists in this checkout's git - so a
 //! table in the doc points at the run that produced it.
 
@@ -105,7 +106,8 @@ fn every_cell_of_the_grid_has_a_row_in_order() {
 #[test]
 fn numeric_columns_parse_and_dashes_say_what_failed() {
     let doc = std::fs::read_to_string(Path::new(DOC)).expect("docs/operations.md exists");
-    // Column indexes in the row: 3 land p99, 6 timeouts, 7 errors.
+    // Column indexes in the row: 3 land p99, 4 checkout p50, 5 checkout
+    // p99, 6 timeouts, 7 errors.
     for row in table_rows(capacity_section(&doc)) {
         let all_dash = row[3..].iter().all(|c| c.as_str() == "-");
         if all_dash {
@@ -117,19 +119,27 @@ fn numeric_columns_parse_and_dashes_say_what_failed() {
         let errors: u64 = row[7]
             .parse()
             .unwrap_or_else(|_| panic!("errors does not parse: {row:?}"));
-        for (at, cell) in row[3..].iter().enumerate() {
-            if cell.as_str() != "-" {
-                cell.parse::<f64>()
-                    .unwrap_or_else(|_| panic!("a number does not parse: {cell:?} in {row:?}"));
-                continue;
+        // The percentile group (land p99, checkout p50, checkout p99)
+        // stands together or parses together: a bench that died names
+        // none of them, a live one names all three. A dash in one and a
+        // number in another is a broken row, not a measurement.
+        let group = &row[3..6];
+        let dashes = group.iter().filter(|c| c.as_str() == "-").count();
+        match dashes {
+            0 => {
+                for cell in group {
+                    cell.parse::<f64>()
+                        .unwrap_or_else(|_| panic!("a number does not parse: {cell:?} in {row:?}"));
+                }
             }
-            // A dash is allowed only where a failed bench left the land
-            // percentile unknown, and only in a cell that had errors or
-            // timeouts: the cell is the data, and those columns say so.
-            assert!(
-                at == 0 && errors + timeouts > 0,
-                "a dash without a failing cell must not publish: {row:?}"
-            );
+            3 if errors + timeouts > 0 => {}
+            _ => panic!("a half-reported percentile group must not publish: {row:?}"),
+        }
+        // The counters and the resources are always numbers: the run
+        // knows them whatever the bench did.
+        for cell in &row[6..] {
+            cell.parse::<f64>()
+                .unwrap_or_else(|_| panic!("a number does not parse: {cell:?} in {row:?}"));
         }
     }
 }
