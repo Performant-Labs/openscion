@@ -1,6 +1,7 @@
 //! The measured recovery time of `docs/operations.md`, section 7: a
 //! store of a stated size (repos, changesets, blob bytes, and pending
-//! lands), a server killed with SIGKILL mid-land, then the time from
+//! lands) at two rungs about ten times apart, a server killed with
+//! SIGKILL mid-land, then the time from
 //! the restart until readiness answers `SERVING` and the first read
 //! succeeds. A measurement, not a gate: plain `cargo test` skips it,
 //! and the `recovery time` CI job runs it with `--ignored --nocapture`
@@ -47,24 +48,40 @@ const READINESS_SERVICE: &str = "scion.v1.Scion";
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "a measurement for the recovery-time job: run with --ignored --nocapture"]
 async fn a_restart_after_a_kill_recovers_in_a_stated_time() {
+    // Two stated sizes, the second about ten times the first: the
+    // number the docs quote at both ends of the ladder, the same
+    // machine, the same bound per size.
+    let sizes = [
+        (REPOS, CHANGESETS_PER_REPO),
+        (REPOS, CHANGESETS_PER_REPO * 10),
+    ];
+    for (repos, changesets_per_repo) in sizes {
+        measure_one_size(repos, changesets_per_repo).await;
+    }
+}
+
+/// One full measure at one stated size: the build, the pending lands,
+/// the storm, the kill, the restart, the time. Prints the size's line
+/// in the format the docs quote and holds it to the bound.
+async fn measure_one_size(repos: u8, changesets_per_repo: u8) {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir(&data).unwrap();
     let store = from_store(Store::open(&data).unwrap());
 
-    // The build, the restore bench's shape: REPOS repos of
-    // CHANGESETS_PER_REPO changesets each, one file per changeset, every
-    // chain deriving as it grows. Its size is what the recovery starts
-    // from, so the number the docs quote names what was recovered.
+    // The build, the restore bench's shape: repos of changesets each,
+    // one file per changeset, every chain deriving as it grows. Its
+    // size is what the recovery starts from, so the number the docs
+    // quote names what was recovered.
     let mut blob_bytes: u64 = 0;
     let build_started = Instant::now();
     let mut tips: Vec<ChangesetId> = Vec::new();
-    for repo in 0..REPOS {
+    for repo in 0..repos {
         let name = format!("repo-{repo:03}");
         let mut parent = None;
         let mut ref_version: Option<i64> = None;
         let mut tip = None;
-        for step in 0..CHANGESETS_PER_REPO {
+        for step in 0..changesets_per_repo {
             let bytes = vec![b'a' + (step % 26); FILE_BYTES];
             let blob = store.blobs().put(&bytes).unwrap();
             blob_bytes += bytes.len() as u64;
@@ -84,7 +101,7 @@ async fn a_restart_after_a_kill_recovers_in_a_stated_time() {
         }
         tips.push(tip.expect("the repo has changesets"));
     }
-    let changesets = u64::from(REPOS) * u64::from(CHANGESETS_PER_REPO);
+    let changesets = u64::from(repos) * u64::from(changesets_per_repo);
     let build = build_started.elapsed();
 
     // The pending lands, built in: one per the first PENDING_LANDS
@@ -156,7 +173,7 @@ async fn a_restart_after_a_kill_recovers_in_a_stated_time() {
     let _ = recovered.0.wait();
 
     println!(
-        "recovery: {:.1} s (build {:.1} s) for {REPOS} repos, {changesets} changesets, \
+        "recovery: {:.1} s (build {:.1} s) for {repos} repos, {changesets} changesets, \
          {} MiB blob bytes, {PENDING_LANDS} pending lands built in, \
          {pending_after_crash} pending left by the crash",
         recovery.as_secs_f64(),
