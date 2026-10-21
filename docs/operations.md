@@ -618,6 +618,48 @@ in the scrape.
 - A cache is stateless except its snapshots: its whole state is memory plus
   the snapshot files, so restart it whenever you like.
 
+### Disk full
+
+The disk the data directory sits on has two alerts: `DiskNearlyFull` at
+10 GiB free and `DiskFull` at 1 GiB free. At either one:
+
+1. Run the gc routine (above): first a `--dry-run` to see what it would
+   collect, then a real run. The collector is safe beside a live server,
+   and on a store whose repos grew by accident (a forgotten import, a
+   test repo nobody removed), this alone frees the space.
+2. Run `fsck` when the run ends. A full disk can leave a write that
+   failed mid-way; fsck tells you whether anything was damaged (there
+   is no repair: restore from a backup, section 3, when it reports one).
+3. If gc collected too little, the data is bigger than the disk: grow
+   the volume, or move the data directory to a bigger one (a stop, a
+   copy per section 3, a start at the new path). Growing a mounted
+   volume needs no restart: the next write sees the new size.
+
+Nothing in the store needs repair because the disk filled: a write that
+failed out-of-space left no torn file, and when space is back, writes
+resume with no restart. A blob whose upload was refused must be uploaded
+again by the client; the server never kept half of it.
+
+Proof: crates/scion-server/tests/disk_full.rs::a_disk_full_runbook_gcs_then_writes_resume
+
+### A failing disk
+
+A disk that fails reads does not fail writes: a read whose file the disk
+cannot serve answers an internal error (the client retries into the same
+device, so do not loop), and the rest of the store keeps serving. On the
+first internal error from a read:
+
+1. Run `fsck` (it is read-only, so it can run beside the live server).
+   Exit 1 with the problem lines names the damage; the store has no
+   repair.
+2. If fsck reports damage, restore from a backup (section 3): a fresh
+   directory gets the metadata snapshot and the objects copy, fsck runs
+   on it, and the server starts at the new path. A read that failed and
+   later succeeds means the disk recovered, not that the damage was
+   never there: run fsck anyway.
+
+Proof: crates/scion-server/tests/storage.rs::a_failing_disk_runbook_fscks_restores_and_serves
+
 ## 6. What to watch
 
 **Metrics.** The server and the cache export Prometheus metrics at
