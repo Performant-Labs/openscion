@@ -68,6 +68,14 @@ jobs:
             value: ""
             name: sqlite
             slice: 2
+          - backend: the default backend
+            value: ""
+            name: sqlite
+            slice: 3
+          - backend: the default backend
+            value: ""
+            name: sqlite
+            slice: 4
           - backend: the postgres backend
             value: postgres
             name: postgres
@@ -76,6 +84,14 @@ jobs:
             value: postgres
             name: postgres
             slice: 2
+          - backend: the postgres backend
+            value: postgres
+            name: postgres
+            slice: 3
+          - backend: the postgres backend
+            value: postgres
+            name: postgres
+            slice: 4
     services:
       postgres:
         image: postgres:17.11
@@ -230,7 +246,7 @@ jobs:
           # fires a half hour before the wall, the step fails cleanly,
           # and its log uploads with the watcher's trend in it.
           nice -n 19 timeout -k 60 900 cargo nextest run --workspace \
-            --partition hash:${{ matrix.slice }}/2 \
+            --partition hash:${{ matrix.slice }}/4 \
             > measure.log 2>&1
           status=$?
           kill "$watcher"
@@ -305,8 +321,6 @@ jobs:
           pattern: coverage-*
           path: target/coverage
           merge-multiple: true
-      - name: the runner's disk and memory, before the build
-        run: df -h / | tail -1; free -m | awk 'NR==2'
       - name: lean build settings for the instrumented build
         run: |
           mkdir -p .cargo
