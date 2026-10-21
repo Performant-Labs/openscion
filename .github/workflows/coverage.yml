@@ -22,6 +22,12 @@ on:
   push:
     branches: [main]
   workflow_dispatch:
+    inputs:
+      phase:
+        description: 'build = instrumented build only (warms the cache); measure = the full gate'
+        required: false
+        default: measure
+        type: string
 
 # Every third-party action is pinned to the commit SHA its version tag
 # named, with the version in a comment, as ci.yml does.
@@ -159,9 +165,17 @@ jobs:
             /usr/local/share/boost /usr/lib/jvm 2>/dev/null || true
           sudo docker image prune -af >/dev/null 2>&1 || true
           df -h / | tail -1
-      - name: clean the coverage workspace
-        run: cargo llvm-cov clean --workspace
+      - name: stale profiles go, the cached build stays
+        run: rm -f target/coverage/*.profraw target/coverage/*.profdata target/coverage/*-profraw-list
+      - name: build only, this run warms the cache
+        if: inputs.phase == 'build'
+        run: |
+          set -o pipefail
+          nice -n 19 cargo llvm-cov --no-run --workspace -q \
+            ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
+            | tee measure.log
       - name: measure
+        if: inputs.phase != 'build'
         run: |
           set -o pipefail
           # The watcher doubles as a guard: a runner whose disk fills
@@ -186,12 +200,14 @@ jobs:
       # set, and the report here runs without tests, so the summary is
       # the per-backend number for the PR body's table.
       - name: the measure's own report
+        if: inputs.phase != 'build'
         run: |
           set -o pipefail
           cargo llvm-cov report --summary-only \
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
             | tee target/coverage/backend-summary.txt
       - name: upload the measure's profile
+        if: inputs.phase != 'build'
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
         with:
           name: coverage-${{ matrix.name }}
@@ -216,6 +232,7 @@ jobs:
 
   gate:
     name: coverage, the gate
+    if: inputs.phase != 'build'
     needs: [measure]
     runs-on: ubuntu-24.04
     timeout-minutes: 60
