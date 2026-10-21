@@ -195,13 +195,15 @@ jobs:
               [ "$avail" -gt 3 ] || { echo 'the runner is out of disk'; df -h /; exit 2; }; done ) &
           watcher=$!
           # nextest isolates every test in its own process with its own
-          # timeout: eight measure runs lost the runner mid-suite with
+          # timeout: nine measure runs lost the runner mid-suite with
           # no log that survived, so the killer test names itself here
           # instead of eating the runner. The measure's output goes to
           # a file, not the step log: the agent buffers what it streams.
+          # The profile is a file, not CLI flags: the flags ride behind
+          # nextest's own parser, the profile does not.
+          mkdir -p .config
+          printf '[profile.default]\ntimeout = "300s"\nretries = 1\nslow-timeout = { period = "60s", terminate-after = 2 }\nfinal-status-level = "slow"\n' > .config/nextest.toml
           nice -n 19 cargo llvm-cov nextest --workspace --no-report \
-            --timeout 300s --retries 1 --final-status-level slow \
-            ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
             > measure.log 2>&1
           status=$?
           kill "$watcher"
