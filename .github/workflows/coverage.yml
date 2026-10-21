@@ -113,12 +113,16 @@ jobs:
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"}
         env:
           PROPTEST_CASES: "64"
+          CARGO_BUILD_JOBS: "2"
+          RUST_TEST_THREADS: "2"
       - name: measure, the postgres backend
         run: |
           cargo llvm-cov --no-report --workspace \
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"}
         env:
           PROPTEST_CASES: "64"
+          CARGO_BUILD_JOBS: "2"
+          RUST_TEST_THREADS: "2"
           SCION_TEST_BACKEND: postgres
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
       - name: the merged report, and the gate
