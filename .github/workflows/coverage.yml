@@ -213,13 +213,18 @@ jobs:
           watcher=$!
           # nextest isolates every test in its own process with its own
           # timeout, and the hash partition takes a slice of the suite:
-          # the full instrumented suite is more than one runner's
-          # agent survives, so no runner carries more than a slice.
-          # The measure's output goes to a file, not the step log: the
-          # agent buffers what it streams.
+          # no runner carries more than a slice. The README's
+          # external-tests recipe again — show-env exports the same
+          # flags the build phase built with, plain cargo nextest runs
+          # the tests against those binaries, so the measure never
+          # recompiles what the build phase cached. The measure's
+          # output goes to a file, not the step log: the agent
+          # buffers what it streams.
           mkdir -p .config
           printf '[profile.default]\ntimeout = "300s"\nretries = 1\nslow-timeout = { period = "60s", terminate-after = 2 }\n' > .config/nextest.toml
-          nice -n 19 cargo llvm-cov nextest --workspace --no-report \
+          # shellcheck disable=SC1090
+          source <(cargo llvm-cov show-env --sh)
+          nice -n 19 cargo nextest run --workspace \
             --partition hash:${{ matrix.slice }}/2 \
             > measure.log 2>&1
           status=$?
