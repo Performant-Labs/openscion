@@ -46,6 +46,13 @@ LANDS=${LANDS:-1000}
 # readers check out beside them for READ_SECONDS.
 READ_SECONDS=${READ_SECONDS:-90}
 CELL_WARM_SECONDS=${CELL_WARM_SECONDS:-60}
+# The closed-loop throughput pass: after the paced repetitions, this
+# cell's own writer count lands as fast as it can for a fixed window,
+# with the readers still up. The window excludes a warm-up (connects
+# and first writes); the rate is the server's Land counter over what
+# is left.
+TP_SECONDS=${TP_SECONDS:-65}
+TP_WARM_SECONDS=${TP_WARM_SECONDS:-5}
 CAPACITY_MACHINE=${CAPACITY_MACHINE:-unknown runner}
 RUN_URL=${RUN_URL:-}
 
@@ -94,8 +101,16 @@ fi
 echo "cell_start,reps,landed" > /dev/null
 
 # The summary's numbers live in one CSV row per repetition:
-# backend,writers,readers,rep,lands_per_min,land_p99_ms,checkout_p50_ms,
-# checkout_p99_ms,reader_failures,rss_end_kib,store_growth_kib_per_1k
+# backend,writers,readers,land_p99_ms,checkout_p50_ms,
+# checkout_p99_ms,reader_timeouts,errors,rss_end_kib,
+# store_growth_kib_per_1k,tp_lands_per_min,tp_land_p99_ms
+
+# land_counter: the server's Land RPC counter, the one number that
+# counts lands the way the server saw them, in flight or lost.
+land_counter() {
+  curl -fsS "http://127.0.0.1:$SERVER_METRICS_PORT/metrics" 2> /dev/null |
+    awk '/^scion_requests_total\{.*rpc="Scion\/Land"/ { s += $NF } END { print s + 0 }'
+}
 
 for backend in sqlite postgres; do
   if [ "$backend" = postgres ] && [ -z "${SCION_PG_URL:-}" ]; then
@@ -148,7 +163,8 @@ for backend in sqlite postgres; do
           n=$((n + 1))
           # Every attempt logs its own start and end, so the run can
           # tell an attempt that outlived the servers (teardown) from
-          # one that hung while the servers were up.
+          # one that hung while the servers were up. The r loops share
+          # the log and the times file, so the counts are the cell's.
           echo "attempt $n start $(date -u +%T.%3N)" >> "$WORK/reads-$backend-w$w-r$r.log"
           t0=$(date +%s%N)
           # Each attempt reads into a destination of its own: a killed
@@ -173,12 +189,20 @@ for backend in sqlite postgres; do
           rm -rf "$dest"
         done
       }
-      readers & echo $! > "$WORK/capacity-readers.pid"
+      # r reader loops, none for r=0: the cell's reader axis is real
+      # concurrency, not a label. The loops share the log and the
+      # times file, so the row's counts and percentiles stay the
+      # cell's own.
+      : > "$WORK/capacity-readers.pids"
+      if [ "$r" -gt 0 ]; then
+        for _ in $(seq 1 "$r"); do
+          readers & echo $! >> "$WORK/capacity-readers.pids"
+        done
+      fi
       # The server's Land counter at the cell's start: lands served is
       # the counter's growth over the cell, so a cell whose bench dies
       # still reports what its writers got through.
-      lands_before=$(curl -fsS "http://127.0.0.1:$SERVER_METRICS_PORT/metrics" 2> /dev/null |
-        awk '/^scion_requests_total\{.*rpc="Scion\/Land"/ { s += $NF } END { print s + 0 }')
+      lands_before=$(land_counter)
       rep=1
       bench_fail=0
       while [ "$rep" -le "$REPS" ]; do
@@ -200,15 +224,45 @@ for backend in sqlite postgres; do
         done
         rep=$((rep + 1))
       done
+      # The paced repetitions' growth ends here: the throughput pass
+      # lands too, and its lands are not this column's denominator.
+      store_end=$(du -sk "$WORK/server" | cut -f1)
+      # The closed-loop throughput pass: this cell's own writer count
+      # lands as fast as it can for a fixed window, with the readers
+      # still up, so the rate is the rate under the cell's own read
+      # load. The rate's source is the server's Land counter over the
+      # window after the warm-up; the bench stops itself at the window
+      # and its report carries the per-land percentiles of the lands
+      # that started after the warm-up. The rate stands in the row next
+      # to the error counts whatever they are: at the envelope's edge
+      # the number is the point, and the edge reads the error columns.
+      "$TIMEOUT" $((TP_SECONDS + 120)) "$BIN/scn" --server "$SERVER" bench \
+        --agents "$w" --lands 1000000 --seconds "$TP_SECONDS" \
+        --warmup-seconds "$TP_WARM_SECONDS" --json \
+        > "$WORK/tp-$backend-w$w-r$r.json" 2> "$WORK/tp-$backend-w$w-r$r.log" &
+      tp_pid=$!
+      sleep "$TP_WARM_SECONDS"
+      lands_tp_warm=$(land_counter)
+      sleep "$((TP_SECONDS - TP_WARM_SECONDS))"
+      lands_tp_end=$(land_counter)
+      wait "$tp_pid" || note "the throughput bench needed its safety net in cell $backend w$w r$r"
+      window=$((TP_SECONDS - TP_WARM_SECONDS))
+      tp_lands_min=$(( (lands_tp_end - lands_tp_warm) * 60 / window ))
+      if [ -s "$WORK/tp-$backend-w$w-r$r.json" ]; then
+        tp_p99=$(jq -r '.land_ms.p99' "$WORK/tp-$backend-w$w-r$r.json")
+      else
+        # No bench report, no window percentiles; the rate above still
+        # stands, from the counter.
+        tp_p99="-"
+      fi
       note "tearing down cell $backend w$w r$r at $(date -u +%T.%3N)"
-      kill "$(cat "$WORK/capacity-readers.pid")" 2> /dev/null || true
-      wait "$(cat "$WORK/capacity-readers.pid")" 2> /dev/null || true
+      while read -r pid; do kill "$pid" 2> /dev/null || true; done < "$WORK/capacity-readers.pids"
+      while read -r pid; do wait "$pid" 2> /dev/null || true; done < "$WORK/capacity-readers.pids"
       rss_end=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')
       # Lands served, from the server's counter, while it still serves:
       # the counter counts what the writers got through, whether bench
       # finished or not.
-      lands_end=$(curl -fsS "http://127.0.0.1:$SERVER_METRICS_PORT/metrics" 2> /dev/null |
-        awk '/^scion_requests_total\{.*rpc="Scion\/Land"/ { s += $NF } END { print s + 0 }')
+      lands_end=$(land_counter)
       stop_scion
       note "cell $backend w$w r$r: $((lands_end - lands_before)) lands landed"
       reader_failures=0
@@ -232,9 +286,8 @@ for backend in sqlite postgres; do
       c99=$(pct "$WORK/read-times.csv" 0.99)
       [ -n "$c50" ] || c50="-"
       [ -n "$c99" ] || c99="-"
-      store_end=$(du -sk "$WORK/server" | cut -f1)
       growth=$(( (store_end - STORE_START) * 1000 / (LANDS * REPS) ))
-      echo "$backend,$w,$r,$land_p99,$c50,$c99,$reader_timeouts,$errors,$rss_end,$growth" \
+      echo "$backend,$w,$r,$land_p99,$c50,$c99,$reader_timeouts,$errors,$rss_end,$growth,$tp_lands_min,$tp_p99" \
         >> "$WORK/capacity.csv"
       if [ "$((errors + reader_timeouts))" -gt 0 ]; then
         note "cell $backend w$w r$r: $reader_timeouts timeouts, $errors errors (readers $reader_failures, bench $bench_fail) - recorded, next cell"
@@ -275,13 +328,16 @@ cp "$WORK"/bench-*.json "${RUNNER_TEMP:-/tmp}/capacity-artifacts/" 2> /dev/null 
 row() { printf '%-46s %s\n' "$1" "$2"; }
 echo "capacity envelope: machine $CAPACITY_MACHINE, commit $HEAD_HEX"
 echo
-echo "| backend | writers | readers | land p99 ms | checkout p50 ms | checkout p99 ms | timeouts | errors | server RSS MiB | store KiB per 1k lands |"
-echo "|---|---|---|---|---|---|---|---|---|---|"
-while IFS=, read -r backend w r land_p99 c50 c99 timeouts errors rss growth; do
-  echo "| $backend | $w | $r | $land_p99 | $c50 | $c99 | $timeouts | $errors | $((rss / 1024)) | $growth |"
+echo "throughput: writers = the cell's writer count, landing as fast as it can for $((TP_SECONDS - TP_WARM_SECONDS)) s after a $TP_WARM_SECONDS s warm-up, one file of about 50 B per land; lands/min is the server's Land counter over the window, next to the errors whatever they are."
+echo
+echo "| backend | writers | readers | land p99 ms | checkout p50 ms | checkout p99 ms | timeouts | errors | server RSS MiB | store KiB per 1k lands | lands/min | tp land p99 ms |"
+echo "|---|---|---|---|---|---|---|---|---|---|---|---|"
+while IFS=, read -r backend w r land_p99 c50 c99 timeouts errors rss growth tp_lands_min tp_p99; do
+  echo "| $backend | $w | $r | $land_p99 | $c50 | $c99 | $timeouts | $errors | $((rss / 1024)) | $growth | $tp_lands_min | $tp_p99 |"
 done < "$WORK/capacity.csv"
 echo
 row "commit" "$HEAD_HEX"
 [ -n "$RUN_URL" ] && row "run" "$RUN_URL"
 row "runner" "$CAPACITY_MACHINE"
+row "throughput window" "$((TP_SECONDS - TP_WARM_SECONDS)) s after a $TP_WARM_SECONDS s warm-up; writers = the cell's writer count; one file of about 50 B per land; the rate is the server's Land counter"
 stop_scion 2> /dev/null || true

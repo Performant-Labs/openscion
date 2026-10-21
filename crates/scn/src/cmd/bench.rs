@@ -28,6 +28,18 @@ pub struct BenchArgs {
     /// base it started from (shared).
     #[arg(long, value_enum, default_value_t = Base::Shared)]
     base: Base,
+    /// Stop the agents at this many seconds instead of waiting for the
+    /// whole land count: a closed-loop pass whose rate a fixed window
+    /// bounds, not a batch. The agents stop themselves at the deadline,
+    /// and the report still comes, so a window carries its own
+    /// percentiles.
+    #[arg(long)]
+    seconds: Option<u64>,
+    /// Lands whose start falls inside this warm-up leave the reported
+    /// percentiles out (connects and first writes). The window's rate
+    /// belongs to the caller, which reads the server's counter.
+    #[arg(long, default_value_t = 0)]
+    warmup_seconds: u64,
 }
 
 /// How each agent picks its base.
@@ -48,6 +60,9 @@ struct Stats {
     land: Vec<Duration>,
     /// Upload + create + land.
     total: Vec<Duration>,
+    /// When the land started, as an offset from the run's start: the
+    /// warm-up filter reads it, not the order of the lands.
+    at: Vec<Duration>,
 }
 
 /// Runs the benchmark and prints throughput and latency.
@@ -56,6 +71,7 @@ pub async fn bench(ctx: &Ctx, args: BenchArgs) -> Result<()> {
         agents,
         lands,
         base,
+        ..
     } = args;
     ensure!(
         agents > 0 && lands > 0,
@@ -64,10 +80,11 @@ pub async fn bench(ctx: &Ctx, args: BenchArgs) -> Result<()> {
     let start = ctx.clone().resolve("main").await?;
     let per_agent = lands.div_ceil(agents);
     let started = Instant::now();
+    let deadline = args.seconds.map(|s| started + Duration::from_secs(s));
     let mut tasks = JoinSet::new();
     for agent in 0..agents {
         let count = per_agent.min(lands.saturating_sub(agent * per_agent));
-        tasks.spawn(run_agent(ctx.clone(), agent, count, start, base));
+        tasks.spawn(run_agent(ctx.clone(), agent, count, start, base, deadline, started));
     }
     let mut stats = Stats::default();
     while let Some(agent) = tasks.join_next().await {
@@ -77,10 +94,32 @@ pub async fn bench(ctx: &Ctx, args: BenchArgs) -> Result<()> {
         stats.rejected += agent.rejected;
         stats.land.extend(agent.land);
         stats.total.extend(agent.total);
+        stats.at.extend(agent.at);
     }
     let elapsed = started.elapsed();
     verify(ctx.clone(), start, &stats.landed).await?;
-    report(ctx.json, agents, &mut stats, elapsed)?;
+    // The window's lands: those that started at or after the warm-up.
+    // A count-bound run has no warm-up, so its window is every land.
+    let warm = Duration::from_secs(args.warmup_seconds);
+    let mut window_land: Vec<Duration> = stats
+        .land
+        .iter()
+        .zip(&stats.at)
+        .filter(|(_, at)| **at >= warm)
+        .map(|(d, _)| *d)
+        .collect();
+    if window_land.is_empty() {
+        window_land.clone_from(&stats.land);
+    }
+    report(
+        ctx.json,
+        agents,
+        &mut stats,
+        elapsed,
+        &window_land,
+        args.seconds,
+        args.warmup_seconds,
+    )?;
     Ok(())
 }
 
@@ -90,9 +129,17 @@ async fn run_agent(
     count: usize,
     start: ChangesetId,
     base: Base,
+    deadline: Option<Instant>,
+    started: Instant,
 ) -> Result<Stats> {
     let mut stats = Stats::default();
     for i in 0..count {
+        // A windowed run stops here: no new land starts past the
+        // deadline, and one in flight finishes, so the window's end is
+        // the last land the deadline let start.
+        if deadline.is_some_and(|d| Instant::now() >= d) {
+            break;
+        }
         let began = Instant::now();
         let parent = match base {
             Base::Shared => start,
@@ -137,6 +184,7 @@ async fn run_agent(
             .into_inner();
         stats.land.push(landing.elapsed());
         stats.total.push(began.elapsed());
+        stats.at.push(began.duration_since(started));
         match reply.state() {
             LandState::Landed => stats.landed.push(id_from(&reply.result_changeset_id)?),
             LandState::Conflict => stats.conflicts += 1,
@@ -213,10 +261,20 @@ fn percentiles_ms(sorted: &[Duration]) -> [f64; 3] {
     [at(0.50), at(0.99), at(1.0)]
 }
 
-fn report(json: bool, agents: usize, stats: &mut Stats, elapsed: Duration) -> Result<()> {
+fn report(
+    json: bool,
+    agents: usize,
+    stats: &mut Stats,
+    elapsed: Duration,
+    window_land: &[Duration],
+    seconds: Option<u64>,
+    warmup_seconds: u64,
+) -> Result<()> {
     stats.land.sort();
     stats.total.sort();
-    let [land_p50, land_p99, land_max] = percentiles_ms(&stats.land);
+    let mut window = window_land.to_vec();
+    window.sort();
+    let [land_p50, land_p99, land_max] = percentiles_ms(&window);
     let [total_p50, total_p99, _] = percentiles_ms(&stats.total);
     let landed = stats.landed.len();
     #[allow(clippy::cast_precision_loss)]
@@ -229,6 +287,9 @@ fn report(json: bool, agents: usize, stats: &mut Stats, elapsed: Duration) -> Re
             "rejected": stats.rejected,
             "seconds": elapsed.as_secs_f64(),
             "lands_per_second": rate,
+            "window_seconds": seconds,
+            "warmup_seconds": warmup_seconds,
+            "lands_in_window": window.len(),
             "land_ms": { "p50": land_p50, "p99": land_p99, "max": land_max },
             "end_to_end_ms": { "p50": total_p50, "p99": total_p99 },
             "verified_on_main": true,
@@ -236,10 +297,16 @@ fn report(json: bool, agents: usize, stats: &mut Stats, elapsed: Duration) -> Re
         outln!("{out}");
         return Ok(());
     }
-    outln!(
-        "{landed} lands by {agents} agents in {:.1} s: {rate:.0} lands/s",
-        elapsed.as_secs_f64()
-    );
+    match seconds {
+        Some(s) => outln!(
+            "{landed} lands by {agents} agents in {:.1} s (window {s} s, warm-up {warmup_seconds} s excluded from the percentiles): {rate:.0} lands/s",
+            elapsed.as_secs_f64()
+        ),
+        None => outln!(
+            "{landed} lands by {agents} agents in {:.1} s: {rate:.0} lands/s",
+            elapsed.as_secs_f64()
+        ),
+    }
     outln!("conflicts {}, rejected {}", stats.conflicts, stats.rejected);
     outln!("land RPC     p50 {land_p50:.1} ms  p99 {land_p99:.1} ms  max {land_max:.1} ms");
     outln!("end to end   p50 {total_p50:.1} ms  p99 {total_p99:.1} ms  (upload + create + land)");
