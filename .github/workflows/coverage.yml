@@ -78,8 +78,12 @@ jobs:
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
         with:
           # The instrumented build is one build: both matrix cells and
-          # the gate share it, and the first run to finish saves it.
+          # the gate share it, and the first run to finish saves it —
+          # even a failed one: the cold build is the stretch where the
+          # runner's agent has been lost, and a saved cache turns every
+          # later run into the warm six-minute measure.
           key: coverage-instrumented
+          cache-on-failure: true
       # cargo-llvm-cov, pinned by version and the release tarball's
       # sha256 (the same discipline the action pins follow), downloaded
       # with curl so no third-party action enters the supply chain.
@@ -133,12 +137,29 @@ jobs:
       # ci.yml's jobs.
       - name: the runner's disk and memory, before the build
         run: df -h / | tail -1; free -m | awk 'NR==2'
+      # The instrumented build is far larger than the plain one, and a
+      # runner whose disk fills loses its agent mid-measure — six runs
+      # in a row, always near the same minute. The image ships dozens
+      # of gigabytes of toolchains this job never touches; they go.
+      - name: free the runner's disk for the instrumented build
+        run: |
+          df -h / | tail -1
+          sudo rm -rf /usr/local/lib/android /usr/share/dotnet /opt/ghc \
+            /usr/local/.ghcup /opt/hostedtoolcache/CodeQL \
+            /usr/local/share/boost /usr/lib/jvm 2>/dev/null || true
+          sudo docker image prune -af >/dev/null 2>&1 || true
+          df -h / | tail -1
       - name: clean the coverage workspace
         run: cargo llvm-cov clean --workspace
       - name: measure
         run: |
           set -o pipefail
-          ( while sleep 30; do date -u +%T; df -h / | tail -1; free -m | awk 'NR==2'; du -sh target 2>/dev/null; done ) &
+          # The watcher doubles as a guard: a runner whose disk fills
+          # loses its agent mid-build, with every log — so the measure
+          # fails itself, loudly, while there is still disk to log it.
+          ( while sleep 30; do date -u +%T; df -h / | tail -1; free -m | awk 'NR==2'; du -sh target 2>/dev/null; \
+              avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9'); \
+              [ "$avail" -gt 3 ] || { echo 'the runner is out of disk'; df -h /; exit 2; }; done ) &
           watcher=$!
           nice -n 19 cargo llvm-cov --no-report --workspace \
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
@@ -169,6 +190,13 @@ jobs:
       - name: keep the profiles out of the cache
         if: always()
         run: rm -rf target/coverage
+      - name: the measure's log, even on failure
+        if: failure()
+        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        with:
+          name: measure-log-${{ matrix.name }}
+          path: measure.log
+          if-no-files-found: ignore
 
   gate:
     name: coverage, the gate
@@ -187,6 +215,7 @@ jobs:
         with:
           # Same instrumented build the measures saved.
           key: coverage-instrumented
+          cache-on-failure: true
       - run: |
           curl -fsSL -o /tmp/cargo-llvm-cov.tgz \
             https://github.com/taiki-e/cargo-llvm-cov/releases/download/v0.9.1/cargo-llvm-cov-x86_64-unknown-linux-gnu.tar.gz
