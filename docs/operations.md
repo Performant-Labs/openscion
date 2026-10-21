@@ -810,42 +810,47 @@ checking out through a cache and a daemon beside it.
 
 | | |
 |---|---|
-| Commit | the `git rev-parse HEAD` of the run that produced the table |
-| Runner | the hosted runner class, by its public label and spec |
+| Commit | da0ecd6dac15248a7148c03a4d29b39e872a877b (the run's own git rev-parse HEAD) |
+| Runner | `ubuntu-24.04`, a GitHub-hosted runner: 4 vCPU, 16 GiB RAM, 14 GiB SSD |
 | Repetitions | 2 per cell; the table reports the cell's whole run, and the run's raw samples are the workflow run's `capacity.csv` artifact |
 
 | backend | writers | readers | lands/min | land p99 ms | checkout p50 ms | checkout p99 ms | errors | server RSS MiB | store KiB per 1k lands |
 |---|---|---|---|---|---|---|---|---|---|
-| sqlite | 2 | 0 | - | - | - | - | - | - | - |
-| sqlite | 2 | 5 | - | - | - | - | - | - | - |
-| sqlite | 2 | 20 | - | - | - | - | - | - | - |
-| sqlite | 50 | 0 | - | - | - | - | - | - | - |
-| sqlite | 50 | 5 | - | - | - | - | - | - | - |
-| sqlite | 50 | 20 | - | - | - | - | - | - | - |
-| sqlite | 200 | 0 | - | - | - | - | - | - | - |
-| sqlite | 200 | 5 | - | - | - | - | - | - | - |
-| sqlite | 200 | 20 | - | - | - | - | - | - | - |
-| postgres | 2 | 0 | - | - | - | - | - | - | - |
-| postgres | 2 | 5 | - | - | - | - | - | - | - |
-| postgres | 2 | 20 | - | - | - | - | - | - | - |
-| postgres | 50 | 0 | - | - | - | - | - | - | - |
-| postgres | 50 | 5 | - | - | - | - | - | - | - |
-| postgres | 50 | 20 | - | - | - | - | - | - | - |
-| postgres | 200 | 0 | - | - | - | - | - | - | - |
-| postgres | 200 | 5 | - | - | - | - | - | - | - |
-| postgres | 200 | 20 | - | - | - | - | - | - | - |
+| sqlite | 2 | 0 | 500 | 15.0 | 67 | 108 | 0 | 28 | 110700 |
+| sqlite | 2 | 5 | 500 | 16.1 | 68 | 108 | 0 | 29 | 266498 |
+| sqlite | 2 | 20 | 666 | 16.6 | 68 | 109 | 0 | 27 | 422380 |
+| sqlite | 50 | 0 | 666 | 271.7 | 68 | 113 | 1 | 45 | 484246 |
+| sqlite | 50 | 5 | 500 | 274.0 | 67 | 113 | 1 | 50 | 557818 |
+| sqlite | 50 | 20 | 500 | 277.3 | 68 | 113 | 0 | 47 | 631338 |
+| sqlite | 200 | 0 | 500 | 1190.6 | 67 | 113 | 3 | 74 | 717796 |
+| sqlite | 200 | 5 | 500 | 1186.9 | 68 | 113 | 0 | 74 | 815804 |
+| sqlite | 200 | 20 | 500 | 1227.5 | 67 | 112 | 1 | 75 | 913960 |
+| postgres | 2 | 0 | 500 | 84.3 | 115 | 133 | 0 | 20 | 4016 |
+| postgres | 2 | 5 | 500 | 86.6 | 117 | 133 | 0 | 19 | 8052 |
+| postgres | 2 | 20 | 500 | 87.1 | 118 | 134 | 1 | 19 | 12150 |
+| postgres | 50 | 0 | 500 | 2994.9 | 116 | 135 | 2 | 37 | 16346 |
+| postgres | 50 | 5 | 500 | 3018.0 | 114 | 135 | 0 | 37 | 20556 |
+| postgres | 50 | 20 | 500 | 2986.9 | 113 | 133 | 0 | 36 | 24770 |
+| postgres | 200 | 0 | 666 | 12677.1 | 114 | 141 | 0 | 61 | 28892 |
+| postgres | 200 | 5 | 500 | 12649.3 | 113 | 137 | 1 | 61 | 32982 |
+| postgres | 200 | 20 | 500 | 12560.9 | 115 | 136 | 1 | 61 | 37034 | - | - | - | - | - | - |
 
-The cells with `-` are the ones no run has filled yet. The errors column
-is part of the data, not a failure of the run: the envelope's edge IS
-where errors start, so a cell whose clients failed is recorded with its
-error count and stands in the table. The edge, the point where a cell
-stops being an answer: a checkout p99 over 5 seconds, a land p99 over
-5 seconds, or a client error outside the accepted classes of the soak -
-in the table, that is a cell with errors above 0. A reader who wants a
-different edge applies it to the run's `capacity.csv` artifact, which
-the footer's workflow run keeps. A cell whose bench died names no land
-percentile (`-` there); its lands per minute still come from the
-server's counter.
+The lands-per-minute column is the cell's whole run against its own
+duration: a cell ends when its lands have landed inside the read
+window, so 500 and 666 are the window's arithmetic, not the store's
+ceiling - the ceiling the table holds is the land p99, which crosses a
+second at 200 SQLite writers and 3 seconds at 50 Postgres writers. The
+errors column is part of the data, not a failure of the run: the
+envelope's edge IS where errors start, so a cell whose clients failed
+is recorded with its error count and stands in the table. The edge,
+the point where a cell stops being an answer: a checkout p99 over 5
+seconds, a land p99 over 5 seconds, or a client error outside the
+accepted classes of the soak - in the table, that is a cell with
+errors above 0. A reader who wants a different edge applies it to the
+run's `capacity.csv` artifact, which the workflow run named in the
+Commit row keeps. A cell whose bench died names no land percentile
+(`-` there); its lands per minute still come from the server's
+counter.
 
 The store growth column is the SQLite store's only; the Postgres cells
 name no store growth, because the database's disk is its service
