@@ -62,7 +62,7 @@ async fn every_reply_survives_a_kill_of_the_server() {
     let mut checked = Checked::default();
     let (mut left, mut cut) = (0, 0);
     for round in 0..kills {
-        let server = Server::start(&data, &log);
+        let server = Server::start_on("One server", &data, &log);
         check(&server.url, &data, &mut ledger, &mut checked, &mut rng).await;
         let signals = Arc::new(Signals::default());
         let clients: Vec<_> = (0..CLIENTS)
@@ -102,7 +102,7 @@ async fn every_reply_survives_a_kill_of_the_server() {
         // restart inside `check`; what a kill left is a folder per process.
         left += fs::read_dir(data.join("tmp")).unwrap().count();
     }
-    let server = Server::start(&data, &log);
+    let server = Server::start_on("One server", &data, &log);
     check(&server.url, &data, &mut ledger, &mut checked, &mut rng).await;
 
     println!(
