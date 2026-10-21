@@ -140,7 +140,7 @@ fn dump_the_holders(schema: &str) {
             for row in rows {
                 eprintln!(
                     "pid={} name={} port={} start={} state={} wait={}/{} q={}",
-                    row.get::<_, i64>(0),
+                    row.get::<_, i32>(0),
                     row.get::<_, String>(1),
                     row.get::<_, String>(2),
                     row.get::<_, String>(3),
@@ -271,22 +271,35 @@ impl PgServer {
         let mut client = raw(&pg_url());
         let start = Instant::now();
         loop {
-            let sessions = client
-                .query_opt(
-                    "SELECT 1 FROM pg_stat_activity \
-                     WHERE (application_name = $1 OR application_name = $2) \
-                       AND pid <> pg_backend_pid()",
-                    &[&self.name, &self.schema],
+            // The gate the next start needs is the one-server key, and
+            // a dead process cannot take a new one. A session of the
+            // dead server holds the key until Postgres cleans it away,
+            // renamed or not, so the wait polls the key's own row and
+            // returns when the key is free. (The schema's NAME cannot
+            // be the wait's test here: the harness store of this test
+            // keeps a pool of its own sessions named the schema alive
+            // for the whole run, and they hold no one-server key.)
+            const SERVER_LOCK: i64 = 0x5343_494F_4E53_5256;
+            let held = !client
+                .query(
+                    "SELECT 1 FROM pg_locks \
+                     WHERE locktype = 'advisory' \
+                       AND classid = (($1::bigint >> 32) & 4294967295)::bigint \
+                       AND objid = ($1::bigint & 4294967295)::bigint",
+                    &[&SERVER_LOCK],
                 )
-                .expect("the session query answers")
-                .is_some();
-            if !sessions {
+                .expect("the lock query answers")
+                .is_empty();
+            if !held {
                 return;
             }
             assert!(
                 start.elapsed() < Duration::from_secs(10),
-                "the dead server's sessions never ended"
+                "the dead server's one-server key never came free"
             );
+            if start.elapsed() > Duration::from_secs(5) {
+                dump_the_holders(&self.schema);
+            }
             std::thread::sleep(Duration::from_millis(50));
         }
     }
@@ -748,14 +761,60 @@ fn a_kill_during_a_schema_upgrade_leaves_one_whole_version() {
 /// file, and a put the kill cut retries to the same id. The kill
 /// timings walk a whole put's duration, so the runs see both endings:
 /// a put cut in flight, and a put done before the kill.
+const PUT_BYTES: usize = 4 << 20;
+const PUTS: usize = 3;
+
+/// Every blob a client's put was answered for reads back whole.
+fn check_replied(store: &Backend, replied: &[(BlobId, Vec<u8>)]) {
+    for (id, bytes) in replied {
+        assert_eq!(
+            store.blobs().get(*id).expect("a replied blob reads"),
+            *bytes,
+            "a put whose reply reached the client lost its bytes"
+        );
+    }
+}
+
+/// Every row of the database names a blob whose file is intact.
+fn check_rows(store: &Backend, repo: scion_server::test_support::meta::RepoId) {
+    let rows = store
+        .read(|c| c.repo_blob_ids(repo))
+        .expect("the rows read");
+    for id in &rows {
+        let id = BlobId::try_from(id.as_slice()).expect("a row names an id");
+        assert_eq!(
+            store.blobs().verify(id).expect("the file reads"),
+            scion_server::test_support::store::BlobStatus::Valid,
+            "a row names a blob whose file is missing or torn"
+        );
+    }
+}
+
+/// A cut put's retry lands on the same id, content-addressed, and its
+/// file is intact.
+fn retry_cut(url: &str, store: &Backend, cut: &[Vec<u8>]) {
+    for bytes in cut {
+        let id = put(url, bytes).expect("the retry lands");
+        assert_eq!(
+            store.blobs().get(id).expect("the retried blob reads"),
+            *bytes,
+            "the retry of a cut put served other bytes"
+        );
+        assert_eq!(
+            store.blobs().verify(id).expect("the file reads"),
+            scion_server::test_support::store::BlobStatus::Valid,
+            "the retried put's file is torn"
+        );
+    }
+}
+
 #[test]
 fn a_kill_during_a_put_leaves_the_rows_and_the_files_agreed() {
     if !is_pg() {
         println!("skipping: Postgres only");
         return;
     }
-    const PUT_BYTES: usize = 4 << 20;
-    const PUTS: usize = 3;
+    let _one = one_server();
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     let log = dir.path().join("server.log");
@@ -768,7 +827,9 @@ fn a_kill_during_a_put_leaves_the_rows_and_the_files_agreed() {
     // One whole wide put, measured: its eighth sets the kill step, so
     // the placement does not depend on the machine.
     let mut server = PgServer::spawn(&data, &schema, &log);
-    let warm = (0..PUT_BYTES).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    let warm: Vec<u8> = (0..PUT_BYTES)
+        .map(|i| u8::try_from(i % 251).expect("under 251"))
+        .collect();
     let started = Instant::now();
     put(&server.url, &warm).expect("the warm put lands");
     let step = started.elapsed() / 8;
@@ -791,7 +852,7 @@ fn a_kill_during_a_put_leaves_the_rows_and_the_files_agreed() {
                 let mut bytes = format!("put kill {k} client {c}\n").into_bytes();
                 bytes.resize(PUT_BYTES, 0);
                 for (i, b) in bytes.iter_mut().enumerate() {
-                    *b = (i % 241) as u8;
+                    *b = u8::try_from(i % 241).expect("under 241");
                 }
                 let sent = bytes.clone();
                 std::thread::spawn(move || (sent, put(&url, &bytes)))
@@ -823,37 +884,9 @@ fn a_kill_during_a_put_leaves_the_rows_and_the_files_agreed() {
         let store = Backend::open_test(&data).expect("the store opens");
         let repo = store.read(|c| c.repo_id(REPO)).expect("the repo is there");
         replied.extend(round);
-        for (id, bytes) in &replied {
-            assert_eq!(
-                store.blobs().get(*id).expect("a replied blob reads"),
-                *bytes,
-                "a put whose reply reached the client lost its bytes"
-            );
-        }
-        let rows = store
-            .read(|c| c.repo_blob_ids(repo))
-            .expect("the rows read");
-        for id in &rows {
-            let id = BlobId::try_from(id.as_slice()).expect("a row names an id");
-            assert_eq!(
-                store.blobs().verify(id).expect("the file reads"),
-                scion_server::test_support::store::BlobStatus::Valid,
-                "a row names a blob whose file is missing or torn"
-            );
-        }
-        for bytes in &cut {
-            let id = put(&server.url, bytes).expect("the retry lands");
-            assert_eq!(
-                store.blobs().get(id).expect("the retried blob reads"),
-                *bytes,
-                "the retry of a cut put served other bytes"
-            );
-            assert_eq!(
-                store.blobs().verify(id).expect("the file reads"),
-                scion_server::test_support::store::BlobStatus::Valid,
-                "the retried put's file is torn"
-            );
-        }
+        check_replied(&store, &replied);
+        check_rows(&store, repo);
+        retry_cut(&server.url, &store, &cut);
         server.kill_and_wait();
         if saw_cut && saw_done {
             break;
