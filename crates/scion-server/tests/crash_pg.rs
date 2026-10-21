@@ -18,11 +18,11 @@ use std::process::{Child, Command, Stdio};
 use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
-use scion_core::{Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
+use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
 use scion_proto::runtime::auth::Bearer;
 use scion_proto::v1::{
-    LandRequest, LandResponse, LandState, ResolveRefRequest, objects_client::ObjectsClient,
-    scion_client::ScionClient,
+    LandRequest, LandResponse, LandState, PutBlobRequest, ResolveRefRequest,
+    objects_client::ObjectsClient, scion_client::ScionClient,
 };
 use scion_server::Backend;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
@@ -353,6 +353,29 @@ fn land(url: &str, changeset: &[u8], key: &str) -> Result<LandResponse, Status> 
             })
             .await
             .map(tonic::Response::into_inner)
+    })
+}
+
+/// `Scion.PutBlob` as one streaming call on a fresh connection: the
+/// whole file goes out, and the reply names its id. A kill mid-call
+/// cuts the stream, and the caller sees the error, not a reply.
+fn put(url: &str, data: &[u8]) -> Result<BlobId, Status> {
+    tokio::runtime::Runtime::new().unwrap().block_on(async {
+        let channel = channel(url).await;
+        let bearer = Bearer::new(TOKEN).unwrap();
+        let mut scion = ScionClient::with_interceptor(channel, bearer);
+        let parts: Vec<PutBlobRequest> = data
+            .chunks(scion_proto::CHUNK_BYTES)
+            .enumerate()
+            .map(|(i, part)| PutBlobRequest {
+                repo: if i == 0 { REPO.into() } else { String::new() },
+                data: part.to_vec(),
+            })
+            .collect();
+        scion
+            .put_blob(tokio_stream::iter(parts))
+            .await
+            .map(|r| BlobId::try_from(r.into_inner().blob_id.as_slice()).expect("a blob id"))
     })
 }
 
@@ -717,5 +740,129 @@ fn a_kill_during_a_schema_upgrade_leaves_one_whole_version() {
         during > 0,
         "no kill came during the upgrade: {during} of {total} kills \
          landed before the log said serving"
+    );
+}
+
+/// A kill during a wide put: every put that got a reply names a blob
+/// the restart serves whole, every row of the database names an intact
+/// file, and a put the kill cut retries to the same id. The kill
+/// timings walk a whole put's duration, so the runs see both endings:
+/// a put cut in flight, and a put done before the kill.
+#[test]
+fn a_kill_during_a_put_leaves_the_rows_and_the_files_agreed() {
+    if !is_pg() {
+        println!("skipping: Postgres only");
+        return;
+    }
+    const PUT_BYTES: usize = 4 << 20;
+    const PUTS: usize = 3;
+    let dir = tempfile::tempdir().unwrap();
+    let data = dir.path().join("data");
+    let log = dir.path().join("server.log");
+    fs::create_dir_all(&data).unwrap();
+    let schema = Backend::test_schema(&data).expect("the test names a schema");
+    drop_schema(&schema);
+    create_schema(&schema);
+    seed_repo(&data);
+
+    // One whole wide put, measured: its eighth sets the kill step, so
+    // the placement does not depend on the machine.
+    let mut server = PgServer::spawn(&data, &schema, &log);
+    let warm = (0..PUT_BYTES).map(|i| (i % 251) as u8).collect::<Vec<_>>();
+    let started = Instant::now();
+    put(&server.url, &warm).expect("the warm put lands");
+    let step = started.elapsed() / 8;
+    server.kill_and_wait();
+
+    // The ledger every rep must keep true: a blob whose reply reached a
+    // client is durable across every later kill, and every row of the
+    // database names an intact file.
+    let mut replied: Vec<(BlobId, Vec<u8>)> = Vec::new();
+    let (mut saw_cut, mut saw_done) = (false, false);
+    let (mut cuts, mut total) = (0usize, 0usize);
+    for k in 0..12usize {
+        let factor = k % 9 + 1;
+        let mut server = PgServer::spawn(&data, &schema, &log);
+        // Distinct blobs per client: the nonce makes every put new, so
+        // the file write and the row commit both run.
+        let handles: Vec<_> = (0..PUTS)
+            .map(|c| {
+                let url = server.url.clone();
+                let mut bytes = format!("put kill {k} client {c}\n").into_bytes();
+                bytes.resize(PUT_BYTES, 0);
+                for (i, b) in bytes.iter_mut().enumerate() {
+                    *b = (i % 241) as u8;
+                }
+                let sent = bytes.clone();
+                std::thread::spawn(move || (sent, put(&url, &bytes)))
+            })
+            .collect();
+        std::thread::sleep(step * u32::try_from(factor).unwrap());
+        server.kill_and_wait();
+        let mut round: Vec<(BlobId, Vec<u8>)> = Vec::new();
+        let mut cut: Vec<Vec<u8>> = Vec::new();
+        for handle in handles {
+            let (bytes, out) = handle.join().unwrap();
+            match out {
+                Ok(id) => round.push((id, bytes)),
+                Err(_) => cut.push(bytes),
+            }
+        }
+        total += 1;
+        cuts += cut.len();
+        if !cut.is_empty() {
+            saw_cut = true;
+        }
+        if !round.is_empty() {
+            saw_done = true;
+        }
+        // The restart answers for everything: the replied blobs read
+        // back whole, the rows of the database name intact files, and a
+        // cut put's retry lands on the same id (content-addressed).
+        let mut server = PgServer::spawn(&data, &schema, &log);
+        let store = Backend::open_test(&data).expect("the store opens");
+        let repo = store.read(|c| c.repo_id(REPO)).expect("the repo is there");
+        replied.extend(round);
+        for (id, bytes) in &replied {
+            assert_eq!(
+                store.blobs().get(*id).expect("a replied blob reads"),
+                *bytes,
+                "a put whose reply reached the client lost its bytes"
+            );
+        }
+        let rows = store
+            .read(|c| c.repo_blob_ids(repo))
+            .expect("the rows read");
+        for id in &rows {
+            let id = BlobId::try_from(id.as_slice()).expect("a row names an id");
+            assert_eq!(
+                store.blobs().verify(id).expect("the file reads"),
+                scion_server::test_support::store::BlobStatus::Valid,
+                "a row names a blob whose file is missing or torn"
+            );
+        }
+        for bytes in &cut {
+            let id = put(&server.url, bytes).expect("the retry lands");
+            assert_eq!(
+                store.blobs().get(id).expect("the retried blob reads"),
+                *bytes,
+                "the retry of a cut put served other bytes"
+            );
+            assert_eq!(
+                store.blobs().verify(id).expect("the file reads"),
+                scion_server::test_support::store::BlobStatus::Valid,
+                "the retried put's file is torn"
+            );
+        }
+        server.kill_and_wait();
+        if saw_cut && saw_done {
+            break;
+        }
+    }
+    assert!(
+        saw_cut && saw_done,
+        "the kills never straddled a put (cut seen: {saw_cut}, done: {saw_done}) \
+         over {total} reps; {cuts} puts were cut, steps of an eighth of the \
+         measured put up to 9/8"
     );
 }
