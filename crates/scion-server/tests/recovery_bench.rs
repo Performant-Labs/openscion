@@ -52,8 +52,8 @@ async fn a_restart_after_a_kill_recovers_in_a_stated_time() {
     // number the docs quote at both ends of the ladder, the same
     // machine, the same bound per size.
     let sizes = [
-        (REPOS, CHANGESETS_PER_REPO),
-        (REPOS, CHANGESETS_PER_REPO * 10),
+        (REPOS, u16::from(CHANGESETS_PER_REPO)),
+        (REPOS, u16::from(CHANGESETS_PER_REPO) * 10),
     ];
     for (repos, changesets_per_repo) in sizes {
         measure_one_size(repos, changesets_per_repo).await;
@@ -63,7 +63,7 @@ async fn a_restart_after_a_kill_recovers_in_a_stated_time() {
 /// One full measure at one stated size: the build, the pending lands,
 /// the storm, the kill, the restart, the time. Prints the size's line
 /// in the format the docs quote and holds it to the bound.
-async fn measure_one_size(repos: u8, changesets_per_repo: u8) {
+async fn measure_one_size(repos: u8, changesets_per_repo: u16) {
     let dir = tempfile::tempdir().unwrap();
     let data = dir.path().join("data");
     std::fs::create_dir(&data).unwrap();
@@ -82,7 +82,7 @@ async fn measure_one_size(repos: u8, changesets_per_repo: u8) {
         let mut ref_version: Option<i64> = None;
         let mut tip = None;
         for step in 0..changesets_per_repo {
-            let bytes = vec![b'a' + (step % 26); FILE_BYTES];
+            let bytes = vec![b'a' + u8::try_from(step % 26).unwrap(); FILE_BYTES];
             let blob = store.blobs().put(&bytes).unwrap();
             blob_bytes += bytes.len() as u64;
             let cs = chain_changeset(&name, step, blob, parent);
@@ -382,7 +382,7 @@ fn pending_lands(data: &std::path::Path) -> u64 {
 
 /// The changeset `step` of a chain in `name`: one file backed by `blob`,
 /// on `parent`, with a message that names it.
-fn chain_changeset(name: &str, step: u8, blob: BlobId, parent: Option<ChangesetId>) -> Changeset {
+fn chain_changeset(name: &str, step: u16, blob: BlobId, parent: Option<ChangesetId>) -> Changeset {
     Changeset::new(
         parent.into_iter().collect(),
         IdentityTime::new(name.as_bytes().to_vec(), b"bench@x".to_vec(), 0, 0)
@@ -390,7 +390,7 @@ fn chain_changeset(name: &str, step: u8, blob: BlobId, parent: Option<ChangesetI
         None,
         format!("{name} step {step}").into_bytes(),
         [(
-            RepoPath::new(format!("f{step:03}").into_bytes()).unwrap(),
+            RepoPath::new(format!("f{step:05}").into_bytes()).unwrap(),
             Some(FileState::Regular {
                 content: blob,
                 executable: false,
