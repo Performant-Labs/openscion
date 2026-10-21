@@ -85,8 +85,11 @@ fetch_dataset
 
 HEAD_HEX=$(git rev-parse HEAD)
 
-# pct FILE P: the P-percentile of the numbers in FILE.
+# pct FILE P: the P-percentile of the numbers in FILE. A cell with no
+# readers (r=0) has no times file: the percentile columns then say so
+# with "-".
 pct() {
+  [ -f "$1" ] || return 0
   sort -n "$1" | awk -v p="$2" '{ a[NR] = $1 } END { if (NR) print a[int(NR * p + 0.5)] }'
 }
 
