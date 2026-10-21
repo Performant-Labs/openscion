@@ -815,25 +815,25 @@ checking out through a cache and a daemon beside it.
 | Repetitions | 2 per cell; the table reports the cell's whole run, and the run's raw samples are the workflow run's `capacity.csv` artifact |
 
 | backend | writers | readers | land p99 ms | checkout p50 ms | checkout p99 ms | timeouts | errors | server RSS MiB | store KiB per 1k lands |
-|---|---|---|---|---|---|---|---|---|---|---|
-| sqlite | 2 | 0 | - | - | - | - | - | - | - | - |
-| sqlite | 2 | 5 | - | - | - | - | - | - | - | - |
-| sqlite | 2 | 20 | - | - | - | - | - | - | - | - |
-| sqlite | 50 | 0 | - | - | - | - | - | - | - | - |
-| sqlite | 50 | 5 | - | - | - | - | - | - | - | - |
-| sqlite | 50 | 20 | - | - | - | - | - | - | - | - |
-| sqlite | 200 | 0 | - | - | - | - | - | - | - | - |
-| sqlite | 200 | 5 | - | - | - | - | - | - | - | - |
-| sqlite | 200 | 20 | - | - | - | - | - | - | - | - |
-| postgres | 2 | 0 | - | - | - | - | - | - | - | - |
-| postgres | 2 | 5 | - | - | - | - | - | - | - | - |
-| postgres | 2 | 20 | - | - | - | - | - | - | - | - |
-| postgres | 50 | 0 | - | - | - | - | - | - | - | - |
-| postgres | 50 | 5 | - | - | - | - | - | - | - | - |
-| postgres | 50 | 20 | - | - | - | - | - | - | - | - |
-| postgres | 200 | 0 | - | - | - | - | - | - | - | - |
-| postgres | 200 | 5 | - | - | - | - | - | - | - | - |
-| postgres | 200 | 20 | - | - | - | - | - | - | - | - |
+|---|---|---|---|---|---|---|---|---|---|
+| sqlite | 2 | 0 | - | - | - | - | - | - | - |
+| sqlite | 2 | 5 | - | - | - | - | - | - | - |
+| sqlite | 2 | 20 | - | - | - | - | - | - | - |
+| sqlite | 50 | 0 | - | - | - | - | - | - | - |
+| sqlite | 50 | 5 | - | - | - | - | - | - | - |
+| sqlite | 50 | 20 | - | - | - | - | - | - | - |
+| sqlite | 200 | 0 | - | - | - | - | - | - | - |
+| sqlite | 200 | 5 | - | - | - | - | - | - | - |
+| sqlite | 200 | 20 | - | - | - | - | - | - | - |
+| postgres | 2 | 0 | - | - | - | - | - | - | - |
+| postgres | 2 | 5 | - | - | - | - | - | - | - |
+| postgres | 2 | 20 | - | - | - | - | - | - | - |
+| postgres | 50 | 0 | - | - | - | - | - | - | - |
+| postgres | 50 | 5 | - | - | - | - | - | - | - |
+| postgres | 50 | 20 | - | - | - | - | - | - | - |
+| postgres | 200 | 0 | - | - | - | - | - | - | - |
+| postgres | 200 | 5 | - | - | - | - | - | - | - |
+| postgres | 200 | 20 | - | - | - | - | - | - | - |
 
 The cells with `-` are the ones no run has filled yet. Every cell
 runs on a store the cell's own import made: on SQLite a data directory

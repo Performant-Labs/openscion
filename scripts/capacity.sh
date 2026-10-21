@@ -146,6 +146,10 @@ for backend in sqlite postgres; do
         local n=0 rc t0 t1
         while [ "$(date +%s)" -lt "$END" ]; do
           n=$((n + 1))
+          # Every attempt logs its own start and end, so the run can
+          # tell an attempt that outlived the servers (teardown) from
+          # one that hung while the servers were up.
+          echo "attempt $n start $(date -u +%T.%3N)" >> "$WORK/reads-$backend-w$w-r$r.log"
           t0=$(date +%s%N)
           # Each attempt reads into a destination of its own: a killed
           # reader must never share a path with the attempts that come
@@ -155,13 +159,15 @@ for backend in sqlite postgres; do
           if "$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" --objects "$DAEMON" checkout main \
             --sparse "$SPARSE_DIR" --into "$dest" > /dev/null 2>> "$WORK/reads-$backend-w$w-r$r.log"; then
             t1=$(date +%s%N)
+            echo "attempt $n end ms=$(( (t1 - t0) / 1000000 )) $(date -u +%T.%3N)" >> "$WORK/reads-$backend-w$w-r$r.log"
             echo $(( (t1 - t0) / 1000000 )) >> "$WORK/read-times.csv"
           else
             rc=$?
+            t1=$(date +%s%N)
             if [ "$rc" -eq 124 ]; then
-              echo "timeout after 60s" >> "$WORK/reads-$backend-w$w-r$r.log"
+              echo "attempt $n timeout after 60s at $(date -u +%T.%3N)" >> "$WORK/reads-$backend-w$w-r$r.log"
             else
-              echo "checkout failed rc=$rc" >> "$WORK/reads-$backend-w$w-r$r.log"
+              echo "attempt $n checkout failed rc=$rc at $(date -u +%T.%3N)" >> "$WORK/reads-$backend-w$w-r$r.log"
             fi
           fi
           rm -rf "$dest"
@@ -194,6 +200,7 @@ for backend in sqlite postgres; do
         done
         rep=$((rep + 1))
       done
+      note "tearing down cell $backend w$w r$r at $(date -u +%T.%3N)"
       kill "$(cat "$WORK/capacity-readers.pid")" 2> /dev/null || true
       wait "$(cat "$WORK/capacity-readers.pid")" 2> /dev/null || true
       rss_end=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')

@@ -23,6 +23,7 @@ fn table_rows(section: &str) -> Vec<Vec<String>> {
     let mut rows: Vec<Vec<String>> = Vec::new();
     let mut grid = false;
     let mut rule_seen = false;
+    let mut header_width = 0;
     for line in section.lines() {
         if !line.starts_with('|') {
             if grid && rule_seen {
@@ -39,17 +40,22 @@ fn table_rows(section: &str) -> Vec<Vec<String>> {
             // The grid table starts at the `| backend |` header; the
             // section's metadata table (Commit, Runner) comes first.
             grid = cells.first().is_some_and(|c| c == "backend");
+            header_width = cells.len();
             continue;
         }
         if !rule_seen {
             rule_seen = cells.first().is_some_and(|c| c.starts_with('-'));
+            assert!(
+                cells.len() == header_width,
+                "the separator row's width differs from the header's: {line}"
+            );
             continue;
         }
         assert!(
-            cells.len() >= NUMERIC_COLUMNS + 3,
-            "a capacity row has too few columns: {line}"
+            cells.len() == header_width,
+            "a capacity row's width differs from the header's: {line}"
         );
-        rows.push(cells[..NUMERIC_COLUMNS + 3].to_vec());
+        rows.push(cells);
     }
     rows
 }
