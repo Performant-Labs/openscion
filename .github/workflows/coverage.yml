@@ -137,6 +137,16 @@ jobs:
       # ci.yml's jobs.
       - name: the runner's disk and memory, before the build
         run: df -h / | tail -1; free -m | awk 'NR==2'
+      # A leaner instrumented build: no debuginfo (coverage needs the
+      # coverage mapping, not DWARF), stripped binaries, and a linker
+      # that keeps less of its working set in RAM. The agent that
+      # dies is the largest process when the linker and the agent
+      # share a 7 GB machine.
+      - name: lean build settings for the instrumented build
+        run: |
+          mkdir -p .cargo
+          printf '[profile.dev]\ndebug = false\nstrip = true\n\n[profile.test]\ndebug = false\nstrip = true\n' > .cargo/config.toml
+          echo "RUSTFLAGS=-C link-arg=-Wl,--no-keep-memory" >> "$GITHUB_ENV"
       # The instrumented build is far larger than the plain one, and a
       # runner whose disk fills loses its agent mid-measure — six runs
       # in a row, always near the same minute. The image ships dozens
@@ -161,7 +171,7 @@ jobs:
               avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9'); \
               [ "$avail" -gt 3 ] || { echo 'the runner is out of disk'; df -h /; exit 2; }; done ) &
           watcher=$!
-          nice -n 19 cargo llvm-cov --no-report --workspace \
+          nice -n 19 cargo llvm-cov --no-report --workspace -q \
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
             | tee measure.log
           status=$?
@@ -187,9 +197,15 @@ jobs:
           name: coverage-${{ matrix.name }}
           path: target/coverage/${{ env.COVERAGE_PROFILE }}
           if-no-files-found: error
-      - name: keep the profiles out of the cache
+      - name: the profiles leave the cache, the build stays
         if: always()
-        run: rm -rf target/coverage
+        run: |
+          # target/coverage holds the instrumented build and the
+          # profiles; the build is what the cache warms from, so only
+          # the profiles go.
+          rm -f target/coverage/*.profraw target/coverage/*.profdata \
+            target/coverage/*-profraw-list target/coverage/backend-summary.txt \
+            target/coverage/measure.log 2>/dev/null || true
       - name: the measure's log, even on failure
         if: failure()
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
@@ -256,6 +272,8 @@ jobs:
               exit 1
             fi
           done < <(sed 's/^[[:space:]]*//; s/#.*//; s/[[:space:]]*$//' scripts/coverage-exclusions.txt | grep -v '^$')
-      - name: keep the profiles out of the cache
+      - name: the profiles leave the cache, the build stays
         if: always()
-        run: rm -rf target/coverage
+        run: |
+          rm -f target/coverage/*.profraw target/coverage/*.profdata \
+            target/coverage/*-profraw-list target/coverage/report-summary.txt 2>/dev/null || true
