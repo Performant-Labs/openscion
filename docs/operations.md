@@ -134,6 +134,7 @@ restore from backup (section 3).
 Proof: crates/scion-server/tests/backend_refusals.rs::a_lost_server_lock_fences_the_backend
 Proof: crates/scion-server/tests/backend_refusals.rs::an_unreachable_database_is_not_a_takeover
 Proof: crates/scion-server/tests/crash.rs::every_reply_survives_a_kill_of_the_server
+Proof: crates/scion-server/tests/first_boot.rs::a_first_boot_serves_probes_and_reads_back
 
 ### Server and a regional cache
 
@@ -620,6 +621,23 @@ After the fix, the server starts and serves; `fsck` says the store is
 whole.
 
 Proof: crates/scion-server/tests/crash.rs::a_newer_schema_refuses_the_open_and_a_restore_serves
+
+
+### Rollback
+
+The rollback depends on what changed: if the schema did not change, run
+the old binary on the data as it is; if it did, restore the pre-upgrade
+backup (section 3) and run the old binary on the copy. After a
+migration, rollback means restoring the backup taken before the
+upgrade: the old binary refuses the new schema - that refusal is the
+stop, and the backup is the recovery. Never edit `user_version` by
+hand - the version is the migration's bookmark, and a hand-moved one
+leaves the database half-migrated in a way no migration can finish.
+The run-the-old-binary arm is the version matrix's drill, #431: the
+pre-upgrade backup restores and serves under the N-1 binary. The
+restore arm is the failed-migration section's Proof: the test forges a
+newer database, sees the refusal, restores the pre-upgrade backup, and
+serves.
 
 An import reads git revision `--rev` (default `HEAD`) into scion repo
 `--repo` (default `main`), and points scion ref `--ref` (default `main`)
