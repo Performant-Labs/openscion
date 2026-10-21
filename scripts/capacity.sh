@@ -78,8 +78,11 @@ fetch_dataset
 
 HEAD_HEX=$(git rev-parse HEAD)
 
-# pct FILE P: the P-percentile of the numbers in FILE.
+      # pct FILE P: the P-percentile of the numbers in FILE. A cell with no
+# readers (r=0) has no times file: the percentile columns then say so
+# with "-".
 pct() {
+  [ -f "$1" ] || return 0
   sort -n "$1" | awk -v p="$2" '{ a[NR] = $1 } END { if (NR) print a[int(NR * p + 0.5)] }'
 }
 
@@ -148,7 +151,8 @@ for backend in sqlite postgres; do
           n=$((n + 1))
           # Every attempt logs its own start and end, so the run can
           # tell an attempt that outlived the servers (teardown) from
-          # one that hung while the servers were up.
+          # one that hung while the servers were up. The r loops share
+          # the log and the times file, so the counts are the cell's.
           echo "attempt $n start $(date -u +%T.%3N)" >> "$WORK/reads-$backend-w$w-r$r.log"
           t0=$(date +%s%N)
           # Each attempt reads into a destination of its own: a killed
@@ -173,7 +177,16 @@ for backend in sqlite postgres; do
           rm -rf "$dest"
         done
       }
-      readers & echo $! > "$WORK/capacity-readers.pid"
+      # r reader loops, none for r=0: the cell's reader axis is real
+      # concurrency, not a label. The loops share the log and the
+      # times file, so the row's counts and percentiles stay the
+      # cell's own.
+      : > "$WORK/capacity-readers.pids"
+      if [ "$r" -gt 0 ]; then
+        for _ in $(seq 1 "$r"); do
+          readers & echo $! >> "$WORK/capacity-readers.pids"
+        done
+      fi
       # The server's Land counter at the cell's start: lands served is
       # the counter's growth over the cell, so a cell whose bench dies
       # still reports what its writers got through.
@@ -201,8 +214,8 @@ for backend in sqlite postgres; do
         rep=$((rep + 1))
       done
       note "tearing down cell $backend w$w r$r at $(date -u +%T.%3N)"
-      kill "$(cat "$WORK/capacity-readers.pid")" 2> /dev/null || true
-      wait "$(cat "$WORK/capacity-readers.pid")" 2> /dev/null || true
+      while read -r pid; do kill "$pid" 2> /dev/null || true; done < "$WORK/capacity-readers.pids"
+      while read -r pid; do wait "$pid" 2> /dev/null || true; done < "$WORK/capacity-readers.pids"
       rss_end=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')
       # Lands served, from the server's counter, while it still serves:
       # the counter counts what the writers got through, whether bench
