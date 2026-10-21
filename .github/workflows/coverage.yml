@@ -245,7 +245,19 @@ jobs:
           # setup costs the job about a quarter of an hour, so the cap
           # fires a half hour before the wall, the step fails cleanly,
           # and its log uploads with the watcher's trend in it.
-          nice -n 19 timeout -k 60 900 cargo nextest run --workspace \
+          # The Postgres slices mirror ci.yml's postgres job's scope:
+          # it proves backend parity for open-scion-server only, and
+          # the scn crate's tests read sqlite-typed rows by
+          # construction. The default-backend slices cover the rest of
+          # the workspace; the merged number sees it all.
+          if [ "${{ matrix.value }}" = postgres ]; then
+            pkgs="-p open-scion-server"
+          else
+            pkgs="--workspace"
+          fi
+          # shellcheck disable=SC2086
+          nice -n 19 timeout -k 60 900 cargo nextest run $pkgs \
+            --no-fail-fast \
             --partition hash:${{ matrix.slice }}/4 \
             > measure.log 2>&1
           status=$?
