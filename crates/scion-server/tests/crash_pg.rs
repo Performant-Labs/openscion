@@ -115,6 +115,19 @@ struct PgServer {
     child: Child,
     url: String,
     log: PathBuf,
+    schema: String,
+}
+
+/// The one-server advisory key of a schema: the same fold `pg.rs`
+/// derives (`SERVER_LOCK` plus the schema's BLAKE3's first 8 bytes),
+/// pinned here because the key is private to the backend.
+fn schema_lock_key(schema: &str) -> i64 {
+    const SERVER_LOCK: i64 = 0x5343_494F_4E53_5256;
+    SERVER_LOCK.wrapping_add(i64::from_be_bytes(
+        blake3::hash(schema.as_bytes()).as_bytes()[..8]
+            .try_into()
+            .expect("8 of 32 bytes"),
+    ))
 }
 
 impl PgServer {
@@ -146,6 +159,7 @@ impl PgServer {
             child,
             url: String::new(),
             log: log.to_path_buf(),
+            schema: schema.to_owned(),
         }
     }
 
@@ -172,12 +186,40 @@ impl PgServer {
         server
     }
 
-    /// Kills the process and waits for the death: the next start must
-    /// not race a lock the dead process still holds.
+    /// Kills the process and waits for the death, then for Postgres to
+    /// free the dead server's one-server advisory lock: the backend
+    /// that held it died with the process, but Postgres gives the lock
+    /// up only while cleaning that session away, which a loaded runner
+    /// can stretch past any fixed sleep. The next start goes out only
+    /// when the lock is really gone, or the test names the wait that
+    /// never ended.
     fn kill_and_wait(&mut self) {
         let _ = self.child.kill();
         let _ = self.child.wait(); // needs &mut: the kill rides it
-        std::thread::sleep(Duration::from_millis(300));
+        let key = schema_lock_key(&self.schema);
+        let mut client = raw(&pg_url());
+        let start = Instant::now();
+        loop {
+            // pg_locks splits the int8 advisory key into classid (the
+            // high 32 bits) and objid (the low 32), both oid.
+            let held = client
+                .query_opt(
+                    "SELECT 1 FROM pg_locks WHERE locktype = 'advisory' \
+                     AND classid = (($1::bigint >> 32) & 4294967295)::oid \
+                     AND objid = ($1::bigint & 4294967295)::oid",
+                    &[&key],
+                )
+                .expect("the lock query answers")
+                .is_some();
+            if !held {
+                return;
+            }
+            assert!(
+                start.elapsed() < Duration::from_secs(10),
+                "the dead server's one-server lock was never freed"
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
     }
 }
 
