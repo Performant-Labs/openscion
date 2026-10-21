@@ -65,7 +65,9 @@ summary() {
 }
 
 # release_tags: every release tag that is an ancestor of HEAD and not HEAD
-# itself, oldest first, capped to the newest 8. Until the first tag:
+# itself, oldest first. The ladder caps itself to the newest 8 (each tag is
+# a build); tags outside the cap are named in a ::warning:: so "every tag"
+# never silently shrinks. Until the first tag:
 # SHORTCUT: two pinned commits whose stores differ in schema version, so
 # every leg of the job has something real to prove; the first release tag
 # replaces them (the resolution never sees them again, because a release
@@ -78,17 +80,31 @@ STANDIN_TAGS=(
 release_tags() {
   local head tag
   head=$(git -C "$ROOT" rev-parse HEAD)
-  git -C "$ROOT" tag --list 'v[0-9]*' --sort=-version:refname --merged=HEAD |
+  git -C "$ROOT" tag --list 'v[0-9]*' --sort=version:refname --merged=HEAD |
     while read -r tag; do
       [ "$(git -C "$ROOT" rev-parse "$tag^{commit}")" != "$head" ] && printf '%s\n' "$tag"
-    done | tail -n 8
+    done
+}
+
+# cap_tags: the newest 8 of the release tags, oldest first; tags outside
+# the cap are warned about by name, never dropped silently.
+CAP=8
+cap_tags() {
+  local all total skipped
+  all=$(release_tags)
+  [ -z "$all" ] && return 0
+  total=$(printf '%s\n' "$all" | grep -c . || true)
+  [ "$total" -le "$CAP" ] && { printf '%s\n' "$all"; return 0; }
+  skipped=$(printf '%s\n' "$all" | awk -v n="$total" -v cap="$CAP" 'NR <= n - cap')
+  summary "::warning::the ladder keeps the newest $CAP tags; these older tags are not built: $(printf '%s' "$skipped" | tr '\n' ' ')"
+  printf '%s\n' "$all" | awk -v n="$total" -v cap="$CAP" 'NR > n - cap'
 }
 
 # --resolve-tags: print the tag list and exit, so a workflow can key its
 # caches before any build runs. An empty ladder is a pinned-stand-ins
 # ladder, never a skip: a run that proves nothing must not pass.
 if [ "${1:-}" = "--resolve-tags" ]; then
-  tags=$(release_tags)
+  tags=$(cap_tags)
   if [ -z "$tags" ]; then
     summary "no release tag yet: the ladder is the pinned stand-in commits"
     printf '%s\n' "${STANDIN_TAGS[@]}"
@@ -120,7 +136,7 @@ git -C "$ROOT" config --local --list | grep '^user\.' > "$WORK/git-config.before
 if [ -n "${STORE_UPGRADE_TAGS:-}" ]; then
   tags=$(printf '%s' "${STORE_UPGRADE_TAGS}" | tr ' ' '\n')
 else
-  tags=$(release_tags)
+  tags=$(cap_tags)
   if [ -z "$tags" ]; then
     summary "no release tag yet: the ladder is the pinned stand-in commits"
     tags=$(printf '%s\n' "${STANDIN_TAGS[@]}")
