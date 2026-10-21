@@ -224,7 +224,10 @@ jobs:
           printf '[profile.default]\ntimeout = "300s"\nretries = 1\nslow-timeout = { period = "60s", terminate-after = 2 }\n' > .config/nextest.toml
           # shellcheck disable=SC1090
           source <(cargo llvm-cov show-env --sh)
-          nice -n 19 cargo nextest run --workspace \
+          # A hard cap 25 minutes under the wall the agent dies at:
+          # the step then fails cleanly, its log uploads, and the
+          # evidence survives the runner.
+          nice -n 19 timeout -k 60 1500 cargo nextest run --workspace \
             --partition hash:${{ matrix.slice }}/2 \
             > measure.log 2>&1
           status=$?
