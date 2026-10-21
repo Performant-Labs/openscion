@@ -15,6 +15,7 @@ use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
+use std::sync::atomic::AtomicU64;
 use std::time::{Duration, Instant};
 
 use scion_core::{Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
@@ -53,6 +54,13 @@ fn pg_url() -> String {
     std::env::var("SCION_TEST_POSTGRES_URL").expect("SCION_TEST_POSTGRES_URL")
 }
 
+/// One per spawn: the `application_name` every connection of that one
+/// server carries, known before the process starts (the pid is not:
+/// the URL rides the spawn's environment). The kill waits for these
+/// sessions to end, so no session of a dead server can appear - and
+/// take a lock - after the wait said the database is clear.
+static SPAWN_SEQ: AtomicU64 = AtomicU64::new(1);
+
 fn is_pg() -> bool {
     std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres")
 }
@@ -61,9 +69,9 @@ fn is_pg() -> bool {
 /// `Backend::test_schema` derives for this data directory, in the URL's
 /// `options`, so the server's one-server lock and its tables sit beside
 /// the harness's.
-fn server_url(schema: &str) -> String {
+fn server_url(schema: &str, name: &str) -> String {
     format!(
-        "{}?options=--search_path%3D{schema}",
+        "{}?options=--search_path%3D{schema}%20-c%20application_name%3D{name}",
         pg_url().trim_end_matches('/')
     )
 }
@@ -116,6 +124,7 @@ struct PgServer {
     url: String,
     log: PathBuf,
     schema: String,
+    name: String,
 }
 
 /// The one-server advisory key of a schema: the same fold `pg.rs`
@@ -135,6 +144,10 @@ impl PgServer {
     /// work - the schema upgrade - has run. The caller that kills
     /// during that work measures from here, not from the serving line.
     fn spawn_raw(data: &Path, schema: &str, log: &Path) -> Self {
+        let name = format!(
+            "scion-test-{}",
+            SPAWN_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+        );
         // One start, one log: a fresh file, so the address this spawn
         // waits for is this spawn's, never an earlier run's.
         let file = fs::OpenOptions::new()
@@ -147,7 +160,7 @@ impl PgServer {
             .arg("--data")
             .arg(data)
             .args(["serve", "--token", TOKEN, "--listen", "127.0.0.1:0"])
-            .env("SCION_POSTGRES_URL", server_url(schema))
+            .env("SCION_POSTGRES_URL", server_url(schema, &name))
             .env("NO_COLOR", "1")
             .env("RUST_LOG", "info")
             .stdout(Stdio::from(file.try_clone().unwrap()))
@@ -160,6 +173,7 @@ impl PgServer {
             url: String::new(),
             log: log.to_path_buf(),
             schema: schema.to_owned(),
+            name: name.clone(),
         }
     }
 
@@ -200,6 +214,17 @@ impl PgServer {
         let mut client = raw(&pg_url());
         let start = Instant::now();
         loop {
+            // A session that was mid-start at the kill can appear in
+            // pg_stat_activity, and take the lock, AFTER a lock-only
+            // check said the database was clear: the wait must see the
+            // sessions of this one server end, not one lock.
+            let sessions = client
+                .query_opt(
+                    "SELECT 1 FROM pg_stat_activity WHERE application_name = $1",
+                    &[&self.name],
+                )
+                .expect("the session query answers")
+                .is_some();
             // pg_locks splits the int8 advisory key into classid (the
             // high 32 bits) and objid (the low 32), both oid.
             let held = client
@@ -211,12 +236,13 @@ impl PgServer {
                 )
                 .expect("the lock query answers")
                 .is_some();
-            if !held {
+            if !sessions && !held {
                 return;
             }
             assert!(
                 start.elapsed() < Duration::from_secs(10),
-                "the dead server's one-server lock was never freed"
+                "the dead server's sessions ({sessions}) or lock ({held}) \
+                 never ended"
             );
             std::thread::sleep(Duration::from_millis(50));
         }
