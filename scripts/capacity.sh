@@ -140,8 +140,16 @@ for backend in sqlite postgres; do
       # rm -rf of the data directory never touches it.
       if [ "$backend" = postgres ]; then
         admin_url="${SCION_PG_URL%/*}/postgres"
-        psql "$admin_url" -X -q -c 'DROP DATABASE IF EXISTS scion' \
-          -c 'CREATE DATABASE scion' || die "the $backend database reset failed"
+        # The database this URL names, query string off: the reset must
+        # drop and create the one the server will open, whatever it is
+        # called - a hardcoded name silently skips a differently named
+        # database's reset, and the next cell starts on the last cell's
+        # lands.
+        pg_db="${SCION_PG_URL##*/}"
+        pg_db="${pg_db%%\?*}"
+        [ -n "$pg_db" ] || die "the Postgres URL names no database: $SCION_PG_URL"
+        psql "$admin_url" -X -q -c "DROP DATABASE IF EXISTS $pg_db" \
+          -c "CREATE DATABASE $pg_db" || die "the $backend database reset failed"
       fi
       rm -rf "$WORK/server"
       note "importing for $backend"
@@ -259,7 +267,15 @@ for backend in sqlite postgres; do
         tp_p99="-"
       fi
       note "tearing down cell $backend w$w r$r at $(date -u +%T.%3N)"
-      while read -r pid; do kill "$pid" 2> /dev/null || true; done < "$WORK/capacity-readers.pids"
+      # Each loop's in-flight client dies with the loop: freeze the loop
+      # first (no new attempt can start), kill its children - the
+      # timeout, which hands the TERM to the checkout it watches - and
+      # only then the loop. A child killed after its parent is re-parented
+      # and lost, and one left alive runs up to its own 60 s timeout
+      # into the next cell, where its failure would be someone else's.
+      while read -r pid; do kill -STOP "$pid" 2> /dev/null || true; done < "$WORK/capacity-readers.pids"
+      while read -r pid; do pkill -TERM -P "$pid" 2> /dev/null || true; done < "$WORK/capacity-readers.pids"
+      while read -r pid; do kill -TERM "$pid" 2> /dev/null || true; done < "$WORK/capacity-readers.pids"
       while read -r pid; do wait "$pid" 2> /dev/null || true; done < "$WORK/capacity-readers.pids"
       rss_end=$(ps -o rss= -p "$SERVER_PID" | tr -d ' ')
       # Lands served, from the server's counter, while it still serves:

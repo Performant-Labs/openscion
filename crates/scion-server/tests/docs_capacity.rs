@@ -133,38 +133,72 @@ fn numeric_columns_parse_and_dashes_say_what_failed() {
     // Column indexes in the row: 3 land p99, 4 checkout p50, 5 checkout
     // p99, 6 timeouts, 7 errors.
     for row in table_rows(capacity_section(&doc)) {
-        let all_dash = row[3..].iter().all(|c| c.as_str() == "-");
-        if all_dash {
-            continue; // the skeleton: no run has filled this cell yet
-        }
-        let timeouts: u64 = row[6]
-            .parse()
-            .unwrap_or_else(|_| panic!("timeouts does not parse: {row:?}"));
-        let errors: u64 = row[7]
-            .parse()
-            .unwrap_or_else(|_| panic!("errors does not parse: {row:?}"));
-        // The percentile group (land p99, checkout p50, checkout p99)
-        // stands together or parses together: a bench that died names
-        // none of them, a live one names all three. A dash in one and a
-        // number in another is a broken row, not a measurement.
-        let group = &row[3..6];
-        let dashes = group.iter().filter(|c| c.as_str() == "-").count();
-        match dashes {
-            0 => {
-                for cell in group {
-                    cell.parse::<f64>()
-                        .unwrap_or_else(|_| panic!("a number does not parse: {cell:?} in {row:?}"));
-                }
+        check_row(&row);
+    }
+}
+
+/// The one row's shape, shared by the doc's table and the fixture rows
+/// the rule is tested against.
+fn check_row(row: &[String]) {
+    let all_dash = row[3..].iter().all(|c| c.as_str() == "-");
+    if all_dash {
+        return; // the skeleton: no run has filled this cell yet
+    }
+    let timeouts: u64 = row[6]
+        .parse()
+        .unwrap_or_else(|_| panic!("timeouts does not parse: {row:?}"));
+    let errors: u64 = row[7]
+        .parse()
+        .unwrap_or_else(|_| panic!("errors does not parse: {row:?}"));
+    // The percentile group (land p99, checkout p50, checkout p99)
+    // stands together or parses together: a bench that died names
+    // none of them, a live one names all three, and a cell with no
+    // readers (r=0) names the land p99 and dashes both checkout
+    // columns. A dash in one and a number in another is otherwise a
+    // broken row, not a measurement.
+    let group = &row[3..6];
+    let dashes = group.iter().filter(|c| c.as_str() == "-").count();
+    match dashes {
+        0 => {
+            for cell in group {
+                cell.parse::<f64>()
+                    .unwrap_or_else(|_| panic!("a number does not parse: {cell:?} in {row:?}"));
             }
-            3 if errors + timeouts > 0 => {}
-            _ => panic!("a half-reported percentile group must not publish: {row:?}"),
         }
-        // The counters and the resources are always numbers: the run
-        // knows them whatever the bench did.
-        for cell in &row[6..] {
-            cell.parse::<f64>()
-                .unwrap_or_else(|_| panic!("a number does not parse: {cell:?} in {row:?}"));
+        // A no-reader cell: the writers ran, the readers never did.
+        2 if row[3] != "-" && row[4] == "-" && row[5] == "-" => {
+            row[3]
+                .parse::<f64>()
+                .unwrap_or_else(|_| panic!("the land p99 does not parse: {row:?}"));
         }
+        3 if errors + timeouts > 0 => {}
+        _ => panic!("a half-reported percentile group must not publish: {row:?}"),
+    }
+    // The counters and the resources are always numbers: the run
+    // knows them whatever the bench did.
+    for cell in &row[6..] {
+        cell.parse::<f64>()
+            .unwrap_or_else(|_| panic!("a number does not parse: {cell:?} in {row:?}"));
+    }
+}
+
+/// The row shapes the rule must accept and refuse, as fixture rows in
+/// the table's own shape: a filled no-reader row, a dead bench's row,
+/// and the half-filled row that must never publish.
+#[test]
+fn a_no_reader_row_names_the_land_and_dashes_the_reads() {
+    let shapes: [(&[&str], bool); 4] = [
+        // (cells after the cell name, does the rule accept it?)
+        (&["63.1", "70", "115", "0", "0", "30376", "110660"], true), // a live cell
+        (&["63.1", "-", "-", "0", "0", "30376", "110660"], true),    // r=0: no readers ran
+        (&["-", "-", "-", "0", "2", "30376", "110660"], true),       // the bench died
+        (&["63.1", "-", "115", "0", "0", "30376", "110660"], false), // half-filled: never
+    ];
+    for (cells, accepts) in shapes {
+        let mut row: Vec<String> = vec!["sqlite".into(), "2".into(), "0".into()];
+        row.extend(cells.iter().map(|c| c.to_string()));
+        let checked = std::panic::catch_unwind(|| check_row(&row));
+        assert_eq!(checked.is_ok(), accepts, "the rule disagrees about {row:?}");
     }
 }
 
