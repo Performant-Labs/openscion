@@ -206,7 +206,8 @@ jobs:
           # whose memory drains loses its agent mid-suite, with every
           # log — so the measure fails itself, loudly, while there is
           # still room to log the numbers.
-          ( while sleep 30; do date -u +%T; df -h / | tail -1; free -m | awk 'NR==2'; du -sh target 2>/dev/null; \
+          ( while sleep 30; do date -u +%T; df -h / | tail -1; free -m | awk 'NR==2'; du -sh target/coverage 2>/dev/null; \
+              find target/coverage -maxdepth 1 -name '*.profraw' 2>/dev/null | wc -l; \
               avail=$(df --output=avail -BG / | tail -1 | tr -dc '0-9'); \
               mem=$(free -m | awk 'NR==2 {print $7}'); \
               { [ "$avail" -gt 3 ] && [ "$mem" -gt 600 ]; } || { echo 'the runner is out of disk or memory'; df -h /; free -m; ps aux --sort=-rss | head -12; exit 2; }; done ) &
@@ -224,10 +225,11 @@ jobs:
           printf '[profile.default]\ntimeout = "300s"\nretries = 1\nslow-timeout = { period = "60s", terminate-after = 2 }\n' > .config/nextest.toml
           # shellcheck disable=SC1090
           source <(cargo llvm-cov show-env --sh)
-          # A hard cap 25 minutes under the wall the agent dies at:
-          # the step then fails cleanly, its log uploads, and the
-          # evidence survives the runner.
-          nice -n 19 timeout -k 60 1500 cargo nextest run --workspace \
+          # A hard cap 15 minutes under the wall the agent dies at:
+          # setup costs the job about a quarter of an hour, so the cap
+          # fires a half hour before the wall, the step fails cleanly,
+          # and its log uploads with the watcher's trend in it.
+          nice -n 19 timeout -k 60 900 cargo nextest run --workspace \
             --partition hash:${{ matrix.slice }}/2 \
             > measure.log 2>&1
           status=$?
