@@ -70,6 +70,30 @@ fn capacity_section(doc: &str) -> &str {
     }
 }
 
+/// The counters of the reader log, tested by the script against a
+/// fixture in the log's real shapes: a line that starts with its attempt
+/// number must still count its event (a grep anchored to the line's
+/// start counted zero of everything, coder5's review).
+#[test]
+fn the_reader_counters_count_the_log_s_own_shapes() {
+    let script = Path::new(DOC)
+        .parent()
+        .and_then(Path::parent)
+        .expect("docs/ has a parent")
+        .join("scripts/test-capacity-counters.sh");
+    let out = Command::new("bash")
+        .arg(&script)
+        .output()
+        .expect("the counter script runs");
+    assert!(
+        out.status.success(),
+        "the counter script fails: {}\n{}\n{}",
+        out.status,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr),
+    );
+}
+
 fn repo_dir() -> &'static Path {
     Path::new(DOC)
         .parent()
