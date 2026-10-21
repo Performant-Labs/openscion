@@ -94,13 +94,19 @@ jobs:
             fi
           done < <(sed 's/^[[:space:]]*//; s/#.*//; s/[[:space:]]*$//' scripts/coverage-exclusions.txt | grep -v '^$')
           [ "$ok" = 1 ]
-      # Two measures accumulate their profiles (--no-report, then
-      # --no-clean keeps the first run's), and the report step merges
-      # them into the one number the gate checks. The exclusion regex
-      # goes to the report step too: the filter applies when the report
-      # is built, and the proof below reads its printed list. The
-      # takeover test stays out: it stops the shared database, as in
-      # ci.yml's jobs.
+      # Two measures accumulate their profiles into the one number the
+      # gate checks, the way cargo-llvm-cov v0.9.1's README documents
+      # merging runs under different conditions: one `clean
+      # --workspace` first, then every measure with `--no-report` —
+      # which itself disables the clean, so the first run's profiles
+      # survive, and `--no-clean` is not only unneeded but refused
+      # beside `--no-report` in this version. The exclusion regex goes
+      # to the report step too: the filter applies when the report is
+      # built, and the proof below reads its printed list. The takeover
+      # test stays out: it stops the shared database, as in ci.yml's
+      # jobs.
+      - name: clean the coverage workspace, once
+        run: cargo llvm-cov clean --workspace
       - name: measure, the default backend
         run: |
           cargo llvm-cov --no-report --workspace \
@@ -109,7 +115,7 @@ jobs:
           PROPTEST_CASES: "64"
       - name: measure, the postgres backend
         run: |
-          cargo llvm-cov --no-report --no-clean --workspace \
+          cargo llvm-cov --no-report --workspace \
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"}
         env:
           PROPTEST_CASES: "64"
