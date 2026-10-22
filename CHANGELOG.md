@@ -359,9 +359,9 @@ The first release: the server, its cache tiers, and the `scn` client.
   re-pin", the proto's is "re-pin additions only; a removal is v2".
 - # The docs' named tests are checked
   
-  Every `path.rs::fn_name` the docs and README name is now machine-
-  checked (docs_links.rs): the file is in the repo, it holds the fn,
-  and the fn is a test - `#[test]`, `#[tokio::test]` or one a
+  Every test the docs and README name by file and function is now
+  machine-checked (docs_links.rs): the file is in the repo, it holds
+  the fn, and the fn is a test - `#[test]`, `#[tokio::test]` or one a
   `proptest!` generates - not a helper. A failure names the doc, its
   line and the missing name. Eight references in docs/threat-model.md
   named helpers, not tests; they now name the covering test or keep the
@@ -1232,10 +1232,11 @@ The first release: the server, its cache tiers, and the `scn` client.
   beats the release tags, the newest tag that is an ancestor of HEAD and
   not HEAD itself wins next, and with neither, the newest of the stand-in
   ladder - the two pinned commits that
-  [store-upgrade.sh](scripts/store-upgrade.md) runs, chosen where the
-  store schema changed - stands in until the first release tag replaces
-  them. A run that tests no pair fails with the reason; the matrix never
-  passes as a skip. Two windows of the N and N-1 pair are proved, both
+  [version-matrix.sh](scripts/version-matrix.sh) holds, chosen where
+  the store schema changed - stands in until the first release tag
+  replaces them. A run that tests no pair fails with the reason; the
+  matrix never passes as a skip. Two windows of the N and N-1 pair are
+  proved, both
   directions: the ticket one version's server signs verifies on the other
   version's tier, and a ticket of another key is refused with the ticket
   reason; the snapshot one version's cache writes opens as the other
