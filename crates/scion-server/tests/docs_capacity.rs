@@ -196,7 +196,7 @@ fn a_no_reader_row_names_the_land_and_dashes_the_reads() {
     ];
     for (cells, accepts) in shapes {
         let mut row: Vec<String> = vec!["sqlite".into(), "2".into(), "0".into()];
-        row.extend(cells.iter().map(|c| c.to_string()));
+        row.extend(cells.iter().map(ToString::to_string));
         let checked = std::panic::catch_unwind(|| check_row(&row));
         assert_eq!(checked.is_ok(), accepts, "the rule disagrees about {row:?}");
     }
