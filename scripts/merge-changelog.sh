@@ -55,6 +55,14 @@ for section in added changed fixed security; do
             exit 1
             ;;
         esac
+        # A fragment is plain text: it starts with its sentence. A
+        # front-matter block (a stray "---" first line, as the ms:
+        # preamble one author added on 2026-10-22) is not plain text and
+        # renders as a rule, so the merge refuses it and names the file.
+        if [ "$(head -n 1 "$fragment")" = "---" ]; then
+            echo "fragment must start with its sentence, not a front-matter block: $fragment" >&2
+            exit 1
+        fi
         # A fragment is plain text: no row marker, no indent. The row
         # marker goes on the first line, and every later line takes the
         # row's two-space indent, as today's changelog rows read.
