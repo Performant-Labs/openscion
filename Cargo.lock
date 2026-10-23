@@ -2500,6 +2500,7 @@ dependencies = [
  "clap",
  "ed25519-dalek",
  "hashlink",
+ "libc",
  "nfsserve",
  "open-scion",
  "open-scion-core",
