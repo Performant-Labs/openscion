@@ -19,6 +19,13 @@ use crate::error::{Error, Result};
 /// default as a request timeout.
 pub(crate) const CALL_LIMIT: Duration = Duration::from_secs(600);
 
+#[cfg(test)]
+thread_local! {
+    /// Deadline checks on this thread, each a read of the clock. Tests use
+    /// it to bound the clock reads of a query.
+    pub(crate) static CHECKS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// When a job gives up: at an instant, or once the call that asked for it
 /// has gone. A request timeout or a client that cancels drops the call, but
 /// not a job that is already running, so the long loops of a job check this.
@@ -26,6 +33,12 @@ pub(crate) const CALL_LIMIT: Duration = Duration::from_secs(600);
 pub struct Deadline {
     at: Instant,
     gone: Arc<AtomicBool>,
+    /// Test-only: expires the deadline on the test's word, so a test
+    /// decides the order of a job's steps by state, not by a clock that
+    /// races a thread start ([#566]'s flake). Absent from production
+    /// builds.
+    #[cfg(test)]
+    expired: Arc<AtomicBool>,
 }
 
 impl Deadline {
@@ -35,6 +48,8 @@ impl Deadline {
         Self {
             at,
             gone: Arc::default(),
+            #[cfg(test)]
+            expired: Arc::default(),
         }
     }
 
@@ -57,6 +72,15 @@ impl Deadline {
         self.at
     }
 
+    /// Expires the deadline now, on the test's word: a test that must
+    /// order a job's steps by state expires its deadline when the state
+    /// says so, instead of arming a clock that can lose to a thread
+    /// start. Test-only.
+    #[cfg(test)]
+    pub(crate) fn test_expire(&self) {
+        self.expired.store(true, Ordering::Relaxed);
+    }
+
     /// How long a wait may last: what is left until this. Zero once this
     /// has passed, never negative, never a panic.
     #[must_use]
@@ -67,6 +91,14 @@ impl Deadline {
     /// Fails with [`Error::Cancelled`] once the call has gone, or
     /// [`Error::DeadlineExceeded`] once the deadline has passed.
     pub(crate) fn check(&self) -> Result<()> {
+        #[cfg(test)]
+        CHECKS.set(CHECKS.get() + 1);
+        #[cfg(test)]
+        if self.expired.load(Ordering::Relaxed) {
+            return Err(Error::DeadlineExceeded(
+                "the test expired this deadline".to_owned(),
+            ));
+        }
         if self.gone.load(Ordering::Relaxed) {
             return Err(Error::Cancelled("its call has gone".to_owned()));
         }
