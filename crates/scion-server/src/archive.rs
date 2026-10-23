@@ -546,7 +546,23 @@ fn restore_impl(
     // the replay starts empty whatever the last run left. A live store
     // is safe: its server holds the one-server lock the drop takes.
     if let Some(url) = postgres_url {
-        crate::pg::reset_schema(url, postgres_ca)?;
+        crate::pg::reset_schema(url, postgres_ca).map_err(|error| match error {
+            Error::Corrupt(why) if why.contains("names a store") => {
+                // The refusal's truth: the schema may hold a complete
+                // store a restore published to the database but never
+                // renamed into place (killed after its last
+                // transaction). The staging directory that names it
+                // sits beside this restore's target.
+                Error::Corrupt(format!(
+                    "{why}; this schema holds a complete store that no data \
+directory names: a restore may have stopped after its last transaction. \
+Rename the {}.restoring directory of the target you meant into place and \
+start a server on it, or restore into a new schema",
+                    file_name.to_string_lossy()
+                ))
+            }
+            other => other,
+        })?;
     }
     // The CLI's audit log may already sit in the target: the restore's
     // own intent line went there before the replay, and the target must

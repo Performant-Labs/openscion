@@ -674,7 +674,10 @@ fn a_restore_at_a_stopped_stores_url_refuses_and_leaves_it_whole() {
     let store = Backend::open(data.path(), Some(&url), None).unwrap();
     store.write(|c| c.create_repo("real").map(|_| ())).unwrap();
     drop(store);
-    let repos_before: i64 = maker
+    // The counts come from the scratch database the store lives in,
+    // not the shared one: a query on the wrong database proves nothing.
+    let mut check = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let repos_before: i64 = check
         .query_one("SELECT count(*) FROM repos", &[])
         .unwrap()
         .get(0);
@@ -694,10 +697,11 @@ fn a_restore_at_a_stopped_stores_url_refuses_and_leaves_it_whole() {
         why.contains("refuses to drop"),
         "the refusal must say what it protects: {why}"
     );
-    let repos_after: i64 = maker
+    let repos_after: i64 = check
         .query_one("SELECT count(*) FROM public.repos", &[])
         .unwrap()
         .get(0);
+    drop(check);
     assert_eq!(
         repos_after, repos_before,
         "the refused restore must leave the store's rows unchanged"
@@ -737,7 +741,11 @@ fn a_restored_store_does_not_carry_the_mark_and_a_later_restore_refuses() {
     // Restore A publishes; the mark must be gone when it reports.
     archive::restore(&out, &target, Some(&url), None)
         .unwrap_or_else(|e| panic!("restore A failed: {e:#}"));
-    let mark_there: Option<String> = maker
+    // The checks run against the scratch database the restore used,
+    // not the shared one: a query on the wrong database passes
+    // trivially and proves nothing.
+    let mut check = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    let mark_there: Option<String> = check
         .query_one("SELECT to_regclass('public.restore_staging')::text", &[])
         .unwrap()
         .get(0);
@@ -748,7 +756,7 @@ fn a_restored_store_does_not_carry_the_mark_and_a_later_restore_refuses() {
     // The published store's rows are the state a later restore meets:
     // a store's identity, no mark, and rows a stopped server's schema
     // would hold.
-    let repos_before: i64 = maker
+    let repos_before: i64 = check
         .query_one("SELECT count(*) FROM repos", &[])
         .unwrap()
         .get(0);
@@ -761,11 +769,12 @@ fn a_restored_store_does_not_carry_the_mark_and_a_later_restore_refuses() {
         restored.is_err(),
         "a restore at the published store's URL must refuse"
     );
-    let repos_after: i64 = maker
+    let repos_after: i64 = check
         .query_one("SELECT count(*) FROM repos", &[])
         .unwrap()
         .get(0);
     assert_eq!(repos_after, repos_before, "A's rows are intact");
+    drop(check);
     maker
         .batch_execute(&format!("DROP DATABASE {name}"))
         .unwrap();
