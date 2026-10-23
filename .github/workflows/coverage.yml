@@ -456,7 +456,7 @@ jobs:
           # floor is half of the corrected reading (run 39947175543's
           # gate), well under it, so a half-lost merge still fails.
           pg_floor=45
-          pg_cover=$(awk '$2 == "scion-server/src/pg.rs" {print $NF}' \
+          pg_cover=$(awk '$1 == "scion-server/src/pg.rs" {print $10}' \
             target/coverage/report-summary.txt | tr -d '%')
           echo "pg.rs lines covered: ${pg_cover:-none}% (floor $pg_floor%)"
           if [ -z "$pg_cover" ] || [ "${pg_cover%%.*}" -lt "$pg_floor" ]; then
