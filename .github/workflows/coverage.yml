@@ -430,7 +430,8 @@ jobs:
           # the ones whose hash matches a unit it rebuilt. The set
           # difference, grouped by the crate each mangled name starts
           # with, says WHAT the dropped set is and HOW BIG each part.
-          pd="$(rustc --print sysroot)/bin/llvm-profdata"
+          pd="$(find "$(rustc --print sysroot)" -name llvm-profdata -type f | head -1)"
+          echo "llvm-profdata at: $pd"
           "$pd" merge -sparse target/coverage/*.profraw \
             -o target/coverage/merged.profdata
           "$pd" show --all-functions target/coverage/merged.profdata \
