@@ -306,14 +306,19 @@ jobs:
           source <(cargo llvm-cov show-env --sh)
           # The server crate is what ci.yml's postgres job proves, and
           # the profiles of the default measure already carry its
-          # sqlite-side lines. The one excluded walk runs longer than
-          # its timeout under postgres plus instrumentation.
+          # sqlite-side lines. The build set is the whole workspace so
+          # the crate compiles under the same feature unification as
+          # the default measure and the gate: a -p build gives the
+          # crate a different coverage mapping, and the gate's report
+          # drops its counters as mismatched data (#565's pg.rs 6%
+          # was this, not missing tests). The run set is the server
+          # crate's tests only.
           # SHORTCUT: one graph walk runs longer than eight minutes
           # under postgres plus instrumentation, because the ancestry
           # walk issues one query per node link. Remove this exclusion
           # when the batched ancestry walk lands.
-          nice -n 19 cargo nextest run -p open-scion-server --no-fail-fast \
-            -E 'not test(graph_queries_across_many_merges_answer)' \
+          nice -n 19 cargo nextest run --workspace --no-fail-fast \
+            -E 'package(open-scion-server) and not test(graph_queries_across_many_merges_answer)' \
             | tee measure-postgres.log
           kill "$watcher"
         env:
