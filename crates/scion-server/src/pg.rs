@@ -1897,6 +1897,40 @@ pub(crate) fn reset_schema(url: &str, ca: Option<&Path>) -> Result<()> {
     // setup asks the database `current_schema()` and locks that. A
     // refusal here is another server's hold, and the drop must not run.
     let client = connect_exclusive(url, ca, &options, None, Arc::new(Fence::new()))?;
+    // The drop's only other guard is what the schema holds: this is the
+    // one check a stopped store's URL cannot escape - a stopped server
+    // holds no lock, so the schema's own rows decide. A schema that
+    // carries a store's identity and no restore's staging mark is a
+    // real store: refused, unchanged, whatever the lock says.
+    let staging: Option<String> = client
+        .query_opt("SELECT to_regclass('public.restore_staging')::text", &[])?
+        .and_then(|row| row.get::<_, Option<String>>(0));
+    let named: Option<String> = client
+        .query_opt("SELECT to_regclass('public.store_uuid')::text", &[])?
+        .and_then(|row| row.get::<_, Option<String>>(0));
+    if staging.is_none() && named.is_some() {
+        return Err(Error::Corrupt(
+            "this database names a store, and no restore's staging mark: \
+             a restore refuses to drop a store it did not make"
+                .to_string(),
+        ));
+    }
+    if staging.is_none() && named.is_none() {
+        // Not ours and not a store: a schema with other objects is not
+        // a restore's leftover, and nothing here may drop it.
+        let foreign: i64 = client.query(
+            "SELECT count(*) FROM pg_catalog.pg_class \
+                 WHERE relnamespace = 'public'::regnamespace AND relkind = 'r'",
+            &[],
+        )?[0]
+            .get(0);
+        if foreign > 0 {
+            return Err(Error::Corrupt(format!(
+                "this schema holds {foreign} table(s) that no store and no restore made: \
+                 a restore refuses to drop what it did not make"
+            )));
+        }
+    }
     // The drop waits out a stale table lock a dead replay's peer left
     // behind - but on a clock, so a stuck backend cannot hold a failed
     // restore forever. A live store is already refused by the
@@ -1911,6 +1945,51 @@ pub(crate) fn reset_schema(url: &str, ca: Option<&Path>) -> Result<()> {
         })?;
     // One batch: a crash between the drop and the create would leave
     // the next open a database with no schema to land in.
+    if let Err(why) = client.batch(&format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}"
+    )) {
+        return Err(Error::Corrupt(format!(
+            "the staging schema {schema} is left behind: {why}; the next restore's start resets it"
+        )));
+    }
+    // This schema is now the restore's staging, and its mark is what
+    // the next restore's start looks for: a schema with the mark is a
+    // restore's leftover, whatever a kill did to the process that made
+    // it. A store's identity never has it.
+    let mut id = [0_u8; 16];
+    getrandom::fill(&mut id).expect("system randomness");
+    let id: String = id
+        .iter()
+        .fold(String::new(), |acc, b| acc + &format!("{b:02x}"));
+    client.batch(&format!(
+        "CREATE TABLE restore_staging (id text primary key, started timestamptz default now()); \
+         INSERT INTO restore_staging (id) VALUES ('{id}')"
+    ))?;
+    Ok(())
+}
+
+/// The failure path's reset: the schema this restore reset at its
+/// start, marked as staging, holds only this run's rows - a failed
+/// replay's committed batches and the identity its open minted. Drop
+/// it unconditionally: everything in it is the restore's, and the
+/// bounded clocks still apply (W1).
+///
+/// # Errors
+///
+/// Why the database could not be reached, or the drop ran out of its
+/// clock with the schema left behind (named, for the next restore's
+/// start to reset).
+pub(crate) fn reset_own_staging(url: &str, ca: Option<&Path>) -> Result<()> {
+    let options = base_options();
+    let client = connect_exclusive(url, ca, &options, None, Arc::new(Fence::new()))?;
+    client.batch(&format!(
+        "SET lock_timeout = '{RESET_LOCK_TIMEOUT}'; SET statement_timeout = '{RESET_STATEMENT_TIMEOUT}'"
+    ))?;
+    let schema: String = client.query("SELECT current_schema()", &[])?[0]
+        .try_get(0)
+        .map_err(|error| {
+            Error::Corrupt(format!("the database answers no current schema: {error}"))
+        })?;
     if let Err(why) = client.batch(&format!(
         "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}"
     )) {

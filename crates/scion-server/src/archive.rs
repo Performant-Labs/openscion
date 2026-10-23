@@ -606,7 +606,7 @@ fn restore_impl(
             // failed: drop the schema they sit in, best effort, so the
             // operator's retry against the same database starts empty.
             if let Some(url) = postgres_url
-                && let Err(why) = crate::pg::reset_schema(url, postgres_ca)
+                && let Err(why) = crate::pg::reset_own_staging(url, postgres_ca)
             {
                 tracing::warn!(error = %why, "cannot drop the restored database's schema");
             }
@@ -761,17 +761,7 @@ fn replay_changesets(
     tx_bytes: usize,
 ) -> Result<(RepoId, u64)> {
     let mut txs = 0u64;
-    let repo_id = store.write(|c| {
-        let repo_id = c.create_repo(name)?;
-        // The lens the tree building needs: the size of every member
-        // blob, read from the files the put above just made durable.
-        let mut lens = HashMap::new();
-        for member in members {
-            lens.insert(*member, store.blobs().size(*member)? as u64);
-        }
-        let _ = lens;
-        Ok(repo_id)
-    })?;
+    let repo_id = store.write(|c| c.create_repo(name))?;
     txs += 1;
     // The mutation lever the ceiling test flips (SCION_RESTORE_MUTATION
     // = whole_file, test-hooks only): the replay reads the whole
@@ -874,7 +864,6 @@ fn restore_batch_note(name: &str, batch: u64) {
     if std::env::var_os("SCION_RESTORE_ECHO_BATCH").is_some() {
         eprintln!("restore: {name} batch {batch} committed");
     }
-    let _ = (name, batch);
 }
 
 /// The transactions the restores of this process committed, for the

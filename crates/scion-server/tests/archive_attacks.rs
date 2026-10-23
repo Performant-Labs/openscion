@@ -641,6 +641,72 @@ fn a_stale_lock_cannot_hang_the_failed_restore_and_the_next_one_lands() {
         .unwrap();
 }
 
+/// The data-loss attack (the #575 review's F1): a restore pointed at
+/// the URL of a real store whose server is DOWN. A stopped store holds
+/// no one-server lock, so the start cleanup's only guard cannot see
+/// it: the drop would erase the store's whole schema. A restore may
+/// drop only what a restore made - a schema that holds a store's
+/// identity and no restore's staging mark is refused, unchanged.
+/// Runs only where `SCION_TEST_POSTGRES_URL` names the job's own
+/// scratch instance.
+#[test]
+fn a_restore_at_a_stopped_stores_url_refuses_and_leaves_it_whole() {
+    let Ok(base) = std::env::var("SCION_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let name = format!("scion_restore_attack_stopped_{}", std::process::id());
+    let mut maker = postgres::Client::connect(&base, postgres::NoTls).unwrap();
+    maker
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {name}"))
+        .unwrap();
+    maker
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .unwrap();
+    let url = format!(
+        "{}/{}",
+        base.rsplit_once('/')
+            .map_or(base.as_str(), |(rest, _)| rest),
+        name
+    );
+    // A real store, with data: one repo, one row the restore has no
+    // right to touch.
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open(data.path(), Some(&url), None).unwrap();
+    store.write(|c| c.create_repo("real").map(|_| ())).unwrap();
+    drop(store);
+    let repos_before: i64 = maker
+        .query_one("SELECT count(*) FROM repos", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(repos_before, 1, "the store holds its repo");
+
+    // The restore, at the stopped store's URL, into an empty target.
+    let (_keep, out, _main, _second) = sound_archive();
+    let target = tempfile::tempdir().unwrap().path().join("restored");
+    std::fs::create_dir_all(&target).unwrap();
+    let restored = archive::restore(&out, &target, Some(&url), None);
+    assert!(
+        restored.is_err(),
+        "a restore at a stopped store's URL must refuse, not drop it"
+    );
+    let why = format!("{:#}", restored.unwrap_err());
+    assert!(
+        why.contains("refuses to drop"),
+        "the refusal must say what it protects: {why}"
+    );
+    let repos_after: i64 = maker
+        .query_one("SELECT count(*) FROM public.repos", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(
+        repos_after, repos_before,
+        "the refused restore must leave the store's rows unchanged"
+    );
+    maker
+        .batch_execute(&format!("DROP DATABASE {name}"))
+        .unwrap();
+}
+
 /// The earlier half of the promise, made deterministic: the restore
 /// dies at its open — the opener fails before any table exists — so
 /// the database comes out exactly as it went in, without a single
