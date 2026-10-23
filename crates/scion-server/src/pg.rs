@@ -1888,6 +1888,11 @@ pub(crate) fn reset_schema(url: &str, ca: Option<&Path>) -> Result<()> {
     // setup asks the database `current_schema()` and locks that. A
     // refusal here is another server's hold, and the drop must not run.
     let client = connect_exclusive(url, ca, &options, None, Arc::new(Fence::new()))?;
+    // The drop waits out any stale table lock a dead replay's peer left
+    // behind (the lock clock is for writers, not for the cleanup that
+    // must not give up halfway), while a live store is already refused
+    // by the one-server lock above, before any drop runs.
+    client.batch("SET lock_timeout = 0; SET statement_timeout = 0")?;
     let schema: String = client.query("SELECT current_schema()", &[])?[0]
         .try_get(0)
         .map_err(|error| {

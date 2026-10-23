@@ -5,12 +5,10 @@
 //! its one writer and reader.
 
 use std::collections::{HashMap, HashSet};
-use std::ffi::OsStr;
 use std::fs;
 use std::io::{self, Read as _, Write as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
-use std::sync::OnceLock;
 
 use gix::ObjectId;
 use scion_core::{BlobId, Changeset, ChangesetId};
@@ -439,12 +437,22 @@ impl ReplayFrames {
 }
 
 /// Whether the replay's whole-file mutation lever is flipped. Test-hooks
-/// only: the ceiling job sets it to prove the guard is not vacuous.
+/// only: the ceiling job sets it to prove the guard is not vacuous. A
+/// default build has no lever: the environment is never read, and the
+/// replay always streams.
+#[cfg(any(test, feature = "test-hooks"))]
 fn mutation_whole_file() -> bool {
-    static ON: OnceLock<bool> = OnceLock::new();
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("SCION_RESTORE_MUTATION").as_deref() == Some(OsStr::new("whole_file"))
+        std::env::var_os("SCION_RESTORE_MUTATION").as_deref()
+            == Some(std::ffi::OsStr::new("whole_file"))
     })
+}
+
+/// The default build: no lever exists to flip.
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn mutation_whole_file() -> bool {
+    false
 }
 
 /// The restore with the store's opener chosen: the one seam the tests
@@ -833,14 +841,22 @@ fn replay_changesets(
 const DEFAULT_TX_BYTES: usize = 64 * 1024 * 1024;
 
 /// The replay's transaction byte budget: `SCION_RESTORE_TX_BYTES` when
-/// the operator (or a test's child process) names one, the caller's
-/// budget otherwise.
+/// a test's child process names one, the caller's budget otherwise.
+/// Test-hooks only: a default build never reads the environment, so a
+/// value set around a release binary cannot change a restore.
+#[cfg(any(test, feature = "test-hooks"))]
 fn replay_tx_bytes(asked: usize) -> usize {
     std::env::var("SCION_RESTORE_TX_BYTES")
         .ok()
         .and_then(|v| v.parse().ok())
         .filter(|v| *v > 0)
         .unwrap_or(asked)
+}
+
+/// The default build: the caller's budget, and the environment unread.
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn replay_tx_bytes(asked: usize) -> usize {
+    asked
 }
 
 /// One line per committed batch when the operator asks for it: a
@@ -851,9 +867,14 @@ fn restore_batch_note(name: &str, batch: u64) {
     if batch.is_multiple_of(1000) {
         tracing::info!(repo = name, batch, "restore: batch committed");
     }
+    // The echo is the seam a test watches before it kills the replay:
+    // test-hooks only, so a default build's stderr is the operator's,
+    // whatever the environment says.
+    #[cfg(any(test, feature = "test-hooks"))]
     if std::env::var_os("SCION_RESTORE_ECHO_BATCH").is_some() {
         eprintln!("restore: {name} batch {batch} committed");
     }
+    let _ = (name, batch);
 }
 
 /// The transactions the restores of this process committed, for the
@@ -1079,6 +1100,10 @@ fn write_changesets(path: &Path, changesets: &[(ChangesetId, i64, Vec<u8>)]) -> 
 pub(crate) struct Frames {
     inner: io::BufReader<fs::File>,
     path: std::path::PathBuf,
+    /// The file's whole length, read once at open: a record whose
+    /// claimed body length runs past the file's end is torn, and the
+    /// claim never becomes an allocation.
+    remaining: u64,
 }
 
 impl Frames {
@@ -1088,9 +1113,12 @@ impl Frames {
     ///
     /// Why the file cannot be opened.
     pub(crate) fn open(path: &Path) -> Result<Self> {
+        let file = fs::File::open(path)?;
+        let remaining = file.metadata()?.len();
         Ok(Self {
-            inner: io::BufReader::new(fs::File::open(path)?),
+            inner: io::BufReader::new(file),
             path: path.to_path_buf(),
+            remaining,
         })
     }
 
@@ -1112,6 +1140,7 @@ impl Frames {
         if at == 0 {
             return Ok(None);
         }
+        self.remaining -= at as u64;
         if at < prefix.len() {
             return Err(torn(&self.path));
         }
@@ -1119,8 +1148,17 @@ impl Frames {
         let len = usize::try_from(len).map_err(|_| torn(&self.path))?;
         let generation =
             i64::from_le_bytes(prefix[36..44].try_into().map_err(|_| torn(&self.path))?);
+        // The length is a claim from the bytes: a claim past the file's
+        // own end is a torn record, and the file's tail is never read
+        // into a 4 GiB buffer of zeros to find that out.
+        if len as u64 > self.remaining {
+            return Err(torn(&self.path));
+        }
         let mut body = vec![0_u8; len];
-        self.inner.read_exact(&mut body)?;
+        self.inner
+            .read_exact(&mut body)
+            .map_err(|_| torn(&self.path))?;
+        self.remaining -= len as u64;
         let id = ChangesetId::try_from(&prefix[4..36]).map_err(|error| {
             Error::Corrupt(format!(
                 "{} holds a bad changeset ID: {error}",
