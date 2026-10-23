@@ -341,6 +341,7 @@ pg_restart() {
   if [ -z "${SCION_FAULT_PG_CMD:-}" ]; then
     die "SCION_FAULT_PG=1 needs SCION_FAULT_PG_CMD"
   fi
+  PG_RESTARTS=$((PG_RESTARTS + 1))
   sh -c "$SCION_FAULT_PG_CMD" >> "$WORK/pg.log" 2>&1
   local n=0
   until pg_isready -q 2> /dev/null; do
@@ -356,6 +357,7 @@ note "fault-soaking for $RUN_MINUTES minutes, ${#KILL_AT[@]} kills"
 # (a du failure inside the loop must survive to the end: #561 review
 # F1 caught fail=0 reseting it after the loop).
 fail=0
+PG_RESTARTS=0
 mkdir -p "$WORK/read" "$WORK/cancel" "$WORK/ledger" "$WORK/seed"
 END=$(($(date +%s) + RUN_MINUTES * 60))
 T0=$(date +%s)
@@ -634,6 +636,9 @@ if [ "$served" != "$asked_backend" ]; then
   echo "FAIL: asked for $asked_backend, the data dir says $served" >&2
   fail=1
 fi
+# The Postgres restarts this run made (0 on the SQLite backend; the
+# fault-soak-postgres job's summary shows the fault really ran).
+[ "${SCION_FAULT_PG:-0}" = "1" ] && row "postgres restarts" "$PG_RESTARTS"
 # A run shorter than the warm-up floor checks no per-segment RSS bound
 # and says so here: the floors the bounds need cannot exist, and the
 # no-sample exception above covers the same runs.
