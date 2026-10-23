@@ -16,6 +16,276 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Added
 
+- # gc writes the audit's first admin lines
+  
+  The collector subcommand records one `admin`/`intent` line before its
+  run and one result after it: `admin`/`ok` with the report's counts, or
+  `admin`/`failed` with the storage class of the error. `--audit-file`
+  puts the CLI's lines in the same file the server appends to, so one
+  audit log holds the whole history of a data directory. The golden pins
+  the new `admin`/`intent` kind and the `admin`/`ok` line's fields; a
+  source run that fails after its intent is declared undriven for now,
+  with its reason in the golden's census.
+- # import and restore write the audit's next admin lines
+  
+  The import subcommand records one `admin`/`intent` line before its run
+  and one `admin`/`ok` after it, with the import's counts: the commits it
+  saw, the ones it stored, the ones it verified, and whether it moved the
+  target ref. The restore subcommand records the same pair around its
+  replay, in the restored store's own `audit.log`, with the counts the
+  restore reports: repos, refs, and pending lands. Both take
+  `--audit-file`, with the same default as `gc`. The golden's
+  `admin`/`intent` and `admin`/`ok` sections grow the fields of the new
+  lines. The fix that made this possible: `verify` and `restore` sat
+  behind an `unreachable!` in the store-open match since the archive
+  landed, so both subcommands panicked instead of running; they now run
+  before the store opens.
+- # The admin lines cover every state-changing command
+  
+  The last admin actions join the audit. The `derive` subcommand records
+  one `admin`/`intent` line before its backfill and one `admin`/`ok` after
+  it, with the kind and the rows the run wrote and removed; a failed run
+  records `admin`/`failed` with the class. Making the counts real,
+  `backfill` returns a `DeriveReport` (the kind's name, the rows it wrote,
+  the rows of older versions it removed) instead of a bare name.
+  
+  An open that migrates a store's schema records one
+  `admin`/`ok` line `{what: migrate, from, to}` as soon as the audit can
+  open, before the command's own pair: the migration ran inside the
+  store's open, before the audit could exist, so no intent can precede
+  it. A fresh open creates the schema and reports no migration. Both
+  engines report their move: a Postgres open runs its own migrations at
+  open, and its runner reports the versions the same way SQLite's does.
+  
+  The `ticket-key` subcommand records one intent before the key exists
+  and one ok after it is on the disk. The lines carry the what and
+  nothing else: never the seed, the key bytes, or the key file's path,
+  in any encoding the test searches for.
+  
+  The golden's `admin`/`intent` and `admin`/`ok` sections grow the new
+  fields; no new (event, outcome) kind appears. With this slice every
+  state-changing CLI command writes its admin lines, and #385's admin
+  item is complete: gc, import, restore, derive, the schema migration,
+  and ticket-key generation all record what they changed.
+- The server records an audit log: an append-only JSON-lines file of
+  authentication, writes, ref changes, lands and administrative
+  changes, with no tokens and no contents.
+  
+  The file sits in the data directory (mode 0600, `--audit-file`
+  relocates it, no disable flag) and one writer thread owns it: callers
+  hand lines to a bounded channel, the writer drains the queue, writes
+  and fsyncs once per drain, and wakes each caller when its own lines
+  are durable. A state change records two lines: an `intent` line
+  fsynced before the change, and a `result` line after it, joined by
+  request ID; a read records one. Every intent gets its result: a call
+  that dies before its job starts is answered `cancelled` by the call's
+  drop, and a land the stale-land sweep rejects is answered `stale` by
+  the sweep. One case can leave a result missing: a job that dies after
+  it claimed the call but before it recorded anything — the server log
+  carries what the audit line cannot. If the audit append fails, the
+  change is refused and readiness reports not-ready. Refused
+  authentication is aggregated per peer per interval into one counted
+  line, capped.
+  
+  The write, land and ref events carry what an operator needs and no
+  contents: the RPC, the repo, the ref, the byte count of an upload,
+  the land's state and ID, and a ref move's old and new changeset IDs.
+  A changeset ID names content the caller already had; a blob or tree
+  digest would name contents, so none appears.
+  
+  On open, a file whose last line has no newline gets one, so a line
+  that a full drive cut in the middle stays a fragment of its own and
+  cannot swallow the lines that follow.
+  
+  A land's ref line names the head the move replaced, read where the
+  move happens, under the ref's lock, and is written only by the call
+  that made the move. A replayed land (the same request key after it
+  landed) moved nothing, so its land line names no old and no ref line
+  appears for it; an auditor finds the head the move replaced in the
+  land line of the call that made the move, under the same land_id.
+  The ref lines of a ref carry the ref's true history: each old is the
+  head its move's CAS replaced, so linking old to new rebuilds the
+  history. The lines of concurrent changes can appear in a different
+  order than the changes themselves (each job records its result after
+  its change), so the history is linked, not read in line order.
+  
+  Blob and tree digests are never logged (a digest is a dictionary key
+  to contents), and neither are token bytes or token hashes. Rotation
+  is by size, keeps a bounded number of old files, and names what it
+  dropped in an admin line.
+  
+  Not covered yet: the ref moves that happen outside the server.
+  Import moves a ref to each imported tip (import.rs), and archive
+  restore writes refs back (restore_ref); they run as their own
+  processes and cannot hand lines to the server's writer, so they must
+  append their own lines to the same audit file, intent before the
+  move. Until they do, a reader of the log must not take it as
+  complete: a ref can move without a line.
+- # The metric surface's golden
+  
+  The `/metrics` registry joins the machine-checked surfaces: a
+  checked-in golden (`crates/scion-proto/tests/metrics_v1.golden`) pins
+  every `scion_*` name the registry renders, its `# TYPE`, and its
+  labels and label values - names, types and labels are the surface,
+  the sample values are this run's counts and pin nothing. The test
+  exercises the registry end to end first (one request per RPC path,
+  one cancelled, one failed, every gauge and histogram), because
+  histograms render only once they counted. The stalled gauge hides
+  until a reply stalls, so its name, type and label set pin in a unit
+  test beside the render. A diff in the golden is a surface change: a
+  removed name or a changed type is a break, never a re-pin; re-pin an
+  added name on purpose with `SCION_UPDATE_METRICS_GOLDEN=1`.
+- The fault matrix runs its disk, power and mount rows on Postgres beside
+  SQLite: the `mount (NFS)`, `power-loss` and `test (postgres)` jobs each
+  run the Postgres arm of their suite, and `docs/faults.md` says which half
+  of each fault every run proves on Postgres (the blob files in the data
+  directory; the metadata in Postgres's own WAL). The tier row is marked
+  N/A: the tier keeps its own object cache and takes no metadata backend.
+  
+  The busy row now runs on both backends in one test: Postgres blocks
+  through an open transaction of a second connection, SQLite through
+  `BEGIN IMMEDIATE` on the same file, and both answer busy inside the
+  same four-to-twenty-second window.
+  
+  On Postgres, a database that answers SQLSTATE `53100` (out of space)
+  maps to `Storage::disk_full` and the fixed `ResourceExhausted` reply, a
+  unit test of the mapping in `pg.rs` pins the SQLSTATE, the class and the
+  reply text; the stale comments that pointed at error.rs say the same.
+- # gc writes the audit's first admin lines
+  
+  The collector subcommand records one `admin`/`intent` line before its
+  run and one result after it: `admin`/`ok` with the report's counts, or
+  `admin`/`failed` with the storage class of the error. `--audit-file`
+  puts the CLI's lines in the same file the server appends to, so one
+  audit log holds the whole history of a data directory. The golden pins
+  the new `admin`/`intent` kind and the `admin`/`ok` line's fields; a
+  source run that fails after its intent is declared undriven for now,
+  with its reason in the golden's census.
+- # import and restore write the audit's next admin lines
+  
+  The import subcommand records one `admin`/`intent` line before its run
+  and one `admin`/`ok` after it, with the import's counts: the commits it
+  saw, the ones it stored, the ones it verified, and whether it moved the
+  target ref. The restore subcommand records the same pair around its
+  replay, in the restored store's own `audit.log`, with the counts the
+  restore reports: repos, refs, and pending lands. Both take
+  `--audit-file`, with the same default as `gc`. The golden's
+  `admin`/`intent` and `admin`/`ok` sections grow the fields of the new
+  lines. The fix that made this possible: `verify` and `restore` sat
+  behind an `unreachable!` in the store-open match since the archive
+  landed, so both subcommands panicked instead of running; they now run
+  before the store opens.
+- # The admin lines cover every state-changing command
+  
+  The last admin actions join the audit. The `derive` subcommand records
+  one `admin`/`intent` line before its backfill and one `admin`/`ok` after
+  it, with the kind and the rows the run wrote and removed; a failed run
+  records `admin`/`failed` with the class. Making the counts real,
+  `backfill` returns a `DeriveReport` (the kind's name, the rows it wrote,
+  the rows of older versions it removed) instead of a bare name.
+  
+  An open that migrates a store's schema records one
+  `admin`/`ok` line `{what: migrate, from, to}` as soon as the audit can
+  open, before the command's own pair: the migration ran inside the
+  store's open, before the audit could exist, so no intent can precede
+  it. A fresh open creates the schema and reports no migration. Both
+  engines report their move: a Postgres open runs its own migrations at
+  open, and its runner reports the versions the same way SQLite's does.
+  
+  The `ticket-key` subcommand records one intent before the key exists
+  and one ok after it is on the disk. The lines carry the what and
+  nothing else: never the seed, the key bytes, or the key file's path,
+  in any encoding the test searches for.
+  
+  The golden's `admin`/`intent` and `admin`/`ok` sections grow the new
+  fields; no new (event, outcome) kind appears. With this slice every
+  state-changing CLI command writes its admin lines, and #385's admin
+  item is complete: gc, import, restore, derive, the schema migration,
+  and ticket-key generation all record what they changed.
+- The server records an audit log: an append-only JSON-lines file of
+  authentication, writes, ref changes, lands and administrative
+  changes, with no tokens and no contents.
+  
+  The file sits in the data directory (mode 0600, `--audit-file`
+  relocates it, no disable flag) and one writer thread owns it: callers
+  hand lines to a bounded channel, the writer drains the queue, writes
+  and fsyncs once per drain, and wakes each caller when its own lines
+  are durable. A state change records two lines: an `intent` line
+  fsynced before the change, and a `result` line after it, joined by
+  request ID; a read records one. Every intent gets its result: a call
+  that dies before its job starts is answered `cancelled` by the call's
+  drop, and a land the stale-land sweep rejects is answered `stale` by
+  the sweep. One case can leave a result missing: a job that dies after
+  it claimed the call but before it recorded anything — the server log
+  carries what the audit line cannot. If the audit append fails, the
+  change is refused and readiness reports not-ready. Refused
+  authentication is aggregated per peer per interval into one counted
+  line, capped.
+  
+  The write, land and ref events carry what an operator needs and no
+  contents: the RPC, the repo, the ref, the byte count of an upload,
+  the land's state and ID, and a ref move's old and new changeset IDs.
+  A changeset ID names content the caller already had; a blob or tree
+  digest would name contents, so none appears.
+  
+  On open, a file whose last line has no newline gets one, so a line
+  that a full drive cut in the middle stays a fragment of its own and
+  cannot swallow the lines that follow.
+  
+  A land's ref line names the head the move replaced, read where the
+  move happens, under the ref's lock, and is written only by the call
+  that made the move. A replayed land (the same request key after it
+  landed) moved nothing, so its land line names no old and no ref line
+  appears for it; an auditor finds the head the move replaced in the
+  land line of the call that made the move, under the same land_id.
+  The ref lines of a ref carry the ref's true history: each old is the
+  head its move's CAS replaced, so linking old to new rebuilds the
+  history. The lines of concurrent changes can appear in a different
+  order than the changes themselves (each job records its result after
+  its change), so the history is linked, not read in line order.
+  
+  Blob and tree digests are never logged (a digest is a dictionary key
+  to contents), and neither are token bytes or token hashes. Rotation
+  is by size, keeps a bounded number of old files, and names what it
+  dropped in an admin line.
+  
+  Not covered yet: the ref moves that happen outside the server.
+  Import moves a ref to each imported tip (import.rs), and archive
+  restore writes refs back (restore_ref); they run as their own
+  processes and cannot hand lines to the server's writer, so they must
+  append their own lines to the same audit file, intent before the
+  move. Until they do, a reader of the log must not take it as
+  complete: a ref can move without a line.
+- # The metric surface's golden
+  
+  The `/metrics` registry joins the machine-checked surfaces: a
+  checked-in golden (`crates/scion-proto/tests/metrics_v1.golden`) pins
+  every `scion_*` name the registry renders, its `# TYPE`, and its
+  labels and label values - names, types and labels are the surface,
+  the sample values are this run's counts and pin nothing. The test
+  exercises the registry end to end first (one request per RPC path,
+  one cancelled, one failed, every gauge and histogram), because
+  histograms render only once they counted. The stalled gauge hides
+  until a reply stalls, so its name, type and label set pin in a unit
+  test beside the render. A diff in the golden is a surface change: a
+  removed name or a changed type is a break, never a re-pin; re-pin an
+  added name on purpose with `SCION_UPDATE_METRICS_GOLDEN=1`.
+- The fault matrix runs its disk, power and mount rows on Postgres beside
+  SQLite: the `mount (NFS)`, `power-loss` and `test (postgres)` jobs each
+  run the Postgres arm of their suite, and `docs/faults.md` says which half
+  of each fault every run proves on Postgres (the blob files in the data
+  directory; the metadata in Postgres's own WAL). The tier row is marked
+  N/A: the tier keeps its own object cache and takes no metadata backend.
+  
+  The busy row now runs on both backends in one test: Postgres blocks
+  through an open transaction of a second connection, SQLite through
+  `BEGIN IMMEDIATE` on the same file, and both answer busy inside the
+  same four-to-twenty-second window.
+  
+  On Postgres, a database that answers SQLSTATE `53100` (out of space)
+  maps to `Storage::disk_full` and the fixed `ResourceExhausted` reply, a
+  unit test of the mapping in `pg.rs` pins the SQLSTATE, the class and the
+  reply text; the stale comments that pointed at error.rs say the same.
 - # The archive's golden
   
   The archive format joins the machine-checked surfaces: a checked-in
@@ -769,6 +1039,24 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Changed
 
+- - The graph queries read their merges' parents and their side branches
+    from caches that a chain page fills: one `parents_many` statement for
+    the page's parents and one node batch for those parents, instead of
+    one parents statement per merge. The walk order is unchanged.
+- a pull request runs only the fast tier: fmt + clippy, the SQLite
+  tests with 500 proptest cases and the docs tests. A pull request
+  that touched only docs, markdown or changelog fragments runs the
+  docs tests alone; a draft pull request skips every job. Main, the
+  nightly and a dispatch run the full suite as before.
+- - The graph queries read their merges' parents and their side branches
+    from caches that a chain page fills: one `parents_many` statement for
+    the page's parents and one node batch for those parents, instead of
+    one parents statement per merge. The walk order is unchanged.
+- a pull request runs only the fast tier: fmt + clippy, the SQLite
+  tests with 500 proptest cases and the docs tests. A pull request
+  that touched only docs, markdown or changelog fragments runs the
+  docs tests alone; a draft pull request skips every job. Main, the
+  nightly and a dispatch run the full suite as before.
 - # The fuzz campaign: a wider target, a dispatchable budget
   
   ## The archive section readers gain their own target
@@ -1061,6 +1349,110 @@ The first release: the server, its cache tiers, and the `scn` client.
 
 ### Fixed
 
+- An error reply of a land now waits for the store's flush before it goes
+  out, the same durability barrier a successful reply already waited for.
+  A reply that says the land stays pending rests on the row the land
+  recorded, and that row is durable before the reply is sent, so a crash
+  that follows the reply cannot lose it.
+- The import's changeset rows are written in batches: the changesets row
+  lands per commit (the derived rows of the same commit name it by an
+  immediate foreign key), and the parents and the repo membership of a
+  transaction's changesets wait for the flush at the transaction's end,
+  one statement per 1,000 rows per table. The parents' generations chain
+  through the generation cache, so the batch reads the database only for
+  the parents it did not insert, usually the first commit's. An import of
+  1,000 commits costs about one changeset statement per commit plus a
+  handful per transaction, instead of four per commit. When the last
+  per-commit writer of a commit moves into the batch, the changesets row
+  moves with it, and every table writes at the transaction's end in the
+  order the foreign keys read: changesets, changeset_parents,
+  repo_changesets, derived, history, git_import.
+- - The `CreateChangeset` write stops its blob checks at the call's
+    deadline: the check re-hashes every distinct blob the changeset puts,
+    so a big changeset would otherwise keep hashing after the client gave
+    up. Nothing is written when the call is gone or its deadline passed,
+    and the write's audit gets its one failed line.
+- The import's derived rows are written in batches: the values a
+  transaction inserted answer its own reads (the batch's derives chain
+  through them, and a jump outside the batch costs one preloaded
+  first-parent chain read per transaction, never one per commit), the
+  flush writes one statement per 1,000 rows, and the older-version delete
+  runs once per kind. The per-commit stored-value check waits for the
+  batch: the transaction's changesets are new, so nothing stored can
+  disagree. The flush's parents rows follow #540's numbering from zero,
+  which the squashed #545 still numbered from one.
+- The write path re-checks each blob's file inside its commit, so the
+  collector's sweep cannot leave a stored changeset naming a file it took.
+  PutBlob adds the repo's row on every store, not only when an earlier read
+  said the row was there, so a reply of ok leaves the blob named.
+- The collector's prune reads the bodies of a batch's unseen changesets
+  in one statement per 1,000 ids, and deletes a batch's dead rows in one
+  statement, where the per-item code read one body and deleted one row
+  per statement: a repo of 100,000 changesets paid over 200,000
+  statements a run on Postgres. The measured prune of 1,000 rows and
+  1,000 prunable rows costs the same 17 statements as a repo of 100,
+  where the per-item code cost 156 more (#520's batch shape, = ANY).
+- The root-tree derivation reads a commit's directory trees in one
+  statement per level of depth, where the per-directory code read one
+  tree per statement: a commit that touches 100 stored directories paid
+  101 tree reads on Postgres, one in 10 paid 11. The trees hand their
+  entries over whole (Tree::into_entries), so a prefetched tree is no
+  longer decoded and then cloned; the bytes are checked against their
+  ids, as the single read does.
+- The import and the restore write their git provenance in batches: one
+  statement per 1,000 pairs on Postgres (= ANY over bytea arrays), where
+  the per-commit code wrote one git_import row per statement - a
+  100,000-commit import or restore paid 100,000 statements. The pairs of
+  one import transaction leave in one call at the transaction's end, so
+  a crash still loses whole commits, never a changeset without its
+  provenance row, and a repeated pair is still skipped, not overwritten.
+- A land's verdict is final only against the head it was planned on: the
+  settle now re-reads the ref version inside its own transaction, and an
+  import that moved the ref between the plan and the settle makes the land
+  replan instead of recording a stale answer.
+- The one-server lock of a Postgres store was one key for the whole
+  database: a second server against the same database was refused, even
+  when its URL named a different schema through `options`. The lock now
+  keys on what the connection actually lands in — the open asks the
+  database `current_schema()` — so a plain URL and one that rides
+  `--search_path=public` fence each other (same schema, one lock), and
+  two URLs that ride different schemas each fence their own. A URL that
+  names a schema can now serve beside another server of the same
+  database; that is a production behavior change, and the reason the
+  tests of one database can hold one server each.
+- - A data directory whose marker names a store refuses a database
+    schema that holds no store, so a `--postgres-url` whose search_path
+    names the wrong or a new schema fails at the start, naming the
+    directory's store, instead of adopting its identity into an empty
+    store that every later call reads as "repo not found". A schema that
+    holds a store's rows but no store UUID row - a dump taken before the
+    UUID existed - is still adopted.
+- - The fault scripts hand `--postgres-url` to the server root command
+    before the subcommand again: `serve`, `import`, `gc` and `fsck` take
+    no such flag of their own, so the NFS mount job's Postgres run failed
+    to start since the fault-matrix change.
+- Postgres numbered a changeset's parents from one (WITH ORDINALITY
+  starts at one) where SQLite numbers them from zero, so every
+  first-parent read (`n = 0`) matched nothing on real Postgres data: a
+  chain fetch walked one changeset and stopped, and the savings the
+  first-parent chain fetch promises never happened on Postgres. The
+  insert now shifts the ordinality down, so both backends put the first
+  parent at n = 0, and a migration renumbers the one-based rows of an
+  existing store (only the rows of a changeset whose smallest n is 1
+  move, in two steps that never hold a duplicate of the primary key, and
+  the migration changes nothing on a store that is already zero-based).
+  The guard tests pin the numbering on both backends, chain a 300-deep
+  ladder through the ordinary path, migrate a one-based store, and hold
+  the bulk seed to the rows the ordinary path writes.
+  
+  Proof: crates/scion-server/tests/pg_parent_numbering.rs
+- The tier job that decides what a pull request runs now starts the
+  Postgres tests for any change under the server's `src/`, not only for
+  the Postgres, metadata, backend and db files: the server's correctness
+  depends on the Postgres transaction order. A test under
+  `crates/scion-server/tests/` opts in when its text names the shared
+  backend (`open_test_shared`) or the env var (`SCION_TEST_BACKEND`),
+  instead of a hand list.
 - The check that reads an extended ACL on macOS treated any
   `acl_get_entry` failure as the end of the walk, so a walk that failed
   partway answered "deny only" and the ACL passed.
