@@ -164,6 +164,8 @@ jobs:
       # actionlint release is pinned by version and sha256.
       - name: the workflows parse (actionlint)
         run: scripts/lint-workflows.sh
+      - name: a script that dies leaves no owned process
+        run: scripts/test-owned-run.sh
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
