@@ -137,13 +137,13 @@ fn take_put_pause() {
 fn take_put_pause() {}
 
 /// Whether the streaming put's whole-file mutation lever is flipped
-/// (SCION_COMMIT_MUTATION = whole_file). Test-hooks only: the ceiling
-/// guard sets it to prove the guard is not vacuous.
+/// (SCION_TEST_COMMIT_MUTATION = whole_file). Test-hooks only: the
+/// ceiling guard sets it to prove the guard is not vacuous.
 #[cfg(any(test, feature = "test-hooks"))]
 fn mutation_whole_file() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ON.get_or_init(|| {
-        std::env::var_os("SCION_COMMIT_MUTATION").as_deref()
+        std::env::var_os("SCION_TEST_COMMIT_MUTATION").as_deref()
             == Some(std::ffi::OsStr::new("whole_file"))
     })
 }
