@@ -171,6 +171,14 @@ jobs:
           ulimit -v 6291456
           # shellcheck disable=SC1090
           source <(cargo llvm-cov show-env --sh)
+          # The build phase writes profiles too: instrumented
+          # proc-macro and build-script processes run while cargo
+          # compiles, and their counters map to no binary the report
+          # reads - they were the 794 "functions have mismatched data"
+          # the corrected split still printed. So the build runs with
+          # profiles discarded, and only the run phase writes them.
+          LLVM_PROFILE_FILE=/dev/null nice -n 19 cargo nextest run \
+            --workspace --no-run
           # One .profraw per test process made thousands per job, and
           # the runner was lost four runs in a row with no log (#565).
           # The %4m pool folds them into four files per test binary.
@@ -323,6 +331,8 @@ jobs:
           # under postgres plus instrumentation, because the ancestry
           # walk issues one query per node link. Remove this exclusion
           # when the batched ancestry walk lands.
+          LLVM_PROFILE_FILE=/dev/null nice -n 19 cargo nextest run \
+            --workspace --no-run
           nice -n 19 cargo nextest run --workspace --no-fail-fast \
             -E 'package(open-scion-server) and not test(graph_queries_across_many_merges_answer)' \
             | tee measure-postgres.log
@@ -403,7 +413,7 @@ jobs:
           source <(cargo llvm-cov show-env --sh)
           export CARGO_LLVM_COV_TARGET_DIR="$PWD/target/coverage"
           export CARGO_TARGET_DIR="$PWD/target/coverage"
-          nice -n 19 cargo build --workspace --tests
+          LLVM_PROFILE_FILE=/dev/null nice -n 19 cargo build --workspace --tests
           cargo llvm-cov report --summary-only --fail-under-lines 80 \
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
             2> target/coverage/report-stderr.txt \
@@ -412,7 +422,10 @@ jobs:
           # silently into a warning. That is how the split lost the
           # whole Postgres side while the total read 84.86% (run
           # 39932392151: "794 functions have mismatched data", pg.rs
-          # 6%). Any count above zero fails this step.
+          # 6%). The measures discard their build-phase profiles and
+          # build one mapping flavor, so a correct merge maps every
+          # function and the count is zero; anything above zero fails
+          # this step.
           mismatches=$(grep -oE '[0-9]+ functions have mismatched data' \
             target/coverage/report-stderr.txt | grep -oE '[0-9]+' | head -1)
           mismatches=${mismatches:-0}
