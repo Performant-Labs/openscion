@@ -1871,8 +1871,34 @@ fn connect_with(
 /// a fresh store names no store, and the next open mints again. The
 /// tables the migration made stay (they are empty, and the next open's
 /// migration is idempotent); only the name goes.
-pub(crate) fn reset_identity(url: &str, ca: Option<&Path>) -> Result<()> {
-    connect_with(url, ca, "", None)?.batch("DELETE FROM store_uuid WHERE one = 1")
+/// Drops the schema the URL names and makes it again, empty: the
+/// restore's staging metadata lives there, and a killed restore's
+/// committed batches (a kill runs no failure path) or a replay that
+/// failed midway must not survive into the next run. Refuses when
+/// another process holds the schema's one-server lock: a live store is
+/// never dropped.
+///
+/// # Errors
+///
+/// Why the database could not be reached, or another server holds the
+/// schema.
+pub(crate) fn reset_schema(url: &str, ca: Option<&Path>) -> Result<()> {
+    let options = base_options();
+    // The one-server lock of the schema the connection lands in: the
+    // setup asks the database `current_schema()` and locks that. A
+    // refusal here is another server's hold, and the drop must not run.
+    let client = connect_exclusive(url, ca, &options, None, Arc::new(Fence::new()))?;
+    let schema: String = client.query("SELECT current_schema()", &[])?[0]
+        .try_get(0)
+        .map_err(|error| {
+            Error::Corrupt(format!("the database answers no current schema: {error}"))
+        })?;
+    // One batch: a crash between the drop and the create would leave
+    // the next open a database with no schema to land in.
+    client.batch(&format!(
+        "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}"
+    ))?;
+    Ok(())
 }
 
 /// [`connect_with`], as the one server process of the database: the
