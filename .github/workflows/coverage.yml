@@ -437,6 +437,10 @@ jobs:
           # is follow-up. The gate fails when the count rises above
           # the constant: new unmappable functions are a regression.
           # A lost side shows in guard 2's floors, not here.
+          # SHORTCUT: the 1221 are unnamed profile data the report
+          # drops; ceiling = the constant three dispatches agree on,
+          # upgrade path = name the set (C65), then lower the ceiling
+          # to what is left, ideally 0.
           mismatch_ceiling=1221
           mismatches=$(grep -oE '[0-9]+ functions have mismatched data' \
             target/coverage/report-stderr.txt | grep -oE '[0-9]+' | head -1)
