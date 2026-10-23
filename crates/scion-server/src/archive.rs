@@ -690,6 +690,12 @@ fn restore_into_with(
                 )?;
             }
             c.put_git_imports(repo_id, provenance)?;
+            // Publication is atomic with this transaction on Postgres:
+            // the store that answers reads must never carry the staging
+            // mark the next restore would drop it by. A kill after this
+            // transaction leaves a complete store with no mark - refused
+            // as a real store, which it now is.
+            c.clear_restore_mark()?;
             Ok(())
         })?;
         txs += 1;

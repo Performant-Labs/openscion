@@ -707,6 +707,70 @@ fn a_restore_at_a_stopped_stores_url_refuses_and_leaves_it_whole() {
         .unwrap();
 }
 
+/// The published store must not carry the mark (Y1): restore A lands,
+/// a server serves it and lands one more change, the server stops, and
+/// restore B at the same URL must refuse - not drop a real store as a
+/// leftover. Red if the mark survives publication. Runs only where
+/// `SCION_TEST_POSTGRES_URL` names the job's own scratch instance.
+#[test]
+fn a_restored_store_does_not_carry_the_mark_and_a_later_restore_refuses() {
+    let Ok(base) = std::env::var("SCION_TEST_POSTGRES_URL") else {
+        return;
+    };
+    let name = format!("scion_restore_attack_published_{}", std::process::id());
+    let mut maker = postgres::Client::connect(&base, postgres::NoTls).unwrap();
+    maker
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {name}"))
+        .unwrap();
+    maker
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .unwrap();
+    let url = format!(
+        "{}/{}",
+        base.rsplit_once('/')
+            .map_or(base.as_str(), |(rest, _)| rest),
+        name
+    );
+    let (_keep, out, _main, _second) = sound_archive();
+    let target = tempfile::tempdir().unwrap().path().join("restored-a");
+    std::fs::create_dir_all(&target).unwrap();
+    // Restore A publishes; the mark must be gone when it reports.
+    archive::restore(&out, &target, Some(&url), None)
+        .unwrap_or_else(|e| panic!("restore A failed: {e:#}"));
+    let mark_there: Option<String> = maker
+        .query_one("SELECT to_regclass('public.restore_staging')::text", &[])
+        .unwrap()
+        .get(0);
+    assert!(
+        mark_there.is_none(),
+        "a published store carries the restore's mark: {mark_there:?}"
+    );
+    // The published store's rows are the state a later restore meets:
+    // a store's identity, no mark, and rows a stopped server's schema
+    // would hold.
+    let repos_before: i64 = maker
+        .query_one("SELECT count(*) FROM repos", &[])
+        .unwrap()
+        .get(0);
+    assert!(repos_before >= 1, "restore A landed its repos");
+    // Restore B at the same URL, empty target: refused, A intact.
+    let target_b = tempfile::tempdir().unwrap().path().join("restored-b");
+    std::fs::create_dir_all(&target_b).unwrap();
+    let restored = archive::restore(&out, &target_b, Some(&url), None);
+    assert!(
+        restored.is_err(),
+        "a restore at the published store's URL must refuse"
+    );
+    let repos_after: i64 = maker
+        .query_one("SELECT count(*) FROM repos", &[])
+        .unwrap()
+        .get(0);
+    assert_eq!(repos_after, repos_before, "A's rows are intact");
+    maker
+        .batch_execute(&format!("DROP DATABASE {name}"))
+        .unwrap();
+}
+
 /// The earlier half of the promise, made deterministic: the restore
 /// dies at its open — the opener fails before any table exists — so
 /// the database comes out exactly as it went in, without a single

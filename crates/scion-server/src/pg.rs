@@ -4109,6 +4109,14 @@ impl MetaTx for PgTx<'_> {
             })
             .collect()
     }
+
+    fn clear_restore_mark(&mut self) -> Result<()> {
+        // Publication is atomic with this: the caller's transaction
+        // holds, so the store that answers reads never carries the
+        // mark, and a mark that survives only survives a kill.
+        self.c.batch("DROP TABLE IF EXISTS restore_staging")?;
+        Ok(())
+    }
 }
 
 /// The statement helpers of [`PgTx::bulk_seed`], outside the trait impl:
