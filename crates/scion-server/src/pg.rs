@@ -1867,6 +1867,15 @@ fn connect_with(
     spawn_client(url, ca, options, schema, false, None)
 }
 
+/// How long the schema reset's drop waits for a stale table lock: an
+/// admin session or a stuck backend cannot hold a failed restore
+/// forever, and a timeout leaves the schema behind, named for the
+/// next restore's start to reset. Longer than the writers' 5 s clock:
+/// the cleanup must not give up behind a peer that is merely slow.
+const RESET_LOCK_TIMEOUT: &str = "60s";
+/// The drop statement's own clock, above the lock's.
+const RESET_STATEMENT_TIMEOUT: &str = "120s";
+
 /// Undoes the identity a failed restore's open minted in the database:
 /// a fresh store names no store, and the next open mints again. The
 /// tables the migration made stay (they are empty, and the next open's
@@ -1888,11 +1897,13 @@ pub(crate) fn reset_schema(url: &str, ca: Option<&Path>) -> Result<()> {
     // setup asks the database `current_schema()` and locks that. A
     // refusal here is another server's hold, and the drop must not run.
     let client = connect_exclusive(url, ca, &options, None, Arc::new(Fence::new()))?;
-    // The drop waits out any stale table lock a dead replay's peer left
-    // behind (the lock clock is for writers, not for the cleanup that
-    // must not give up halfway), while a live store is already refused
-    // by the one-server lock above, before any drop runs.
-    client.batch("SET lock_timeout = 0; SET statement_timeout = 0")?;
+    // The drop waits out a stale table lock a dead replay's peer left
+    // behind - but on a clock, so a stuck backend cannot hold a failed
+    // restore forever. A live store is already refused by the
+    // one-server lock above, before any drop runs.
+    client.batch(&format!(
+        "SET lock_timeout = '{RESET_LOCK_TIMEOUT}'; SET statement_timeout = '{RESET_STATEMENT_TIMEOUT}'"
+    ))?;
     let schema: String = client.query("SELECT current_schema()", &[])?[0]
         .try_get(0)
         .map_err(|error| {
@@ -1900,9 +1911,13 @@ pub(crate) fn reset_schema(url: &str, ca: Option<&Path>) -> Result<()> {
         })?;
     // One batch: a crash between the drop and the create would leave
     // the next open a database with no schema to land in.
-    client.batch(&format!(
+    if let Err(why) = client.batch(&format!(
         "DROP SCHEMA IF EXISTS {schema} CASCADE; CREATE SCHEMA {schema}"
-    ))?;
+    )) {
+        return Err(Error::Corrupt(format!(
+            "the staging schema {schema} is left behind: {why}; the next restore's start resets it"
+        )));
+    }
     Ok(())
 }
 

@@ -13,6 +13,50 @@ use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPa
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::{Backend, archive, test_support::tree};
 
+static LOG: std::sync::LazyLock<Captured> = std::sync::LazyLock::new(Captured::default);
+
+#[derive(Clone, Default)]
+struct Captured(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for Captured {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0.lock().unwrap().extend_from_slice(buf);
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Captured {
+    type Writer = Captured;
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
+    }
+}
+
+/// Installs the one global subscriber, once: the restore's failure log
+/// lands in the buffer a test reads from its own mark.
+fn init_log() {
+    static INIT: std::sync::Once = std::sync::Once::new();
+    INIT.call_once(|| {
+        let subscriber = tracing_subscriber::fmt()
+            .with_ansi(false)
+            .with_max_level(tracing::level_filters::LevelFilter::TRACE)
+            .with_writer(Captured::clone(&*LOG))
+            .finish();
+        tracing::subscriber::set_global_default(subscriber).unwrap();
+    });
+}
+
+fn mark() -> usize {
+    LOG.0.lock().unwrap().len()
+}
+
+fn since(mark: usize) -> String {
+    String::from_utf8(LOG.0.lock().unwrap()[mark..].to_vec()).unwrap()
+}
+
 const REPO: &str = "main";
 const SECOND: &str = "second";
 
@@ -500,6 +544,101 @@ fn assert_pg_database_empty(check: &mut postgres::Client) {
         };
         assert_eq!(rows, 0, "{table} must be empty after a failed restore");
     }
+}
+
+/// The bounded cleanup: a lock held on the staging schema past the
+/// reset's clock must not hang the failed restore forever - the
+/// restore fails within the bound, one log line names the staging
+/// schema left behind, and the next restore, whose start resets the
+/// schema, succeeds once the lock is gone. Runs only where
+/// `SCION_TEST_POSTGRES_URL` names the job's own scratch instance.
+#[test]
+fn a_stale_lock_cannot_hang_the_failed_restore_and_the_next_one_lands() {
+    let Ok(base) = std::env::var("SCION_TEST_POSTGRES_URL") else {
+        return;
+    };
+    init_log();
+    let name = format!("scion_restore_attack_stale_{}", std::process::id());
+    let mut maker = postgres::Client::connect(&base, postgres::NoTls).unwrap();
+    maker
+        .batch_execute(&format!("DROP DATABASE IF EXISTS {name}"))
+        .unwrap();
+    maker
+        .batch_execute(&format!("CREATE DATABASE {name}"))
+        .unwrap();
+    let url = format!(
+        "{}/{}",
+        base.rsplit_once('/')
+            .map_or(base.as_str(), |(rest, _)| rest),
+        name
+    );
+    let (_keep, out, _main, _second) = sound_archive();
+    let empty = tempfile::tempdir().unwrap();
+    let holder_url = url.clone();
+    let (locked, wait_locked) = std::sync::mpsc::channel();
+    let holder = std::thread::spawn(move || {
+        let mut db = postgres::Client::connect(&holder_url, postgres::NoTls).unwrap();
+        // The lock goes down as soon as the restore's open has made its
+        // tables, and holds PAST the reset's 60 s lock clock: the
+        // failure-path drop must give up on the clock, not hang.
+        let started = std::time::Instant::now();
+        loop {
+            let there: Option<String> = db
+                .query_one("SELECT to_regclass('public.changesets')::text", &[])
+                .unwrap()
+                .get(0);
+            if there.is_some() {
+                db.batch_execute("BEGIN; LOCK TABLE changesets IN EXCLUSIVE MODE;")
+                    .unwrap();
+                let _ = locked.send(());
+                std::thread::sleep(std::time::Duration::from_secs(75));
+                let _ = db.batch_execute("COMMIT");
+                return;
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "the test database never gained its changesets table within 30 s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(200));
+        }
+    });
+    let mark = mark();
+    let started = std::time::Instant::now();
+    let restored = archive::restore_with(&out, empty.path(), Some(&url), None, |path, url, ca| {
+        let store = scion_server::Backend::open(path, url, ca)?;
+        wait_locked
+            .recv_timeout(std::time::Duration::from_secs(30))
+            .expect("the holder never took its table");
+        // The seam: the replay's first write dies as busy, and the
+        // cleanup's drop waits behind the holder's table lock.
+        store.fail_next_commits(1);
+        Ok(store)
+    });
+    assert!(
+        restored.is_err(),
+        "a replay whose store refuses its commit must not report success"
+    );
+    // Within the bound: the store's 5 s clock, then the reset's 60 s,
+    // not the forever the unbounded drop waited.
+    let took = started.elapsed();
+    assert!(
+        took < std::time::Duration::from_secs(110),
+        "the failed restore took {took:?}; the reset's clock did not bound it"
+    );
+    let log = since(mark);
+    assert!(
+        log.contains("is left behind"),
+        "the failure must name the staging schema it left behind: {log}"
+    );
+    holder.join().unwrap();
+    // The lock is gone: the next restore's start resets the leftover
+    // schema, and the restore lands whole.
+    let report = archive::restore(&out, empty.path(), Some(&url), None)
+        .unwrap_or_else(|e| panic!("the restore after the stale lock failed: {e:#}"));
+    assert_eq!(report.repos.len(), 2);
+    maker
+        .batch_execute(&format!("DROP DATABASE {name}"))
+        .unwrap();
 }
 
 /// The earlier half of the promise, made deterministic: the restore
