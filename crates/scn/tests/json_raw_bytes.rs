@@ -4,7 +4,7 @@
 //! (standard base64, with padding), so a script gets the real bytes
 //! back and two different names never print as one. A value that is
 //! valid UTF-8 prints exactly as before, with no sibling field — the
-//! golden (json_golden.rs) pins that shape.
+//! golden (`json_golden.rs`) pins that shape.
 
 #![cfg(unix)]
 
@@ -13,7 +13,7 @@ use std::process::Command;
 use std::sync::Arc;
 
 use base64::Engine as _;
-use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath};
+use scion_core::{BlobId, Changeset, FileState, IdentityTime, RepoPath};
 use scion_proto::runtime::listen::Limits;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::service;
@@ -36,7 +36,6 @@ const PADDED_NAME: &[u8] = b"thirteen-byt\x80";
 
 struct Fixture {
     url: String,
-    store: Backend,
     home: TempDir,
     /// The server runs on this runtime; dropped, the server stops.
     _runtime: tokio::runtime::Runtime,
@@ -107,7 +106,7 @@ impl Fixture {
         let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
         runtime.spawn(service::serve(
-            store.clone(),
+            store,
             listener,
             TOKEN,
             service::ServeOptions {
@@ -129,7 +128,6 @@ impl Fixture {
         let home = tempfile::tempdir().unwrap();
         Self {
             url,
-            store,
             home,
             _runtime: runtime,
         }
