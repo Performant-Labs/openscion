@@ -10,7 +10,7 @@ use std::fs;
 use std::process::{Command, Output};
 use std::sync::Arc;
 
-use open_scion::client::{set_put_pause, test_objects};
+use open_scion::client::set_put_pause;
 use scion_proto::runtime::listen::Limits;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::service;
@@ -22,8 +22,9 @@ const TOKEN: &str = "secret";
 const REPO: &str = "r";
 
 /// The pause hook is one per process, and the tests run in parallel:
-/// every hook user holds this from `set_put_pause` to its clear.
-static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+/// every hook user holds this from `set_put_pause` to its clear. A
+/// tokio mutex: the user's await sits inside.
+static HOOK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
 
 /// A server on an empty store, with one changeset to hold the ref.
 struct Fixture {
@@ -134,7 +135,9 @@ impl Fixture {
         let file = self.work.path().join(name);
         // Pseudorandom-ish, so a torn mix cannot pass a byte compare by
         // repeating one short pattern at a chunk boundary.
-        let bytes: Vec<u8> = (0..len).map(|i| (i * 7 % 251) as u8).collect();
+        let bytes: Vec<u8> = (0..len)
+            .map(|i| u8::try_from(i * 7 % 251).unwrap())
+            .collect();
         fs::write(&file, bytes).unwrap();
         file
     }
@@ -224,7 +227,8 @@ fn a_commit_of_a_big_file_stays_under_its_rss_ceiling() {
     let out = commit_measured(&fx, "huge.bin", &file);
     assert!(
         out.status.success(),
-        "commit failed: {}",
+        "commit failed: {}{}",
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
     let peak_kb = out.peak_kb;
@@ -239,7 +243,7 @@ fn a_commit_of_a_big_file_stays_under_its_rss_ceiling() {
 /// A commit's exit state plus the child process's peak RSS in kB. The
 /// measurement is `getrusage(RUSAGE_CHILDREN)`'s number, read the way
 /// each platform reports it: Linux through `/proc/<pid>/status`
-/// (VmHWM, kB), macOS through `/usr/bin/time -l` (the child's peak, in
+/// (`VmHWM`, kB), macOS through `/usr/bin/time -l` (the child's peak, in
 /// bytes). The libc call itself is unsafe, which this workspace denies,
 /// so the wrappers stand in for it.
 struct Measured {
@@ -286,7 +290,7 @@ fn commit_measured(fx: &Fixture, name: &str, file: &std::path::Path) -> Measured
             peak_kb: peak / 1024,
         }
     } else {
-        let mut child = Command::new(env!("CARGO_BIN_EXE_scn"))
+        let child = Command::new(env!("CARGO_BIN_EXE_scn"))
             .args(args)
             .arg(&put)
             .env("SCION_TOKEN", TOKEN)
@@ -331,7 +335,7 @@ async fn a_file_that_shrinks_while_it_is_read_is_refused() {
     let fx = Fixture::start_async().await;
     let file = fx.put_file("torn.bin", 2 * 1_048_576 + 7);
     let torn = file.clone();
-    let _hook = HOOK.lock().unwrap();
+    let _hook = HOOK.lock().await;
     set_put_pause(Some(Box::new(move || {
         // The pause sits between the metadata read and the first chunk:
         // the file loses its tail here.
@@ -344,7 +348,7 @@ async fn a_file_that_shrinks_while_it_is_read_is_refused() {
             .unwrap();
     let put = ctx.put_blob_file(&file).await;
     set_put_pause(None);
-    let err = put.err().expect("the shrunk file must refuse");
+    let err = put.expect_err("the shrunk file must refuse");
     assert!(
         err.to_string()
             .contains("changed while it was read; commit again"),
@@ -358,7 +362,7 @@ async fn a_file_that_grows_while_it_is_read_is_refused() {
     let fx = Fixture::start_async().await;
     let file = fx.put_file("grown.bin", 2 * 1_048_576 + 7);
     let grown = file.clone();
-    let _hook = HOOK.lock().unwrap();
+    let _hook = HOOK.lock().await;
     set_put_pause(Some(Box::new(move || {
         let mut bytes = fs::read(&grown).unwrap();
         bytes.push(0xff);
@@ -370,7 +374,7 @@ async fn a_file_that_grows_while_it_is_read_is_refused() {
             .unwrap();
     let put = ctx.put_blob_file(&file).await;
     set_put_pause(None);
-    let err = put.err().expect("the grown file must refuse");
+    let err = put.expect_err("the grown file must refuse");
     assert!(
         err.to_string()
             .contains("changed while it was read; commit again"),
@@ -385,7 +389,7 @@ async fn a_file_whose_mtime_changes_while_it_is_read_is_refused() {
     let fx = Fixture::start_async().await;
     let file = fx.put_file("touched.bin", 1_048_576 + 7);
     let touched = file.clone();
-    let _hook = HOOK.lock().unwrap();
+    let _hook = HOOK.lock().await;
     set_put_pause(Some(Box::new(move || {
         let new = fs::File::options().append(true).open(&touched).unwrap();
         new.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
@@ -397,7 +401,7 @@ async fn a_file_whose_mtime_changes_while_it_is_read_is_refused() {
             .unwrap();
     let put = ctx.put_blob_file(&file).await;
     set_put_pause(None);
-    let err = put.err().expect("the touched file must refuse");
+    let err = put.expect_err("the touched file must refuse");
     assert!(
         err.to_string()
             .contains("changed while it was read; commit again"),
@@ -412,7 +416,7 @@ async fn the_client_refuses_a_torn_file() {
     let fx = Fixture::start_async().await;
     let file = fx.put_file("direct.bin", 1_048_576 + 7);
     let torn = file.clone();
-    let _hook = HOOK.lock().unwrap();
+    let _hook = HOOK.lock().await;
     set_put_pause(Some(Box::new(move || {
         let short = fs::read(&torn).unwrap();
         fs::write(&torn, &short[..3]).unwrap();
@@ -423,7 +427,7 @@ async fn the_client_refuses_a_torn_file() {
             .unwrap();
     let put = ctx.put_blob_file(&file).await;
     set_put_pause(None);
-    let err = put.err().expect("the torn read must fail");
+    let err = put.expect_err("the torn read must fail");
     assert!(
         err.to_string().contains("changed while it was read"),
         "the refusal must name the change: {err:#}"
