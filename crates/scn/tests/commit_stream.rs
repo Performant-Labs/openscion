@@ -21,6 +21,10 @@ use tokio::net::TcpListener;
 const TOKEN: &str = "secret";
 const REPO: &str = "r";
 
+/// The pause hook is one per process, and the tests run in parallel:
+/// every hook user holds this from `set_put_pause` to its clear.
+static HOOK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// A server on an empty store, with one changeset to hold the ref.
 struct Fixture {
     url: String,
@@ -321,6 +325,7 @@ async fn a_file_that_shrinks_while_it_is_read_is_refused() {
     let fx = Fixture::start_async().await;
     let file = fx.put_file("torn.bin", 2 * 1_048_576 + 7);
     let torn = file.clone();
+    let _hook = HOOK.lock().unwrap();
     set_put_pause(Some(Box::new(move || {
         // The pause sits between the metadata read and the first chunk:
         // the file loses its tail here.
@@ -352,6 +357,7 @@ async fn a_file_that_grows_while_it_is_read_is_refused() {
     let fx = Fixture::start_async().await;
     let file = fx.put_file("grown.bin", 2 * 1_048_576 + 7);
     let grown = file.clone();
+    let _hook = HOOK.lock().unwrap();
     set_put_pause(Some(Box::new(move || {
         let mut bytes = fs::read(&grown).unwrap();
         bytes.push(0xff);
@@ -383,6 +389,7 @@ async fn a_file_whose_mtime_changes_while_it_is_read_is_refused() {
     let fx = Fixture::start_async().await;
     let file = fx.put_file("touched.bin", 1_048_576 + 7);
     let touched = file.clone();
+    let _hook = HOOK.lock().unwrap();
     set_put_pause(Some(Box::new(move || {
         let new = fs::File::options().append(true).open(&touched).unwrap();
         new.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
@@ -414,6 +421,7 @@ async fn the_client_refuses_a_torn_file() {
     let fx = Fixture::start_async().await;
     let file = fx.put_file("direct.bin", 1_048_576 + 7);
     let torn = file.clone();
+    let _hook = HOOK.lock().unwrap();
     set_put_pause(Some(Box::new(move || {
         let short = fs::read(&torn).unwrap();
         fs::write(&torn, &short[..3]).unwrap();
