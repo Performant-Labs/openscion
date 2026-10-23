@@ -414,12 +414,12 @@ jobs:
           export CARGO_LLVM_COV_TARGET_DIR="$PWD/target/coverage"
           export CARGO_TARGET_DIR="$PWD/target/coverage"
           # The gate rebuilds the exact compilation units the measures
-          # built: nextest's --no-run compiles the lib in test mode and
-          # every integration test, which plain `cargo build --tests`
-          # does not - the unit-test functions it leaves out were the
-          # 1221 "functions have mismatched data" that no amount of
-          # profile hygiene removed.
-          LLVM_PROFILE_FILE=/dev/null nice -n 19 cargo nextest run \
+          # built: `cargo test --no-run` compiles the lib in test mode
+          # and every integration test (what nextest builds too), which
+          # plain `cargo build --tests` does not - the unit-test
+          # functions it leaves out were the 1221 "functions have
+          # mismatched data" that no amount of profile hygiene removed.
+          LLVM_PROFILE_FILE=/dev/null nice -n 19 cargo test \
             --workspace --no-run
           cargo llvm-cov report --summary-only --fail-under-lines 80 \
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
