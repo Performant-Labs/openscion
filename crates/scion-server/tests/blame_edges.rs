@@ -10,6 +10,7 @@ use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{BlameChangeset, BlameRange, BlameRequest};
 use scion_server::Access;
+use scion_server::test_support::backend::from_store;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::{
     Backend,
@@ -82,7 +83,7 @@ fn commit(
 /// `root_body`, written by a 4-byte author.
 fn store(root_body: &[u8]) -> (tempfile::TempDir, Backend, ChangesetId) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+    let store = from_store(Store::open(dir.path()).unwrap());
     let blob = store.blobs().put(root_body).unwrap();
     let root = store
         .write(|c| {
@@ -135,6 +136,7 @@ async fn serve(
         access,
         service::ServeOptions {
             data: dir.to_path_buf(),
+            audit: scion_server::test_support::audit::Audit::off(),
             limits: Limits::default(),
             quotas: scion_server::Quotas::off(),
             pending_lands: None,
@@ -147,11 +149,7 @@ async fn serve(
             stopped.await.ok();
         },
     ));
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(&format!("http://{addr}")).await.unwrap();
     let client = ScionClient::with_interceptor(channel, Bearer(Some(token.to_string())));
     (stop, client)
 }
@@ -640,3 +638,6 @@ async fn an_older_version_with_too_many_lines_counts_as_absent() {
     assert_eq!(changesets[0].changeset_id, child.as_bytes().to_vec());
     assert!(next.is_empty(), "the walk explained the whole file");
 }
+
+#[path = "common/mod.rs"]
+mod common;

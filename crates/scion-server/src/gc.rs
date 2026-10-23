@@ -70,6 +70,60 @@ pub const SWEEP_BATCH: usize = 1000;
 /// every writer waits behind it.
 const PRUNE_BATCH: usize = 256;
 
+/// The changeset bodies one body fetch of the prune reads, at most: a
+/// chunk of bodies holds at most this many bytes of bodies, so its
+/// memory is the budget plus one body (a single body larger than the
+/// budget is a chunk of its own). The way the import batches size
+/// themselves.
+const PRUNE_BODY_BUDGET: usize = 64 * 1024 * 1024;
+
+/// A test's override of the byte budget, behind the test hooks: the gc
+/// has one caller per process, so a plain static needs no ordering.
+#[cfg(any(test, feature = "test-hooks"))]
+static TEST_BODY_BUDGET: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The byte budget one body fetch of the prune reads. A test can shrink
+/// it with [`test_set_body_budget`]; a build without the hooks, and a
+/// test that set nothing, runs the compiled budget.
+fn prune_body_budget() -> usize {
+    #[cfg(any(test, feature = "test-hooks"))]
+    {
+        let override_ = TEST_BODY_BUDGET.load(std::sync::atomic::Ordering::Relaxed);
+        if override_ > 0 {
+            return override_;
+        }
+    }
+    PRUNE_BODY_BUDGET
+}
+
+/// Shrinks the byte budget of the prune's body fetches, for a test that
+/// exercises the chunker on small bodies. Pass zero to reset.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn test_set_body_budget(bytes: usize) {
+    TEST_BODY_BUDGET.store(bytes, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// The body fetches the prune made since the last reset: one call to
+/// `stored_changeset_bodies` is one fetch. A test with a small byte
+/// budget asserts this is more than one, so the wiring really goes
+/// through the byte-budget chunker (a single fetch would mean the old
+/// row-chunked shape came back).
+#[cfg(any(test, feature = "test-hooks"))]
+static TEST_BODY_FETCHES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// The body fetches the prune made since the last reset.
+#[cfg(any(test, feature = "test-hooks"))]
+#[must_use]
+pub fn test_body_fetch_count() -> u64 {
+    TEST_BODY_FETCHES.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Sets the body-fetch count back to zero.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn test_reset_body_fetch_count() {
+    TEST_BODY_FETCHES.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// The time one prune transaction or sweep batch may hold the collector's
 /// key before the run says so in the log. The row cap bounds the hold;
 /// this clock only reports the batches that ran past it.
@@ -274,14 +328,39 @@ fn prune_rows(
         for chunk in dead.chunks(PRUNE_BATCH) {
             let started = std::time::Instant::now();
             store.write(|c| {
-                let mut fresh = BTreeSet::new();
+                // The changesets this repo gained since the snapshot walk:
+                // their IDs, collected under the write lock the deletes
+                // share.
+                let mut unseen = Vec::new();
                 for cs in c.repo_changeset_ids(repo)? {
                     let Ok(cs) = ChangesetId::try_from(cs.as_slice()) else {
                         continue; // fsck reports the bad ID
                     };
                     if seen.insert(cs) {
-                        let Some(body) = c.stored_changeset_body(cs.as_bytes())? else {
-                            continue;
+                        unseen.push(cs.as_bytes().to_vec());
+                    }
+                }
+                // The puts of every new changeset, bodies in chunks of at
+                // most [`PRUNE_BODY_BUDGET`] bytes: the lengths come
+                // first, then one fetch per byte-budget chunk, so a
+                // chunk's memory is the budget plus one body. A missing
+                // body is skipped, as the walk reads it: `fsck` reports
+                // it.
+                // The lengths, in row chunks of [`DERIVED_BATCH`]: ids
+                // and lengths only, 40 bytes a row, so holding them is
+                // fine; the statement must not grow with the repo (the
+                // C62 sweep class).
+                let mut lengths = Vec::new();
+                for ids in unseen.chunks(crate::meta::DERIVED_BATCH) {
+                    lengths.extend(c.stored_changeset_body_lengths(ids)?);
+                }
+                let mut fresh = BTreeSet::new();
+                for ids in bytes_chunks(&lengths, prune_body_budget()) {
+                    #[cfg(any(test, feature = "test-hooks"))]
+                    TEST_BODY_FETCHES.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    for (id, body) in c.stored_changeset_bodies(&ids)? {
+                        let Ok(cs) = ChangesetId::try_from(id.as_slice()) else {
+                            continue; // fsck reports the bad ID
                         };
                         let (cs, _) = Changeset::decode_with_id(&body)
                             .map_err(|e| crate::Error::Corrupt(format!("changeset {cs}: {e}")))?;
@@ -290,15 +369,16 @@ fn prune_rows(
                         }
                     }
                 }
-                for blob in chunk {
-                    if fresh.contains(blob) {
-                        continue;
-                    }
-                    if !dry_run {
-                        c.delete_repo_blob(repo, blob.as_bytes())?;
-                    }
-                    report.rows_pruned += 1;
+                // The chunk's dead rows leave in one statement.
+                let gone: Vec<Vec<u8>> = chunk
+                    .iter()
+                    .filter(|blob| !fresh.contains(*blob))
+                    .map(|blob| blob.as_bytes().to_vec())
+                    .collect();
+                if !dry_run && !gone.is_empty() {
+                    c.delete_repo_blobs(repo, &gone)?;
                 }
+                report.rows_pruned += u64::try_from(gone.len()).unwrap_or(u64::MAX);
                 Ok(())
             })?;
             tracing::info!(
@@ -326,6 +406,31 @@ fn prune_rows(
         }
     }
     Ok(())
+}
+
+/// Splits the id-length list into chunks of at most `budget` bytes of
+/// bodies, in the list's order: a chunk's memory is its bodies' bytes, so
+/// a body larger than the budget is a chunk of its own. Empty ids name no
+/// chunk, and a zero budget would loop forever, so the caller passes the
+/// compiled budget when the test hook asks for zero.
+fn bytes_chunks(lengths: &[(Vec<u8>, i64)], budget: usize) -> Vec<Vec<Vec<u8>>> {
+    let budget = budget.max(1);
+    let mut chunks: Vec<Vec<Vec<u8>>> = Vec::new();
+    let mut chunk: Vec<Vec<u8>> = Vec::new();
+    let mut sum: u64 = 0;
+    for (id, len) in lengths {
+        let len = (*len).max(0).cast_unsigned();
+        if !chunk.is_empty() && sum + len > budget as u64 {
+            chunks.push(std::mem::take(&mut chunk));
+            sum = 0;
+        }
+        sum += len;
+        chunk.push(id.clone());
+    }
+    if !chunk.is_empty() {
+        chunks.push(chunk);
+    }
+    chunks
 }
 
 /// Unlinks the blob files that no row names, oldest first.
@@ -466,6 +571,62 @@ mod tests {
     use std::time::Instant;
     use tempfile::TempDir;
 
+    /// A deadline a test does not reach.
+    fn later() -> Deadline {
+        Deadline::new(Instant::now() + std::time::Duration::from_secs(600))
+    }
+
+    /// The byte-budget chunker: a chunk holds at most `budget` bytes of
+    /// bodies, a body larger than the budget is a chunk of its own, and
+    /// the order is the list's order. This is the bound the prune's
+    /// memory promise rests on; the integration test proves the wiring
+    /// goes through it.
+    #[test]
+    fn body_chunks_hold_at_most_the_budget_of_bodies() {
+        let id = |n: u8| vec![n; 8];
+        // 4 bodies of 600 bytes against a 1,000-byte budget: 2 chunks of
+        // 2, 3, ... the exact split the running sum makes.
+        let lengths: Vec<(Vec<u8>, i64)> = (0..4).map(|n| (id(n), 600)).collect();
+        let chunks = bytes_chunks(&lengths, 1_000);
+        eprintln!(
+            "4 bodies of 600 bytes at a 1,000-byte budget: {} chunks",
+            chunks.len()
+        );
+        assert!(
+            chunks.len() > 1,
+            "many budgets of bodies take more than one chunk"
+        );
+        for chunk in &chunks {
+            let sum: u64 = chunk
+                .iter()
+                .map(|id| {
+                    lengths
+                        .iter()
+                        .find(|(other, _)| other == id)
+                        .map_or(0, |(_, len)| (*len).max(0).cast_unsigned())
+                })
+                .sum();
+            assert!(sum <= 1_000, "a chunk holds at most the budget: {sum}");
+        }
+        // A single body larger than the budget is a chunk of its own: it
+        // must not be dropped, and no chunk may hold two of them.
+        let big: Vec<(Vec<u8>, i64)> = vec![(id(1), 5_000), (id(2), 5_000), (id(3), 100)];
+        let chunks = bytes_chunks(&big, 1_000);
+        eprintln!(
+            "two 5,000-byte bodies and one 100-byte body at a 1,000-byte budget: {} chunks",
+            chunks.len()
+        );
+        assert_eq!(chunks.len(), 3);
+        // The order is the list's order, and every id lands exactly once.
+        let flat: Vec<Vec<u8>> = chunks.concat();
+        assert_eq!(flat, vec![id(1), id(2), id(3)]);
+        // Empty ids name no chunk.
+        assert_eq!(bytes_chunks(&[], 1_000), Vec::<Vec<Vec<u8>>>::new());
+        // A zero budget would loop forever: the chunker clamps it to one.
+        let chunks = bytes_chunks(&lengths, 0);
+        assert_eq!(chunks.len(), lengths.len());
+    }
+
     const REPO: &str = "gc";
     /// Older than the default grace of seven days.
     const OLD: Duration = Duration::from_secs(8 * 24 * 60 * 60);
@@ -509,7 +670,7 @@ mod tests {
                     &mut tx,
                     repo,
                     cs,
-                    &mut crate::tree::lens_of(&Backend::Sqlite(store.clone())),
+                    &mut crate::tree::lens_of(&Backend::sqlite(store.clone())),
                 )?;
                 let version = tx.get_ref(repo, "main")?.map(|r| r.version);
                 assert!(tx.cas_ref(repo, "main", version, id)?);
@@ -573,9 +734,9 @@ mod tests {
     fn gc_removes_what_nothing_names() {
         let (_dir, store) = store();
         let x = uploaded(&store, b"orphan\n");
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
         let report = collect(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
@@ -593,9 +754,9 @@ mod tests {
         let (_dir, store) = store();
         let x = store.blobs().put(b"kept\n").unwrap();
         land(&store, &cs(None, &[("a.txt", file_of(&store, b"kept\n"))]));
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
         let report = collect(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
@@ -609,7 +770,7 @@ mod tests {
         let (_dir, store) = store();
         let x = uploaded(&store, b"fresh\n");
         let report = collect(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
@@ -635,9 +796,9 @@ mod tests {
             &store,
             &cs(None, &[("a.txt", file_of(&store, b"shared\n"))]),
         );
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
         let report = collect(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
@@ -650,7 +811,7 @@ mod tests {
     fn a_changeset_after_the_snapshot_pins_its_blobs() {
         let (_dir, store) = store();
         let x = uploaded(&store, b"pinned\n");
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
         let mut injected = false;
         let report = {
             let store = &store;
@@ -669,7 +830,7 @@ mod tests {
                 }
             };
             collect(
-                &Backend::Sqlite(store.clone()),
+                &Backend::sqlite(store.clone()),
                 Duration::from_secs(DEFAULT_GRACE_SECS),
                 &mut between,
             )
@@ -685,7 +846,7 @@ mod tests {
         let (_dir, store) = store();
         let text = b"again\n";
         let x = uploaded(&store, text);
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
         let before = mtime_of(&store, x);
         std::thread::sleep(Duration::from_millis(20));
         // The second upload of the same content keeps the stored copy.
@@ -694,7 +855,7 @@ mod tests {
         assert!(after > before, "the keep must touch the file: {before:?}");
         // The touched file is younger than the grace, so the run keeps it.
         let report = collect(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
@@ -722,11 +883,11 @@ mod tests {
             deadline: Deadline::new(Instant::now()),
         };
         let err = lands
-            .land(&Backend::Sqlite(store.clone()), &Caller("t".into()), &req)
+            .land(&Backend::sqlite(store.clone()), &Caller("t".into()), &req)
             .unwrap_err();
         assert!(matches!(err, crate::Error::DeadlineExceeded(_)), "{err:?}");
         // Every stored blob is old, and nothing new is orphaned.
-        let report = collect(&Backend::Sqlite(store.clone()), Duration::ZERO, &mut |_| {});
+        let report = collect(&Backend::sqlite(store.clone()), Duration::ZERO, &mut |_| {});
         assert_eq!(report.rows_pruned, 0, "{report:?}");
         assert_eq!(report.files_removed, 0, "{report:?}");
     }
@@ -735,7 +896,7 @@ mod tests {
     fn rows_go_before_files_so_a_crash_leaves_no_missing_file() {
         let (_dir, store) = store();
         let x = uploaded(&store, b"crash\n");
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
         // What a crash between the two stages leaves: the rows are gone,
         // the file is an orphan.
         store
@@ -757,7 +918,7 @@ mod tests {
             })
             .unwrap();
         // The next run removes the orphan file.
-        let report = collect(&Backend::Sqlite(store.clone()), Duration::ZERO, &mut |_| {});
+        let report = collect(&Backend::sqlite(store.clone()), Duration::ZERO, &mut |_| {});
         assert_eq!(report.files_removed, 1, "{report:?}");
     }
 
@@ -766,16 +927,16 @@ mod tests {
         let (_dir, store) = store();
         let x = store.blobs().put(b"later\n").unwrap();
         let report = collect(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
         assert_eq!(report.files_young, 1, "{report:?}");
         assert_eq!(report.files_removed, 0, "{report:?}");
         // Once it is old, the next run removes it.
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
         let report = collect(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
@@ -794,7 +955,7 @@ mod tests {
         // and `scion-server gc` run.
         let other = Store::open_shared(dir.path()).unwrap();
         let x = store.blobs().put(b"raced\n").unwrap();
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
 
         // The put of the other process holds the lock while it works on
         // the file. Every wait below is bounded.
@@ -802,7 +963,7 @@ mod tests {
         let listed = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
         let listed2 = listed.clone();
         let (done, done_rx) = std::sync::mpsc::channel();
-        let backend = Backend::Sqlite(store.clone());
+        let backend = Backend::sqlite(store.clone());
         std::thread::spawn(move || {
             let report = collect(
                 &backend,
@@ -848,7 +1009,7 @@ mod tests {
     fn a_row_added_between_the_listing_and_the_sweep_keeps_its_file() {
         let (_dir, store) = store();
         let x = store.blobs().put(b"listed\n").unwrap();
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
         let mut injected = false;
         let report = {
             let mut between = |stage: Stage| {
@@ -865,7 +1026,7 @@ mod tests {
                 }
             };
             collect(
-                &Backend::Sqlite(store.clone()),
+                &Backend::sqlite(store.clone()),
                 Duration::from_secs(DEFAULT_GRACE_SECS),
                 &mut between,
             )
@@ -877,7 +1038,7 @@ mod tests {
             store.blobs().verify(x).unwrap(),
             crate::store::BlobStatus::Valid
         );
-        let check = crate::fsck::run(&Backend::Sqlite(store.clone()), 1, &mut |_| {}).unwrap();
+        let check = crate::fsck::run(&Backend::sqlite(store.clone()), 1, &mut |_| {}).unwrap();
         assert!(check.is_clean(), "{check:?}");
     }
 
@@ -885,7 +1046,7 @@ mod tests {
     fn a_dry_run_removes_nothing() {
         let (_dir, store) = store();
         let x = uploaded(&store, b"dry\n");
-        age_file(&Backend::Sqlite(store.clone()), x, OLD);
+        age_file(&Backend::sqlite(store.clone()), x, OLD);
         let mut removed = 0;
         let mut between = |stage: Stage| {
             if stage == Stage::BlobFiles {
@@ -893,7 +1054,7 @@ mod tests {
             }
         };
         let report = run(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             true,
             &mut between,
@@ -912,7 +1073,7 @@ mod tests {
         );
         // The real run after it collects both.
         let real = collect(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
@@ -924,7 +1085,7 @@ mod tests {
     fn a_store_that_never_holds_blobs_collects_nothing() {
         let (_dir, store) = store();
         let report = collect(
-            &Backend::Sqlite(store.clone()),
+            &Backend::sqlite(store.clone()),
             Duration::from_secs(DEFAULT_GRACE_SECS),
             &mut |_| {},
         );
@@ -1083,8 +1244,141 @@ mod tests {
                 chunks.set(chunks.get() + 1);
             }
         });
+        assert_eq!(chunks.get(), 2, "the prune held the key once for every row");
         assert_eq!(report.rows_pruned, blobs.len() as u64, "{report:?}");
         assert_eq!(report.files_removed, blobs.len() as u64, "{report:?}");
-        assert_eq!(chunks.get(), 2, "the prune held the key once for every row");
+    }
+
+    use crate::write::{PARK_CREATE, PARK_PUT, create_changeset, put_blob};
+
+    /// Waits until a writer parked in one of the write parks, named by
+    /// the marker file of `id`.
+    fn wait_parked(hooks: &Path, id: BlobId) {
+        let marker = hooks.join(format!("parked-{id}"));
+        let give_up = std::time::Instant::now() + Duration::from_secs(10);
+        while !marker.exists() {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the writer never parked"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The collector takes the row and the file while a `create_changeset`
+    /// sits parked between its file check and its write transaction. The
+    /// commit may not name a blob whose file the collector removed: the
+    /// create refuses (the client uploads again), or it commits and the
+    /// named blob reads back. A commit that names a file the sweep
+    /// unlinked loses the file's bytes for every reader of the path.
+    #[test]
+    fn a_create_over_a_collected_blob_does_not_name_its_lost_file() {
+        let dir = TempDir::new().unwrap();
+        let store = Backend::open_test_shared(dir.path()).unwrap();
+        let repo = store.write(|c| c.create_repo(REPO)).unwrap();
+        let text = b"named\n";
+        let upload = store.blobs().upload().unwrap().append(text).unwrap();
+        let b = put_blob(&store, repo, upload).unwrap();
+        age_file(&store, b, OLD);
+        let root = store
+            .write(|c| c.insert_changeset(repo, &cs(None, &[])))
+            .unwrap();
+        let mut changes = std::collections::BTreeMap::new();
+        changes.insert(
+            RepoPath::new("f").unwrap(),
+            Some(FileState::Regular {
+                content: b,
+                executable: false,
+            }),
+        );
+        let bytes = Changeset::new(
+            vec![root],
+            IdentityTime::new(
+                b"Ada".to_vec(),
+                b"ada@example.com".to_vec(),
+                1_700_000_000,
+                0,
+            )
+            .expect("identity fits the format"),
+            None,
+            b"write\n".to_vec(),
+            changes,
+        )
+        .expect("changeset fits the format")
+        .encode();
+
+        // The create parks after its file check; the collector then takes
+        // the row and the file the check saw.
+        let hooks = dir.path().join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        PARK_CREATE.arm(&hooks);
+        std::fs::write(hooks.join(format!("park-{b}")), b"").unwrap();
+        let writer = store.clone();
+        let created = std::thread::spawn(move || {
+            create_changeset(&writer, REPO, &bytes, &later()).map_err(|e| e.to_string())
+        });
+        wait_parked(&hooks, b);
+        let report = collect(&store, Duration::from_secs(DEFAULT_GRACE_SECS), &mut |_| {});
+        assert_eq!(report.rows_pruned, 1, "{report:?}");
+        assert_eq!(report.files_removed, 1, "{report:?}");
+
+        std::fs::remove_file(hooks.join(format!("park-{b}"))).unwrap();
+        let answer = created.join().expect("the create's thread answers");
+        PARK_CREATE.lift();
+        match answer {
+            // The refuse sends the client to upload again: nothing names
+            // the file the collector removed.
+            Err(why) => assert!(why.contains("is not stored"), "{why}"),
+            // A commit may only name blobs that read back.
+            Ok(_) => assert_eq!(
+                store.blobs().get(b).unwrap(),
+                text,
+                "the named blob reads back"
+            ),
+        }
+    }
+
+    /// The collector takes the row while a `PutBlob` sits parked after
+    /// its member read, and takes the file too. The reply must still
+    /// leave the row behind: a `PutBlob` that answers ok stores the blob
+    /// for the repo, and the next changeset may name it.
+    #[test]
+    fn a_put_blob_that_answers_ok_names_the_blob_over_a_concurrent_gc() {
+        let dir = TempDir::new().unwrap();
+        let store = Backend::open_test_shared(dir.path()).unwrap();
+        let repo = store.write(|c| c.create_repo(REPO)).unwrap();
+        let upload = store.blobs().upload().unwrap().append(b"kept\n").unwrap();
+        let b = put_blob(&store, repo, upload).unwrap();
+        age_file(&store, b, OLD);
+
+        // The PutBlob parks after its member read said true; the
+        // collector then prunes the row and unlinks the file.
+        let hooks = dir.path().join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        PARK_PUT.arm(&hooks);
+        std::fs::write(hooks.join(format!("park-{b}")), b"").unwrap();
+        let writer = store.clone();
+        let put_thread = std::thread::spawn(move || {
+            let upload = writer.blobs().upload().unwrap().append(b"kept\n").unwrap();
+            put_blob(&writer, repo, upload).map_err(|e| e.to_string())
+        });
+        wait_parked(&hooks, b);
+        let report = collect(&store, Duration::from_secs(DEFAULT_GRACE_SECS), &mut |_| {});
+        assert_eq!(report.rows_pruned, 1, "{report:?}");
+        assert_eq!(report.files_removed, 1, "{report:?}");
+
+        std::fs::remove_file(hooks.join(format!("park-{b}"))).unwrap();
+        let answer = put_thread.join().expect("the PutBlob's thread answers");
+        PARK_PUT.lift();
+        answer.expect("the PutBlob answers ok");
+        assert!(
+            store.read(|c| c.any_repo_names(b.as_bytes())).unwrap(),
+            "the row of a PutBlob that answered ok vanished"
+        );
+        assert_eq!(
+            store.blobs().get(b).unwrap(),
+            b"kept\n",
+            "the blob reads back"
+        );
     }
 }

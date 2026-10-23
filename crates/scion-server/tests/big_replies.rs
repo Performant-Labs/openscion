@@ -10,14 +10,12 @@ use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{
     CreateChangesetRequest, GetChangesetRequest, ListDirRequest, PutBlobRequest,
 };
+use scion_server::test_support::backend::from_store;
 use scion_server::test_support::meta::MetaTx;
 use std::sync::Arc;
 
 use scion_server::Metrics;
-use scion_server::{
-    Backend,
-    test_support::{service, store::Store},
-};
+use scion_server::test_support::{service, store::Store};
 use tokio::net::TcpListener;
 use tokio_stream::StreamExt;
 use tonic::Status;
@@ -74,11 +72,12 @@ async fn big_repo(names: usize) -> (tempfile::TempDir, Scion, ChangesetId) {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
     tokio::spawn(service::serve(
-        Backend::Sqlite(store.clone()),
+        from_store(store.clone()),
         listener,
         TOKEN,
         service::ServeOptions {
             data: dir.path().to_path_buf(),
+            audit: scion_server::test_support::audit::Audit::off(),
             limits: Limits::default(),
             quotas: scion_server::Quotas::off(),
             pending_lands: None,
@@ -89,21 +88,13 @@ async fn big_repo(names: usize) -> (tempfile::TempDir, Scion, ChangesetId) {
         None,
         std::future::pending(),
     ));
-    let channel = Channel::from_shared(format!("http://{addr}"))
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(&format!("http://{addr}")).await.unwrap();
     let mut client = ScionClient::with_interceptor(channel, Bearer::new(TOKEN).unwrap())
         .max_decoding_message_size(MAX_PART_MESSAGE_BYTES);
 
     // The content of every file, uploaded once, so the repo has its blob.
     let mut raw = ScionClient::with_interceptor(
-        Channel::from_shared(format!("http://{addr}"))
-            .unwrap()
-            .connect()
-            .await
-            .unwrap(),
+        common::channel(&format!("http://{addr}")).await.unwrap(),
         Bearer::new(TOKEN).unwrap(),
     );
     let blob = raw
@@ -222,3 +213,6 @@ async fn a_client_that_stops_mid_reply_can_read_on() {
     let tree = Tree::decode(&tree_bytes).expect("the second reply is whole");
     assert_eq!(tree.entries().len(), 40_001);
 }
+
+#[path = "common/mod.rs"]
+mod common;

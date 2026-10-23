@@ -1,13 +1,17 @@
 # Releasing
 
-How to cut a release of openscion. v0.1.x is a source release: a git
-tag plus GitHub release notes. Nothing publishes crates: the crates
-publish later, after their public APIs are narrowed
-([#21](https://github.com/bnsd55/openscion/issues/21)). Nothing here
-tags by itself: each step is run by a person.
+How to cut a release of openscion. v0.1.x is a source release: one
+SSH-signed annotated git tag plus one immutable GitHub release with
+notes. Nothing publishes crates: the owner has decided (D12) that no
+crate publishes before a real outside consumer exists, so a narrow
+client crate is the only publish ever planned. Nothing here tags by
+itself: each step is run by a person.
 
 ## Before a release
 
+- Run the drills of docs/drills/ that the release's milestone lists on
+  the release candidate, and record each run beside the template there
+  (a drill is the proof of a runbook step no CI test can run).
 - Every required check is green on the release commit. A red check
   blocks the release; `gh pr checks` on the release PR lists them.
 - The milestone for the version has no open issues but the release's
@@ -68,24 +72,27 @@ A release is cut through one PR from a branch named
 
 ## Release steps
 
-1. **Tag.** Cut an annotated tag from the commit that the release
-   notes describe:
+1. **Tag, signed.** Cut an annotated tag from the commit that the
+   release notes describe. The owner signs it personally with their SSH
+   key (D18), so the signature a verifier checks is the owner's, not a
+   CI secret's:
 
    ```sh
-   git tag -a v0.1.0 -m "openscion v0.1.0"
+   git -c gpg.format=ssh -c user.signingkey="$HOME/.ssh/id_ed25519.pub" \
+     tag -s v0.1.0 -m "openscion v0.1.0"
    git push origin v0.1.0
    ```
 
-   Before the push, the same check runs locally, on the tag alone:
+   Verify the signature before the push (`git tag -v v0.1.0`), and that
+   the tag points at the release commit:
 
    ```sh
    test "$(git rev-parse 'v0.1.0^{}')" = "$(git rev-parse <the release commit>)"
    ```
 
    Then push, and check the tag landed on the release commit. An
-   annotated tag
-   makes `git ls-remote` print the tag object's SHA, so compare the
-   peeled ref to the commit:
+   annotated tag makes `git ls-remote` print the tag object's SHA, so
+   compare the peeled ref to the commit:
 
    ```sh
    test "$(git ls-remote origin 'refs/tags/v0.1.0^{}' | cut -f1)" \
@@ -95,10 +102,37 @@ A release is cut through one PR from a branch named
    If the check fails, stop and redo the tag per "Undoing a bad tag"
    before any release notes point at it.
 
-2. **GitHub release.** Open a release for the tag with the notes
-   rebuilt from the `CHANGELOG.md` section of the version at that
-   commit (`git show v0.1.0:CHANGELOG.md`), and the measured numbers
-   with the provenance the checklist asks for.
+2. **GitHub release, immutable.** The release workflow
+   (`.github/workflows/release.yml`) does this step: on the tag push it
+   builds every artifact twice per cell, fails on one differing byte,
+   attests each artifact and SBOM, verifies the attestations, and
+   opens the release immutable with the notes rebuilt from the
+   `CHANGELOG.md` section of the version at that commit. A person does
+   not run it; a person reads its run. What a person must turn on
+   once, before the first tag (repository settings only the owner can
+   change):
+
+   - **A ruleset on `refs/tags/v*`** (Settings → Rules → Rulesets):
+     creation restricted to the owner, deletion denied, and updates
+     denied. It is what stops anyone else from pushing a `v*` tag the
+     workflow would happily build. GitHub's older tag-protection rules
+     are replaced by rulesets; this is the ruleset to create.
+   - **Immutable releases** (Settings → General → Releases): the
+     workflow also passes `--immutable` to `gh release create`, so a
+     release is protected even before the repository-wide setting
+     exists.
+   - **The registry the SBOMs name is not secret; nothing else to
+     add.** The workflow needs no key: the tag's SSH signature is
+     verified by GitHub at push time against the key on the owner's
+     account (D18), and the build signs nothing of its own — the
+     provenance comes from GitHub's hosted builder.
+
+   The dry-run proves all of it before the first tag: dispatch the
+   workflow from `main` with `dry_run` on and the `commit` input set to
+   a main commit's SHA, and push no tag — the run checks out that
+   commit and refuses one that is not an ancestor of `main`. Read the
+   run: the diff job prints `NO DIFFERENCE`, the `verify` job's `gh
+   attestation verify` output is the proof — and nothing is published.
 
 ## Undoing a bad tag
 

@@ -16,6 +16,7 @@ use scion_proto::v1::LogRequest;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_server::Backend;
 use scion_server::Metrics;
+use scion_server::test_support::backend::from_store;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::{service, store::Store, tree};
 use tonic::service::interceptor::InterceptedService;
@@ -34,7 +35,7 @@ type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
 /// message names i, so a test can tell which changeset an entry holds.
 fn chain(count: usize) -> (tempfile::TempDir, Backend, Vec<scion_core::ChangesetId>) {
     let dir = tempfile::tempdir().unwrap();
-    let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+    let store = from_store(Store::open(dir.path()).unwrap());
     let ids = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -72,6 +73,7 @@ async fn serve(store: Backend, dir: &std::path::Path) -> String {
         TOKEN,
         service::ServeOptions {
             data: dir.to_path_buf(),
+            audit: scion_server::test_support::audit::Audit::off(),
             limits: Limits::default(),
             quotas: scion_server::Quotas::off(),
             pending_lands: None,
@@ -87,11 +89,7 @@ async fn serve(store: Backend, dir: &std::path::Path) -> String {
 
 async fn client(url: &str) -> Scion {
     ScionClient::with_interceptor(
-        Channel::from_shared(url.to_owned())
-            .unwrap()
-            .connect()
-            .await
-            .unwrap(),
+        common::channel(url).await.unwrap(),
         Bearer::new(TOKEN).unwrap(),
     )
 }
@@ -249,3 +247,6 @@ async fn log_paging_with_a_path_matches_one_full_walk() {
     paged(&mut client, &tip, &positions, 7, b"d/f.txt").await;
     paged(&mut client, &tip, &positions, 4, b"d/f.txt").await;
 }
+
+#[path = "common/mod.rs"]
+mod common;

@@ -17,6 +17,7 @@ use scion_proto::v1::{
 use std::sync::Arc;
 
 use scion_server::Access;
+use scion_server::test_support::backend::from_store;
 use scion_server::test_support::meta::Meta as _;
 use scion_server::test_support::store::Store;
 
@@ -86,6 +87,28 @@ fn access() -> Access {
 /// A token with a principal, but no rule for any repo.
 fn no_rules() -> Access {
     Access::parse(&format!("token\tmallory\t{}\n", hex("mallory"))).unwrap()
+}
+
+/// A line the parser does not know is refused at load: the access
+/// file's keys are additive-only in 1.x, and an unknown key is an
+/// error, never a silent rule (docs/stability.md, the file-format
+/// row).
+#[test]
+fn an_unknown_line_is_refused() {
+    let text = format!("token\talice\t{}\ndelete\talice\tr\n", hex("alice"));
+    let error = Access::parse(&text).unwrap_err();
+    assert!(
+        error.contains("expected `token`, `read` or `write`"),
+        "{error}"
+    );
+    // An unknown key on a well-formed line is refused too: a fifth
+    // field is no rule the 0.x file promised.
+    let text = "read\talice\tr\textra\textra\n".to_string();
+    let error = Access::parse(&text).unwrap_err();
+    assert!(
+        error.contains("expected `token`, `read` or `write`"),
+        "{error}"
+    );
 }
 
 fn hex(token: &str) -> String {
@@ -164,6 +187,7 @@ async fn serve(store: &Backend, dir: &std::path::Path, access: Access) -> (Stop,
         access,
         service::ServeOptions {
             data: dir.to_path_buf(),
+            audit: scion_server::test_support::audit::Audit::off(),
             limits: Limits::default(),
             quotas: scion_server::Quotas::off(),
             pending_lands: None,
@@ -181,11 +205,7 @@ async fn serve(store: &Backend, dir: &std::path::Path, access: Access) -> (Stop,
 
 /// A client of `url` as `token`; `None` sends no token at all.
 async fn scion(url: &str, token: Option<&str>) -> Scion {
-    let channel = Channel::from_shared(url.to_owned())
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(url).await.unwrap();
     match token {
         None => ScionClient::with_interceptor(channel, Bearer(None)),
         Some(token) => {
@@ -197,11 +217,7 @@ async fn scion(url: &str, token: Option<&str>) -> Scion {
 
 /// An `Objects` client of `url` as `token`; `None` sends no token.
 async fn objects(url: &str, token: Option<&str>) -> Objects {
-    let channel = Channel::from_shared(url.to_owned())
-        .unwrap()
-        .connect()
-        .await
-        .unwrap();
+    let channel = common::channel(url).await.unwrap();
     match token {
         None => ObjectsClient::with_interceptor(channel, Bearer(None)),
         Some(token) => {
@@ -884,6 +900,11 @@ async fn a_partial_readers_ticket_reaches_only_its_view() {
 
 /// A partial reader writes nothing: the write calls all answer the same
 /// uniform `UNIMPLEMENTED`, with no per-object difference.
+/// The side channel the threat model names: a partial reader sees the
+/// ref's real changeset ID, so a hidden-only landing shows through a new
+/// ID over an unchanged view, with every path answer the same.
+/// A partial reader writes nothing: the write calls all answer the same
+/// uniform `UNIMPLEMENTED`, with no per-object difference.
 #[tokio::test(flavor = "multi_thread")]
 async fn a_partial_reader_writes_nothing() {
     let (dir, store, root, _blob) = store();
@@ -898,6 +919,142 @@ async fn a_partial_reader_writes_nothing() {
     );
     unimplemented("Land", scion.land(req::land(root.as_bytes())).await);
     unimplemented("GetLand", scion.get_land(req::get_land()).await);
+}
+
+/// The side channel the threat model names: a partial reader sees the
+/// ref's real changeset ID, so a hidden-only landing shows through a new
+/// ID over an unchanged view, with every path answer the same.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_partial_reader_sees_a_hidden_landing_through_the_ref_id() {
+    let (dir, store, tip, _docs, _secret) = repo_with_docs_and_secret();
+    let (_stop, mut pat, mut objects) = server(&store, dir.path(), partial_access(), "pat").await;
+
+    let first = pat
+        .resolve_ref(req::resolve_ref())
+        .await
+        .unwrap()
+        .into_inner()
+        .changeset_id;
+    let view = objects
+        .get_root_tree(req::get_root_tree(tip.as_bytes()))
+        .await
+        .unwrap()
+        .into_inner();
+
+    // A change outside the reader's prefix lands on main, as a real land
+    // would: the ref moves to it.
+    let hidden = put(&store, b"hidden\n");
+    let _landed = store
+        .write(|c| {
+            let repo = c.repo_id(REPO)?;
+            let cs = c.insert_changeset(
+                repo,
+                &changeset(vec![tip], "secret/c", Some(regular(hidden))),
+            )?;
+            let version = c.get_ref(repo, "main")?.unwrap().version;
+            assert!(c.cas_ref(repo, "main", Some(version), cs)?);
+            Ok(cs)
+        })
+        .unwrap();
+
+    let second = pat
+        .resolve_ref(req::resolve_ref())
+        .await
+        .unwrap()
+        .into_inner()
+        .changeset_id;
+    assert_ne!(first, second, "the landing shows through the ref's ID");
+    let after = objects
+        .get_root_tree(req::get_root_tree(&second))
+        .await
+        .unwrap()
+        .into_inner();
+    assert_eq!(view.tree_id, after.tree_id, "the view root is unchanged");
+}
+
+/// The window the operations guide promises: a narrowed access file cuts
+/// a principal at the next start, but an outstanding ticket keeps working
+/// for its whole life - at most 15 minutes from signing - while the key
+/// holds, and a new key cuts it at once.
+#[tokio::test(flavor = "multi_thread")]
+async fn an_outstanding_ticket_survives_a_narrowed_access_file_until_the_key_rotates() {
+    let (dir, store, tip, docs, _secret) = repo_with_docs_and_secret();
+    let full = Access::parse(&format!("token\tpat\t{}\nread\tpat\t{REPO}\n", hex("pat"))).unwrap();
+    let narrowed = Access::parse(&format!("token\tnobody\t{}\n", hex("nobody"))).unwrap();
+
+    let keys = scion_server::Keys::generate();
+    let (stop, url) = serve_keys(&store, dir.path(), full, keys.clone()).await;
+    let mut pat = objects(&url, Some("pat")).await;
+    let ticket = pat
+        .get_root_tree(req::get_root_tree(tip.as_bytes()))
+        .await
+        .unwrap()
+        .into_inner()
+        .ticket;
+    let get = |ticket: Vec<u8>, url: String| async move {
+        let mut objects = objects(&url, None).await;
+        objects
+            .get_objects(GetObjectsRequest {
+                refs: vec![ObjectRef {
+                    kind: ObjectKind::Blob as i32,
+                    id: docs.as_bytes().to_vec(),
+                    path: b"docs/a".to_vec(),
+                }],
+                accept: Vec::new(),
+                ticket,
+            })
+            .await
+    };
+    let mut reply = get(ticket.clone(), url.clone()).await.unwrap().into_inner();
+    while (reply.message().await.unwrap()).is_some() {}
+    drop(pat);
+    stop.send(()).ok();
+
+    // The access file no longer knows `pat`. The outstanding ticket still
+    // serves, because its permission is the walk, not the rules.
+    let (_stop, url) = serve_keys(&store, dir.path(), narrowed.clone(), keys.clone()).await;
+    let mut reply = get(ticket.clone(), url.clone()).await.unwrap().into_inner();
+    while (reply.message().await.unwrap()).is_some() {}
+
+    // A new key cuts the old ticket at once.
+    let (_stop, url) =
+        serve_keys(&store, dir.path(), narrowed, scion_server::Keys::generate()).await;
+    let err = get(ticket, url).await.unwrap_err();
+    assert_eq!(err.code(), Code::PermissionDenied, "{err:?}");
+    assert!(err.to_string().contains("bad ticket"), "{err:?}");
+}
+
+/// `serve` with explicit ticket keys, so a restart can keep the key - and
+/// every outstanding ticket with it.
+async fn serve_keys(
+    store: &Backend,
+    dir: &std::path::Path,
+    access: Access,
+    keys: scion_server::Keys,
+) -> (Stop, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let (stop, stopped) = tokio::sync::oneshot::channel::<()>();
+    tokio::spawn(service::serve(
+        store.clone(),
+        listener,
+        access,
+        service::ServeOptions {
+            data: dir.to_path_buf(),
+            audit: scion_server::test_support::audit::Audit::off(),
+            limits: Limits::default(),
+            quotas: scion_server::Quotas::off(),
+            pending_lands: None,
+            land_stale_secs: 1 << 40,
+            tls: None,
+            metrics: Arc::new(Metrics::default()),
+        },
+        Some(Arc::new(keys)),
+        async {
+            stopped.await.ok();
+        },
+    ));
+    (stop, format!("http://{addr}"))
 }
 
 /// The code that says "accepted".
@@ -1535,7 +1692,7 @@ fn a_partial_reader_case(paths: &[String], rule_seeds: &[u16]) -> Result<(), Tes
     // The store: a chain of changesets whose tip tree holds every path,
     // and each file's blob, as an upload would leave them.
     let dir = tempfile::tempdir().unwrap();
-    let store = Backend::Sqlite(Store::open(dir.path()).unwrap());
+    let store = from_store(Store::open(dir.path()).unwrap());
     let tip = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -1568,7 +1725,7 @@ fn a_partial_reader_case(paths: &[String], rule_seeds: &[u16]) -> Result<(), Tes
         .cloned()
         .collect();
     let dir_b = tempfile::tempdir().unwrap();
-    let store_b = Backend::Sqlite(Store::open(dir_b.path()).unwrap());
+    let store_b = from_store(Store::open(dir_b.path()).unwrap());
     let tip_b = store_b
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -1749,3 +1906,133 @@ fn a_partial_reader_answers_like_the_model() {
         })
         .unwrap();
 }
+
+/// The pass-4 attacks on the shape of a prefix: a path that differs from
+/// the rule only by case, a name that only starts like the rule, and a
+/// principal name that differs by case. Paths are bytes: `DOCS/a` and
+/// `docsx/a` are outside the rule `docs`, and `Pat` is not `pat`.
+#[tokio::test(flavor = "multi_thread")]
+async fn nothing_near_a_rule_is_served() {
+    // One repo: `docs/a` inside the rule, `DOCS/a` and `docsx/a` beside
+    // it, `secret/b` outside it.
+    let (dir, store, tip) = {
+        let (dir, store, root, _blob) = store();
+        let (docs, upper, docsx, secret) = (
+            put(&store, b"a\n"),
+            put(&store, b"A\n"),
+            put(&store, b"x\n"),
+            put(&store, b"b\n"),
+        );
+        let cs = changeset(vec![root], "docs/a", Some(regular(docs)));
+        let mut changes = cs.changes().clone();
+        changes.insert(RepoPath::new("DOCS/a").unwrap(), Some(regular(upper)));
+        changes.insert(RepoPath::new("docsx/a").unwrap(), Some(regular(docsx)));
+        changes.insert(RepoPath::new("secret/b").unwrap(), Some(regular(secret)));
+        let cs = Changeset::new(
+            cs.parents().to_vec(),
+            cs.author().clone(),
+            cs.committer().cloned(),
+            cs.message().to_vec(),
+            changes,
+        )
+        .expect("changeset fits the format");
+        let tip = store
+            .write(|c| {
+                let repo = c.repo_id(REPO).unwrap();
+                c.insert_changeset(repo, &cs)
+            })
+            .unwrap();
+        (dir, store, tip)
+    };
+
+    // A whole reader sees every one of them: only the rule hides.
+    let whole = partial_access_whole();
+    let (_stop, mut boss, _) = server(&store, dir.path(), whole, "boss").await;
+    for path in ["DOCS/a", "docsx/a", "secret/b"] {
+        boss.read_file(req::read_file(tip.as_bytes(), path.as_bytes()))
+            .await
+            .unwrap_or_else(|s| panic!("a whole reader reads {path}: {s:?}"));
+    }
+
+    // pat reads `docs`: its file is served; every near-miss answers
+    // exactly as a path that is nowhere in the tree.
+    let (_stop, mut pat, _) = server(&store, dir.path(), partial_access(), "pat").await;
+    let served = pat
+        .read_file(req::read_file(tip.as_bytes(), b"docs/a"))
+        .await
+        .unwrap();
+    let mut bytes = Vec::new();
+    let mut stream = served.into_inner();
+    while let Some(part) = stream.message().await.unwrap() {
+        bytes.extend_from_slice(&part.data);
+    }
+    assert_eq!(bytes, b"a\n");
+    let absent = pat
+        .read_file(req::read_file(tip.as_bytes(), b"zzz/none"))
+        .await
+        .unwrap_err();
+    for near in ["DOCS/a", "docsx/a", "Docs/a", "secret/b"] {
+        let got = pat
+            .read_file(req::read_file(tip.as_bytes(), near.as_bytes()))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            got.code(),
+            absent.code(),
+            "{near} must answer as a missing path: {got:?} vs {absent:?}"
+        );
+        // The same refusal shape, with the path the caller sent echoed:
+        // the reply tells a hidden path from a missing one by nothing but
+        // the name the caller itself put in the request.
+        let shape = |s: &tonic::Status| {
+            let m = s.message();
+            m.starts_with("path \"") && m.ends_with("\" not found")
+        };
+        assert!(shape(&got) && shape(&absent), "{near}: {got:?}");
+    }
+}
+
+/// The access file that `nothing_near_a_rule_is_served`'s whole reader
+/// uses: boss reads the whole of `main`.
+fn partial_access_whole() -> Access {
+    let text = format!("token\tboss\t{}\nread\tboss\t{REPO}\n", hex("boss"));
+    Access::parse(&text).unwrap()
+}
+
+/// A prefix that is not a path is refused when the access file parses:
+/// a trailing slash, an empty prefix, a parent step, and a walk through
+/// one. The server refuses to start over such a rule.
+#[test]
+fn a_prefix_that_is_not_a_path_is_refused() {
+    for bad in ["docs/", "", "..", "docs/../secret", "docs//a"] {
+        let text = format!("token\tpat\t{}\nread\tpat\t{REPO}\t{bad}\n", hex("pat"));
+        let why = Access::parse(&text).expect_err(&format!("the prefix {bad:?} must be refused"));
+        assert!(
+            why.contains("bad path"),
+            "{bad:?}: the refusal must name the path: {why}"
+        );
+    }
+}
+
+/// A principal name that differs by case is another principal: the rules
+/// of `pat` do not follow `Pat`, who sees no repo on any RPC.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_principal_name_that_differs_by_case_is_another_principal() {
+    let (dir, store, tip, _docs, _secret) = repo_with_docs_and_secret();
+    let (_stop, mut pat, _) = server(&store, dir.path(), partial_access(), "pat").await;
+    pat.resolve_ref(req::resolve_ref())
+        .await
+        .unwrap_or_else(|s| panic!("the rules' own principal reads: {s:?}"));
+
+    // The token digest names the principal: `Pat` is no one here, so the
+    // answer is the token refusal, not a repo answer.
+    let (_stop, mut upper, _) = server(&store, dir.path(), partial_access(), "Pat").await;
+    match upper.resolve_ref(req::resolve_ref()).await {
+        Err(status) => assert_eq!(status.code(), Code::Unauthenticated, "{status:?}"),
+        Ok(reply) => panic!("a token with no principal read the repo: {reply:?}"),
+    }
+    let _ = tip;
+}
+
+#[path = "common/mod.rs"]
+mod common;

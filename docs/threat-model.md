@@ -124,9 +124,9 @@ that breaks one is caught.
   `scion-server/tests/every_rpc_unauthenticated.rs::every_rpc_answers_unauthenticated_without_a_valid_token`
 - **A token is one principal.** The access file holds BLAKE3 digests and
   each digest maps to one principal with its rules.
-  `scion-proto/src/runtime/auth.rs::each_token_gets_its_own_principal`. The
+  `scion-proto/src/runtime/auth/mod.rs::each_token_gets_its_own_principal`. The
   compare is constant
-  time (`auth.rs`, `constant_time_eq`); no test yet - a timing test is
+  time (`constant_time_eq`); no test yet - a timing test is
   not reliable, so the code is the proof.
 - **A repo outside a principal's rules does not exist.** Every RPC
   answers `NOT_FOUND` for it, as for a repo that is not there.
@@ -172,11 +172,11 @@ that breaks one is caught.
   a whole-keeping file refuses group and others write; a symlink dies
   at the open; the ancestors are checked, with the sticky-bit exception;
   and the bytes are read from the checked descriptor.
-  `scion-proto/src/runtime/auth.rs::a_file_owned_by_another_account_is_refused`,
-  `scion-proto/src/runtime/auth.rs::a_group_readable_secret_is_refused_and_a_group_writable_shared_file_is_refused`,
-  `scion-proto/src/runtime/auth.rs::a_secret_reads_through_the_descriptor_and_a_link_dies_at_the_open`,
-  `scion-proto/src/runtime/auth.rs::a_directory_that_others_can_write_is_refused_unless_sticky`,
-  `scion-server/src/main.rs::key_file_tests:a_key_owned_by_another_user_is_refused`,
+  `scion-proto/src/runtime/auth/mod.rs::a_file_owned_by_another_account_is_refused`,
+  `scion-proto/src/runtime/auth/mod.rs::a_group_readable_secret_is_refused_and_a_group_writable_shared_file_is_refused`,
+  `scion-proto/src/runtime/auth/mod.rs::a_secret_reads_through_the_descriptor_and_a_link_dies_at_the_open`,
+  `scion-proto/src/runtime/auth/mod.rs::a_directory_that_others_can_write_is_refused_unless_sticky`,
+  `scion-server/src/main.rs::a_symlinked_key_is_refused_with_a_perfect_target`,
   `scion-proto/src/runtime/tls.rs::a_symlinked_certificate_is_refused_with_a_perfect_target`
 - **A data directory opens only as one server, for one build.** The
   locks fence a second server and a build mismatch;
@@ -199,6 +199,17 @@ that breaks one is caught.
   symlinked snapshot is refused, and `--seed-full-repo` must say so.
   `scion-tier/src/snapshot.rs::a_group_writable_snapshot_is_refused`,
   `scion-tier/src/snapshot.rs::a_symlinked_snapshot_is_refused`
+- **Two repos whose names differ only by case do not share one
+  snapshot file.** On a case-insensitive disk, `main` and `MAIN` would
+  fold one onto the other: the second repo's snapshot write replaced
+  the first's, and a seed of the first read the second's file;
+  `file_name` escapes
+  every capital (and every byte outside the plain name set) as `%XX`,
+  so the file name keeps lowercase only, and the property test holds
+  it for any repo name
+  (`scion-tier/src/snapshot.rs::any_repo_name_gives_one_plain_file_name`,
+  with its regression file in
+  `scion-tier/proptest-regressions/snapshot.txt`). #452
 - **Checkout writes nothing it should not.** Names that are unsafe fail
   before anything is written, a failed checkout removes what it wrote,
   a signal cleans up, and an existing destination is left untouched on
@@ -212,10 +223,66 @@ that breaks one is caught.
   reachable by
   other local users is out of profile, not hidden: the mount says so at
   start and in `--help`.
+- **The directory checks read no ACL that the mode does not grant, and
+  refuse every ACL beyond the mode.** The sticky-bit exception excuses
+  no group write. `scion-proto/src/runtime/auth/mod.rs::a_minimal_acl_matching_the_mode_passes`,
+  `scion-proto/src/runtime/auth/mod.rs::an_acl_beyond_the_mode_is_refused_for_real`,
+  `scion-proto/src/runtime/auth/mod.rs::a_group_writable_ancestor_is_refused_even_with_the_sticky_bit`
 - **Internal errors say `internal error`.** The detail stays in the
   log, named by the request id.
   `scion-server/tests/request_id.rs::a_calls_request_id_names_its_span_in_the_servers_log`
-
+- **An archive is untrusted input.** `verify` and `restore` treat every
+  byte of an archive as coming from outside the server: a repo name the
+  manifest holds is checked against the live name rule and that it is
+  one path component, before it ever joins a path
+  (`scion-server/tests/archive.rs::a_manifest_name_that_escapes_the_archive_is_refused`),
+  and a blob file decompresses through a bounded stream, at most the
+  server's max blob size plus one, so a crafted frame cannot grow in
+  memory past the cap
+  (`scion-server/tests/archive.rs::a_blob_file_that_expands_past_the_cap_is_refused`).
+- **A restore verifies first, and goes only into an empty store.** It
+  runs the same `verify` a reader runs and refuses on any damage, and it
+  refuses a data directory that already holds a store
+  (`scion-server/tests/archive.rs::a_verify_names_a_blob_whose_bytes_someone_corrupted`,
+  `scion-server/tests/archive.rs::a_restore_refuses_a_data_directory_that_already_holds_a_store`).
+- **A secret path cannot hang or flood the checked read.** The open is
+  `O_NONBLOCK`, so a planted FIFO dies at the open instead of blocking
+  the server at startup; the kind check takes a regular file only; and
+  the bytes are read bounded at a fixed cap, so a file that lies about
+  its size, or grows between the fstat and the read, is refused
+  deterministically. (#433)
+  `open_checked_file`,
+  `read_bounded` over
+  `MAX_CHECKED_FILE`; the tests
+  `scion-proto/src/runtime/auth/mod.rs::a_file_that_is_not_a_file_is_refused`,
+  `scion-proto/src/runtime/auth/mod.rs::a_reader_that_yields_one_byte_past_the_cap_is_refused`
+- **An archive cannot fold two names onto one file, duplicate a repo,
+  or land half.** `verify` refuses a manifest that names one repo
+  twice, and refuses two names that fold to one directory on a
+  case-insensitive disk — the disk's own (device, inode) is the judge,
+  not a fold table (`check_section_dir`); colliding land
+  keys are named or tolerated, never half-restored; and a replay that
+  dies halfway leaves the target empty, because `restore` fills a
+  staging directory and publishes by one rename
+  (`restore_impl`). (#438) The tests:
+  `scion-server/tests/archive.rs::an_archive_naming_two_repos_that_fold_to_one_is_refused`,
+  `scion-server/tests/archive_attacks.rs::a_manifest_naming_one_repo_twice_is_refused_before_any_write`,
+  `scion-server/tests/archive_attacks.rs::two_pending_lands_sharing_a_request_key_are_named_or_tolerated`,
+  `scion-server/tests/archive_attacks.rs::a_mid_replay_failure_leaves_the_target_empty`,
+  `scion-server/tests/archive_attacks.rs::a_pg_replay_that_dies_halfway_leaves_the_database_empty`
+- **A refused-auth flood is counted by the machine, not the socket.**
+  The audit meter folds one peer's refusals into counted lines keyed
+  by the address — an IPv6 by its /64, the smallest block one site
+  routes — so one machine opening a thousand connections from a
+  thousand ports cannot fill the peer cap for free and bury a real
+  stranger in the shared bucket. (#414)
+  `meter_key`, and the test
+  `scion-server/src/audit.rs::one_address_rotating_ports_does_not_bury_a_stranger`
+- **A restore verifies first, and goes only into an empty store.** It
+  runs the same `verify` a reader runs and refuses on any damage, and it
+  refuses a data directory that already holds a store
+  (`scion-server/tests/archive.rs::a_verify_names_a_blob_whose_bytes_someone_corrupted`,
+  `scion-server/tests/archive.rs::a_restore_refuses_a_data_directory_that_already_holds_a_store`).
 ## 6. What has no test yet
 
 Each of these is a claim this document makes without a test behind it.
@@ -224,18 +291,32 @@ They become issues as the project moves past alpha.
 - The token compare is constant time: the code is (`auth.rs`,
   `constant_time_eq`), but no test observes it, and a timing test would
   be flaky by nature. The digest form of the access file is the main
-  defence, and that is the load-time format.
+  defence, and that is the load-time format. The check's whole work
+  still scales with the number of tokens the access file holds, so its
+  duration lets a caller estimate how many principals are configured.
+  That is config size, not identity, and the compare itself stays
+  constant time; a fixed-worst-case loop would buy nothing else.
 - A narrowed access file does not cut outstanding tickets: they hold
   for at most 15 minutes from signing, by design (rotate the key to cut
-  at once). Documented, no test.
+  at once). The window and the cut are pinned:
+  `scion-server/tests/access.rs::an_outstanding_ticket_survives_a_narrowed_access_file_until_the_key_rotates`
 - TLS revocation, and hostname checks beyond what the CA signs: no
   test; revocation has no issue yet.
-- The owner and mode checks read no ACLs: an ACL that grants a write
-  the mode does not gets past them. Documented as a limit; no test.
-- A partial reader sees real changeset IDs for its view: a new ID with
-  the same view root reveals that a hidden-only change landed. No test.
+- A partial reader sees real changeset IDs for its view: a landing on
+  hidden paths moves `main`, and the reader's `ResolveRef` answers the
+  new ID over an unchanged view. The channel is pinned as documented
+  behavior, not closed:
+  `scion-server/tests/access.rs::a_partial_reader_sees_a_hidden_landing_through_the_ref_id`
 - The page cache makes a shared blob fast, and the rename of a replaced
   blob frees the old file: two side channels the code does not hide. No
-  test.
+  test can exist here: both are behavior of the operating system and
+  the hardware below the process, so no test of this repository can
+  observe them, let alone refuse them. The data directory's file modes
+  are the only wall, and they are tested.
+- The mount's single-user rule rests on the operating system: the NFS
+  server cannot tell local users apart, so the code has nothing to
+  check, and a test of this repository cannot observe other local users
+  either. It is out of profile, and the mount says so at start and in
+  `--help`.
 - `scn mount` serves any local user who can read the mount table: the
   secret is not a wall. Out of profile by design; no test.

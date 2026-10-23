@@ -89,7 +89,7 @@ END=$(($(date +%s) + RUN_MINUTES * 60))
 
 writers() {
   # A hard cap on the writers: bench would otherwise outlive the run.
-  timeout $((RUN_MINUTES * 60 + 120)) "$BIN/scn" --server "$SERVER" bench \
+  "$TIMEOUT" $((RUN_MINUTES * 60 + 120)) "$BIN/scn" --server "$SERVER" bench \
     --agents "$AGENTS" --lands "$LANDS" \
     > "$WORK/bench.json" 2> "$WORK/bench.log"
 }
@@ -97,7 +97,7 @@ readers() {
   local n=0
   while [ "$(date +%s)" -lt "$END" ]; do
     n=$((n + 1))
-    if ! timeout 120 "$BIN/scn" --server "$SERVER" --objects "$DAEMON" checkout main \
+    if ! "$TIMEOUT" 120 "$BIN/scn" --server "$SERVER" --objects "$DAEMON" checkout main \
       --sparse "$SPARSE_DIR" --into "$WORK/read/$n" \
       >> "$WORK/readers.log" 2>&1; then
       echo "checkout $n failed" >> "$WORK/read-fail.log"
@@ -112,7 +112,7 @@ importer() {
   local n=0
   while [ "$(date +%s)" -lt "$END" ]; do
     n=$((n + 1))
-    timeout 300 "$BIN/scion-server" --data "$WORK/server" import \
+    "$TIMEOUT" 300 "$BIN/scion-server" --data "$WORK/server" import \
       --rev main "$WORK/src.git" \
       >> "$WORK/import-soak.log" 2>&1 || echo "import $n failed" >> "$WORK/import-fail.log"
     sleep 60
@@ -124,9 +124,9 @@ gcer() {
   local n=0
   while [ "$(date +%s)" -lt "$END" ]; do
     n=$((n + 1))
-    timeout 120 "$BIN/scion-server" --data "$WORK/server" gc --dry-run \
+    "$TIMEOUT" 120 "$BIN/scion-server" --data "$WORK/server" gc --dry-run \
       >> "$WORK/gc.log" 2>&1 || echo "gc-dry $n failed" >> "$WORK/gc-fail.log"
-    timeout 120 "$BIN/scion-server" --data "$WORK/server" gc \
+    "$TIMEOUT" 120 "$BIN/scion-server" --data "$WORK/server" gc \
       >> "$WORK/gc.log" 2>&1 || echo "gc $n failed" >> "$WORK/gc-fail.log"
     sleep 120
   done
@@ -146,21 +146,17 @@ canceller() {
 }
 # One slow client: it holds a ReadFile stream of the dataset's largest
 # file open and drains it at a crawl, so back pressure reaches the server
-# for the whole run.
-slow_reader() {
-  while [ "$(date +%s)" -lt "$END" ]; do
-    # shellcheck disable=SC2016 # the drain reads its own $1, the cat command
-    timeout 120 sh -c '"$1" | while IFS= read -r -N 4096 chunk; do
-        printf %s "$chunk" > /dev/null
-        sleep 0.2
-      done' drain "$BIN/scn --server $SERVER cat main:tokio/Cargo.lock" \
-      >> "$WORK/slow.log" 2>&1 || true
-    sleep 1
-  done
-}
+# for the whole run. The reader and its check live in common.sh
+# (issue #399: the old `read -N` reader exited at once on every shell
+# it ran on). SLOW_EXPECTED, the file's byte size, is what the end
+# check compares each drain against.
+SLOW_EXPECTED=$("$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" cat "$SLOW_FILE" | wc -c | tr -d ' ')
+[ -n "$SLOW_EXPECTED" ] && [ "$SLOW_EXPECTED" -gt 0 ] \
+  || die "the slow file $SLOW_FILE is missing from the store"
+
 sample() {
   echo "$(ps -o rss= -p "$SERVER_PID" | tr -d ' '),\
-$(find "/proc/$SERVER_PID/fd" -maxdepth 1 2> /dev/null | wc -l | tr -d ' ')" \
+$(count_fds "$SERVER_PID")" \
     > "$WORK/last.sample"
 }
 # The latency probe times one real read: the ticket comes from the server,
@@ -169,7 +165,7 @@ $(find "/proc/$SERVER_PID/fd" -maxdepth 1 2> /dev/null | wc -l | tr -d ' ')" \
 latency() {
   local t0 t1
   t0=$(date +%s%N)
-  if timeout 60 "$BIN/scn" --server "$SERVER" --objects "$CACHE_URL" \
+  if "$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" --objects "$CACHE_URL" \
     cat main:tokio/Cargo.toml > /dev/null 2>> "$WORK/latency-fail.log"; then
     t1=$(date +%s%N)
     echo $(( (t1 - t0) / 1000000 ))
@@ -180,13 +176,16 @@ latency() {
 }
 
 note "soaking for $RUN_MINUTES minutes"
+# Every check below, from the du samples in the load loop to the
+# bounds, ORs into this one flag; it starts at 0 once, before the loop.
+fail=0
 mkdir -p "$WORK/read" "$WORK/cancel"
-writers & echo $! > "$WORK/soak-writers.pid"
-readers & echo $! > "$WORK/soak-readers.pid"
-importer & echo $! > "$WORK/soak-importer.pid"
-gcer & echo $! > "$WORK/soak-gcer.pid"
-canceller & echo $! > "$WORK/soak-canceller.pid"
-slow_reader & echo $! > "$WORK/soak-slow.pid"
+loop_bg soak-writers writers
+loop_bg soak-readers readers
+loop_bg soak-importer importer
+loop_bg soak-gcer gcer
+loop_bg soak-canceller canceller
+loop_bg soak-slow slow_reader
 
 : > "$WORK/metrics.csv"
 : > "$WORK/metrics-store.csv"
@@ -201,17 +200,17 @@ while [ "$(date +%s)" -lt "$END" ]; do
 $(sed -n 1p "$WORK/last.sample" | cut -d, -f2),$(latency)" >> "$WORK/metrics.csv"
   # The store's size on disk, next to the RSS it may share a cause with:
   # files a leak of disk would grow, and what Ben's run-length decision
-  # needs (issue #239).
-  du -sk "$WORK/server" | awk -v e="$now" '{ print e "," $1 }' \
-    >> "$WORK/metrics-store.csv"
+  # needs (issue #239). du_sample keeps the size through the server's
+  # temp-file churn (its vanished-file errors) and fails on anything
+  # else, including a sample that reads nothing.
+  du_sample "$WORK/metrics-store.csv" "$WORK/server" "$now" || fail=1
   if [ -z "$warm_rss" ] && [ $((now - T0)) -ge "$SOAK_WARM_SECONDS" ]; then
     warm_rss=$rss
   fi
   sleep 10
 done
 # The writers stop at the end: bench has no time limit of its own.
-pkill -TERM -P "$(cat "$WORK/soak-writers.pid")" 2> /dev/null || true
-kill "$(cat "$WORK/soak-writers.pid")" 2> /dev/null || true
+stop soak-writers
 sleep 2
 
 # The artifacts go where the workflow finds them, right after the run and
@@ -219,6 +218,8 @@ sleep 2
 # EXIT trap of common.sh's make_work removes $WORK after this.
 mkdir -p "${RUNNER_TEMP:-/tmp}/soak-artifacts"
 cp "$WORK/metrics.csv" "${RUNNER_TEMP:-/tmp}/soak-artifacts/metrics.csv"
+cp "$WORK/slow-held.csv" "${RUNNER_TEMP:-/tmp}/soak-artifacts/slow-held.csv" \
+  2> /dev/null || true
 cp "$WORK/metrics-store.csv" "${RUNNER_TEMP:-/tmp}/soak-artifacts/metrics-store.csv"
 cp "$WORK"/*.log "${RUNNER_TEMP:-/tmp}/soak-artifacts/" 2> /dev/null || true
 
@@ -237,6 +238,14 @@ else
   echo "FAIL: open files grew for 3 samples in a row (start ${fds_start:-?})" >&2
   fail=1
 fi
+# A measurement that reads nothing is a broken measurement: a live
+# server has open files, so a run whose every sample counted 0 open
+# files never measured them (macOS's /proc, issue #399).
+if [ "$(cut -d, -f3 "$WORK/metrics.csv" | tail -n +2 | sort -u | grep -cv '^0$')" -eq 0 ]; then
+  echo "FAIL: the open-file count never read anything" >&2
+  fail=1
+fi
+
 p99() {
   sed -n "$1,$2p" "$WORK/metrics.csv" | cut -d, -f4 | sort -n |
     awk '{ a[NR] = $1 } END { print a[int(NR * 0.99 + 0.5)] }'
@@ -254,6 +263,13 @@ if [ "$rows" -ge 30 ]; then
     echo "FAIL: p99 grew: $early ms early, $late ms late" >&2
     fail=1
   fi
+fi
+
+# The slow client must have held its stream: a drain that read fewer
+# bytes than the file has ended early while the server was still
+# serving (common.sh, issue #399).
+if ! check_slow_stream "$SLOW_EXPECTED"; then
+  fail=1
 fi
 
 # Every failure a client saw, one line at a time: a line that matches no
@@ -289,6 +305,17 @@ fi
 row "store size first -> last" "$(sed -n 1p "$WORK/metrics-store.csv" | cut -d, -f2) KB -> \
 $(tail -n 1 "$WORK/metrics-store.csv" | cut -d, -f2) KB"
 row "p99 early -> late" "${early:-?} ms -> ${late:-?} ms"
+# The backend the run really served, from the data dir, against the
+# one the run asked for (the soak serves the default store): a run
+# asked for one store that got another fails, and the summary names
+# what ran either way. served_backend comes from common.sh.
+asked_backend=sqlite
+served=$(served_backend "$WORK/server")
+row "backend (asked -> data dir)" "$asked_backend -> $served"
+if [ "$served" != "$asked_backend" ]; then
+  echo "FAIL: asked for $asked_backend, the data dir says $served" >&2
+  fail=1
+fi
 [ "${fail:-0}" -eq 0 ] || die "the soak failed its bounds"
 
 stop_scion

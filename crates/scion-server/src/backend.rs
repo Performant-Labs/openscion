@@ -1,10 +1,10 @@
 //! The metadata backend of a server: one of the supported databases,
 //! behind the crate's internal metadata trait.
 //!
-//! [`Backend::Sqlite`] is the data directory of [`Store`].
-//! [`Backend::Postgres`] is a shared database (`Pg`). A caller holds one
-//! and reads or writes through it; the transaction type differs per
-//! backend, so the queries of a call go through `BackendTx`, which
+//! A backend is opaque: the caller opens it (a data directory, or a
+//! shared Postgres database from a URL) and reads or writes through it,
+//! without naming which engine it holds. The transaction type differs
+//! per backend, so the queries of a call go through `BackendTx`, which
 //! forwards them to the backend's own transaction.
 
 use gix::ObjectId;
@@ -18,7 +18,7 @@ use crate::db::SqliteTx;
 use crate::error::Result;
 use crate::history::NodeId;
 use crate::land::{LandOutcome, LandRequest, LandState};
-use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId};
+use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId, StaleLand};
 use crate::pg::{Pg, PgTx};
 use std::fmt::Write as _;
 use std::path::Path;
@@ -26,14 +26,59 @@ use std::sync::atomic::AtomicBool;
 
 use crate::store::{Blobs, Store};
 
+#[cfg(any(test, feature = "test-hooks"))]
+#[path = "test_support/backend.rs"]
+pub(crate) mod test_hooks;
+
 /// The metadata storage of a server: the data directory, or a shared
-/// Postgres database.
+/// Postgres database. The backend is opaque — which engine it holds is
+/// private, so a caller matches classes of behavior through the
+/// methods, never the engine: a new engine (or a major bump of one) is
+/// then a private change of this crate, not a break of its API.
 #[derive(Clone)]
-pub enum Backend {
+pub struct Backend {
+    inner: Inner,
+}
+
+/// The one engine this build holds, behind the opaque [`Backend`].
+
+#[derive(Clone)]
+enum Inner {
     /// One data directory on this machine.
     Sqlite(Store),
     /// A Postgres database that a fleet of servers can share.
     Postgres(Pg),
+}
+
+impl Backend {
+    /// A backend on a prepared Postgres handle, for the crate's tests.
+    #[cfg(test)]
+    pub(crate) fn postgres(pg: Pg) -> Self {
+        Self {
+            inner: Inner::Postgres(pg),
+        }
+    }
+
+    /// The Postgres handle, when this backend is one. The crate's own
+    /// code reads it to tell the one-writer engines apart (a Postgres
+    /// database always has one writer; a data directory may be shared).
+    /// The schema versions this open moved, when the open migrated: the
+    /// process that opened records the move in its audit log. A fresh
+    /// open creates the schema and reports none.
+    #[must_use]
+    pub fn migrated(&self) -> Option<(u32, u32)> {
+        match &self.inner {
+            Inner::Sqlite(store) => store.migrated(),
+            Inner::Postgres(pg) => pg.migrated(),
+        }
+    }
+
+    pub(crate) fn as_postgres(&self) -> Option<&Pg> {
+        match &self.inner {
+            Inner::Postgres(pg) => Some(pg),
+            Inner::Sqlite(_) => None,
+        }
+    }
 }
 
 /// The transaction of a [`Backend`]: the queries of one call, forwarded to
@@ -49,21 +94,7 @@ pub enum BackendTx<'a> {
     Postgres(PgTx<'a>),
 }
 
-impl BackendTx<'_> {
-    /// The connection of the data directory, for a test that asserts its
-    /// rows. [`None`] on Postgres, whose rows a test reads through the
-    /// [`MetaTx`] queries.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    pub fn sqlite(&self) -> Option<&rusqlite::Connection> {
-        match self {
-            // SqliteTx derefs to the connection.
-            Self::Sqlite(tx) => Some(tx),
-            Self::Postgres(_) => None,
-        }
-    }
-}
+impl BackendTx<'_> {}
 
 /// Clients that a Postgres backend pools for its reads: as many as a
 /// data directory holds, so the graph-walk bound of the server keeps its
@@ -162,6 +193,12 @@ fn refuse_postgres_marker(data: &Path) -> Result<()> {
 
 /// The store UUID a marker carries, if it names one: 32 hex digits on
 /// its second line.
+/// The store UUID the data directory's marker holds, for the archive's
+/// manifest: it names where the metadata came from.
+pub(crate) fn store_uuid_of(data: &Path) -> Option<[u8; 16]> {
+    marker_uuid(data)
+}
+
 fn marker_uuid(data: &Path) -> Option<[u8; 16]> {
     let text = std::fs::read_to_string(data.join(MARKER)).ok()?;
     let line = text.lines().nth(1)?.trim();
@@ -196,8 +233,9 @@ fn marker_agrees(data: &Path, uuid: [u8; 16]) -> Result<()> {
         }
         Some(_) => {}
         None => {
-            // A fresh pair, or a marker that predates the UUID: the
-            // database's identity is the one this directory takes, and
+            // A fresh pair, a marker that predates the UUID, or a first
+            // open cut before it wrote the marker: the database's
+            // identity is the one this directory takes, and
             // `write_marker` writes it durable at once.
             write_marker(&marker, uuid)?;
         }
@@ -233,28 +271,6 @@ fn hex16(bytes: &[u8; 16]) -> String {
     hex
 }
 
-/// The URL of the test database. Its callers sit behind the test-hooks
-/// feature, and so does this.
-#[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn test_url() -> Result<String> {
-    std::env::var("SCION_TEST_POSTGRES_URL").map_err(|_| {
-        crate::error::Error::InvalidArgument(
-            "SCION_TEST_POSTGRES_URL must name the test database".into(),
-        )
-    })
-}
-
-/// A database schema name that belongs to `data`, so the tests of one
-/// directory share it and no others see it. Its callers sit behind the
-/// test-hooks feature, and so does this.
-#[cfg(any(test, feature = "test-hooks"))]
-pub(crate) fn test_schema(data: &Path) -> String {
-    let path = data.canonicalize().unwrap_or_else(|_| data.to_path_buf());
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(&path, &mut hasher);
-    format!("scion_test_{:016x}", std::hash::Hasher::finish(&hasher))
-}
-
 impl Backend {
     /// Where a ref points.
     ///
@@ -272,21 +288,12 @@ impl Backend {
         })
     }
 
-    /// The advisory-lock key of the test schema's one-server lock, for
-    /// the test that takes the lock from its own connection, as a
-    /// second server process would.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn test_server_lock(data: &Path) -> Result<i64> {
-        Ok(crate::pg::schema_lock_key(&test_schema(data)))
-    }
-
     /// The derive walks of this backend: which are in flight, and the cap
     /// on how many may be.
     pub(crate) fn derive_flights(&self) -> &crate::derived::DeriveFlights {
-        match self {
-            Self::Sqlite(store) => store.derive_flights(),
-            Self::Postgres(pg) => pg.derive_flights(),
+        match &self.inner {
+            Inner::Sqlite(store) => store.derive_flights(),
+            Inner::Postgres(pg) => pg.derive_flights(),
         }
     }
 
@@ -294,9 +301,9 @@ impl Backend {
     #[cfg(test)]
     #[must_use]
     pub(crate) fn writers_waiting(&self) -> usize {
-        match self {
-            Self::Sqlite(store) => store.writers_waiting(),
-            Self::Postgres(pg) => pg.writers_waiting(),
+        match &self.inner {
+            Inner::Sqlite(store) => store.writers_waiting(),
+            Inner::Postgres(pg) => pg.writers_waiting(),
         }
     }
 
@@ -310,9 +317,9 @@ impl Backend {
         &self,
         deadline: Option<&crate::deadline::Deadline>,
     ) -> Result<()> {
-        match self {
-            Self::Sqlite(store) => store.wait_for_writers(deadline),
-            Self::Postgres(pg) => pg.wait_for_writers(deadline),
+        match &self.inner {
+            Inner::Sqlite(store) => store.wait_for_writers(deadline),
+            Inner::Postgres(pg) => pg.wait_for_writers(deadline),
         }
     }
 
@@ -330,11 +337,15 @@ impl Backend {
             refuse_sqlite_dir(data)?;
             let pg = Pg::open_exclusive(url, ca, PG_READERS, data, marker)?;
             marker_agrees(data, pg.store_uuid())?;
-            Ok(Self::Postgres(pg))
+            Ok(Self {
+                inner: Inner::Postgres(pg),
+            })
         } else {
             refuse_damaged_marker(data)?;
             refuse_postgres_marker(data)?;
-            Ok(Self::Sqlite(Store::open(data)?))
+            Ok(Self {
+                inner: Inner::Sqlite(Store::open(data)?),
+            })
         }
     }
 
@@ -352,68 +363,16 @@ impl Backend {
             refuse_sqlite_dir(data)?;
             let pg = Pg::open(url, ca, PG_READERS, data, marker)?;
             marker_agrees(data, pg.store_uuid())?;
-            Ok(Self::Postgres(pg))
+            Ok(Self {
+                inner: Inner::Postgres(pg),
+            })
         } else {
             refuse_damaged_marker(data)?;
             refuse_postgres_marker(data)?;
-            Ok(Self::Sqlite(Store::open_shared(data)?))
+            Ok(Self {
+                inner: Inner::Sqlite(Store::open_shared(data)?),
+            })
         }
-    }
-
-    /// [`Backend::open_test`], as a process that does not land: on the
-    /// data directory this is a shared [`Store`](crate::store::Store).
-    ///
-    /// # Errors
-    ///
-    /// What the store or the database returns, and a missing test URL.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn open_test_shared(data: &Path) -> Result<Self> {
-        if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
-            refuse_damaged_marker(data)?;
-            let marker = Marker::read(data);
-            refuse_sqlite_dir(data)?;
-            let pg =
-                Pg::open_test_shared(&test_url()?, &test_schema(data), PG_READERS, data, marker)?;
-            marker_agrees(data, pg.store_uuid())?;
-            return Ok(Self::Postgres(pg));
-        }
-        refuse_postgres_marker(data)?;
-        Self::open_shared(data, None, None)
-    }
-
-    /// Opens the backend that `SCION_TEST_BACKEND` names, for the
-    /// integration tests: `postgres` runs them against a Postgres database,
-    /// whose URL comes from `SCION_TEST_POSTGRES_URL`; any other value, or
-    /// none, opens the data directory. The URL is never logged.
-    ///
-    /// # Errors
-    ///
-    /// What the store or the database returns, and a missing test URL.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn open_test(data: &Path) -> Result<Self> {
-        if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
-            refuse_damaged_marker(data)?;
-            let marker = Marker::read(data);
-            refuse_sqlite_dir(data)?;
-            let pg = Pg::open_test(&test_url()?, &test_schema(data), PG_READERS, data, marker)?;
-            marker_agrees(data, pg.store_uuid())?;
-            return Ok(Self::Postgres(pg));
-        }
-        refuse_postgres_marker(data)?;
-        Self::open(data, None, None)
-    }
-
-    /// Whether `SCION_TEST_BACKEND` names Postgres. A test that asserts the
-    /// rows of the data directory's database skips itself on Postgres: its
-    /// assertions are about the SQLite schema, which the schema drift test
-    /// covers for Postgres.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    pub fn test_is_postgres() -> bool {
-        std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres")
     }
 
     /// Whether this backend lost its database to another process: every
@@ -421,9 +380,9 @@ impl Backend {
     /// it is never fenced.
     #[must_use]
     pub fn fenced(&self) -> bool {
-        match self {
-            Self::Sqlite(_) => false,
-            Self::Postgres(pg) => pg.fenced(),
+        match &self.inner {
+            Inner::Sqlite(_) => false,
+            Inner::Postgres(pg) => pg.fenced(),
         }
     }
 
@@ -434,46 +393,18 @@ impl Backend {
     /// seam, so it is public and documented instead of doc(hidden).
     #[must_use]
     pub fn fence_flag(&self) -> Option<Arc<AtomicBool>> {
-        match self {
-            Self::Sqlite(_) => None,
-            Self::Postgres(pg) => Some(pg.fence_flag()),
-        }
-    }
-
-    /// The schema that [`Backend::open_test`] gave this data directory on
-    /// Postgres: a test that counts rows through its own Postgres client
-    /// names it the same way. A result, so the callers unwrap one shape.
-    /// The schema a test backend of this directory uses, when the tests
-    /// run on Postgres. Hidden: a test holds a lock in it from a
-    /// connection of its own.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    pub fn test_schema(data: &Path) -> Option<String> {
-        if Self::test_is_postgres() {
-            Some(test_schema(data))
-        } else {
-            None
-        }
-    }
-
-    /// Write transactions run so far. SQLite only.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    pub fn txes(&self) -> u64 {
-        match self {
-            Self::Sqlite(store) => store.txes(),
-            Self::Postgres(_) => 0,
+        match &self.inner {
+            Inner::Sqlite(_) => None,
+            Inner::Postgres(pg) => Some(pg.fence_flag()),
         }
     }
 
     /// The blob folder. Blob files stay on local disk in every backend.
     #[must_use]
     pub fn blobs(&self) -> &Blobs {
-        match self {
-            Self::Sqlite(store) => store.blobs(),
-            Self::Postgres(pg) => pg.blobs(),
+        match &self.inner {
+            Inner::Sqlite(store) => store.blobs(),
+            Inner::Postgres(pg) => pg.blobs(),
         }
     }
 
@@ -482,9 +413,9 @@ impl Backend {
     /// sorts its writers out itself.
     #[must_use]
     pub fn is_shared(&self) -> bool {
-        match self {
-            Self::Sqlite(store) => store.is_shared(),
-            Self::Postgres(_) => false,
+        match &self.inner {
+            Inner::Sqlite(store) => store.is_shared(),
+            Inner::Postgres(_) => false,
         }
     }
 
@@ -495,9 +426,9 @@ impl Backend {
     /// gauges and the collector-key wait. Without it, import, fsck and
     /// gc record nothing.
     pub fn set_metrics(&self, metrics: Arc<Metrics>) {
-        match self {
-            Self::Sqlite(store) => store.set_metrics(metrics),
-            Self::Postgres(pg) => pg.set_metrics(metrics),
+        match &self.inner {
+            Inner::Sqlite(store) => store.set_metrics(metrics),
+            Inner::Postgres(pg) => pg.set_metrics(metrics),
         }
     }
 
@@ -506,89 +437,34 @@ impl Backend {
     /// immediate and whose readers are pages, not connections.
     #[must_use]
     pub fn pg_tx_age(&self) -> Duration {
-        match self {
-            Self::Sqlite(_) => Duration::ZERO,
-            Self::Postgres(pg) => pg.tx_age(),
+        match &self.inner {
+            Inner::Sqlite(_) => Duration::ZERO,
+            Inner::Postgres(pg) => pg.tx_age(),
         }
     }
 
-    /// Commits made so far. SQLite only: it counts the transactions of the
-    /// write connection, which is what the tests of the batching watch.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    pub fn commits(&self) -> u64 {
-        match self {
-            Self::Sqlite(store) => store.commits(),
-            Self::Postgres(_) => 0,
+    /// Runs `f` so every statement sees one snapshot, as an export's
+    /// sections claim. On Postgres, [`Backend::read`] already runs in one
+    /// REPEATABLE READ transaction. On SQLite, [`Backend::read`] runs each
+    /// statement autocommit, so the snapshot needs an explicit read
+    /// transaction on the reader connection.
+    ///
+    /// # Errors
+    ///
+    /// What `f` returns, or a database error from the transaction's
+    /// begin.
+    pub(crate) fn read_snapshot<T>(
+        &self,
+        f: impl FnOnce(&mut BackendTx<'_>) -> Result<T>,
+    ) -> Result<T> {
+        match &self.inner {
+            Inner::Sqlite(store) => store.read_snapshot(|tx| f(&mut BackendTx::Sqlite(tx))),
+            Inner::Postgres(pg) => pg.read(|tx| f(&mut BackendTx::Postgres(tx.reborrow()))),
         }
     }
 }
 
-impl Backend {
-    /// Sets how many of the next commits of the data directory fail as a
-    /// busy database. A Postgres database has no busy error, so this only
-    /// reaches SQLite.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn fail_next_commits(&self, n: u32) {
-        if let Self::Sqlite(store) = self {
-            store.fail_next_commits(n);
-        }
-    }
-
-    /// Sets how long the write connection of the data directory waits for
-    /// a busy database.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn set_busy_timeout(&self, timeout: std::time::Duration) {
-        if let Self::Sqlite(store) = self {
-            store.set_busy_timeout(timeout);
-        }
-    }
-
-    /// The import's test hooks and busy-retry count, the same state on
-    /// both backends.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    fn hooks(&self) -> &crate::store::ImportHooks {
-        match self {
-            Self::Sqlite(store) => store.hooks(),
-            Self::Postgres(pg) => pg.hooks(),
-        }
-    }
-
-    /// Sets the step the tests run after each batch of the import commits.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn set_after_batch(&self, step: Option<crate::store::AfterBatch>) {
-        self.hooks().set_after_batch(step);
-    }
-
-    /// How many busy retries of the import's batches ran so far.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    pub fn busy_retries(&self) -> u64 {
-        self.hooks().busy_retries()
-    }
-
-    /// Runs the test step of a batch boundary, with the count of batches
-    /// done so far.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn run_after_batch(&self, batches: usize) {
-        self.hooks().run_after_batch(batches);
-    }
-
-    /// Counts one busy retry of the import's batch.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub fn note_busy_retry(&self) {
-        self.hooks().note_busy_retry();
-    }
-}
+impl Backend {}
 
 impl Meta for Backend {
     type Tx<'a>
@@ -597,19 +473,19 @@ impl Meta for Backend {
         Self: 'a;
 
     fn read<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
-        match self {
-            Self::Sqlite(store) => store.read(|tx| f(&mut BackendTx::Sqlite(tx))),
-            Self::Postgres(pg) => pg.read(|tx| f(&mut BackendTx::Postgres(tx.reborrow()))),
+        match &self.inner {
+            Inner::Sqlite(store) => store.read(|tx| f(&mut BackendTx::Sqlite(tx))),
+            Inner::Postgres(pg) => pg.read(|tx| f(&mut BackendTx::Postgres(tx.reborrow()))),
         }
     }
 
     fn read_counted<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> (Result<T>, u64) {
-        match self {
-            Self::Sqlite(store) => {
+        match &self.inner {
+            Inner::Sqlite(store) => {
                 let (result, seen) = store.read_counted(|tx| f(&mut BackendTx::Sqlite(tx)));
                 (result, seen)
             }
-            Self::Postgres(pg) => {
+            Inner::Postgres(pg) => {
                 let (result, seen) =
                     pg.read_counted(|tx| f(&mut BackendTx::Postgres(tx.reborrow())));
                 (result, seen)
@@ -618,39 +494,39 @@ impl Meta for Backend {
     }
 
     fn wait_durable(&self, seen: u64) -> Result<()> {
-        match self {
-            Self::Sqlite(store) => store.wait_durable(seen),
-            Self::Postgres(pg) => pg.wait_durable(seen),
+        match &self.inner {
+            Inner::Sqlite(store) => store.wait_durable(seen),
+            Inner::Postgres(pg) => pg.wait_durable(seen),
         }
     }
 
     fn read_unflushed<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
-        match self {
-            Self::Sqlite(store) => store.read_unflushed(|tx| f(&mut BackendTx::Sqlite(tx))),
-            Self::Postgres(pg) => {
+        match &self.inner {
+            Inner::Sqlite(store) => store.read_unflushed(|tx| f(&mut BackendTx::Sqlite(tx))),
+            Inner::Postgres(pg) => {
                 pg.read_unflushed(|tx| f(&mut BackendTx::Postgres(tx.reborrow())))
             }
         }
     }
 
     fn commit<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
-        match self {
-            Self::Sqlite(store) => store.commit(move |tx| f(&mut BackendTx::Sqlite(tx))),
-            Self::Postgres(pg) => pg.commit(move |tx| f(&mut BackendTx::Postgres(tx.reborrow()))),
+        match &self.inner {
+            Inner::Sqlite(store) => store.commit(move |tx| f(&mut BackendTx::Sqlite(tx))),
+            Inner::Postgres(pg) => pg.commit(move |tx| f(&mut BackendTx::Postgres(tx.reborrow()))),
         }
     }
 
     fn write<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
-        match self {
-            Self::Sqlite(store) => store.write(move |tx| f(&mut BackendTx::Sqlite(tx))),
-            Self::Postgres(pg) => pg.write(move |tx| f(&mut BackendTx::Postgres(tx.reborrow()))),
+        match &self.inner {
+            Inner::Sqlite(store) => store.write(move |tx| f(&mut BackendTx::Sqlite(tx))),
+            Inner::Postgres(pg) => pg.write(move |tx| f(&mut BackendTx::Postgres(tx.reborrow()))),
         }
     }
 
     fn flush(&self) -> Result<()> {
-        match self {
-            Self::Sqlite(store) => store.flush(),
-            Self::Postgres(pg) => pg.flush(),
+        match &self.inner {
+            Inner::Sqlite(store) => store.flush(),
+            Inner::Postgres(pg) => pg.flush(),
         }
     }
 }
@@ -667,6 +543,40 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.repo_id(name),
             Self::Postgres(pg) => pg.repo_id(name),
+        }
+    }
+
+    fn set_changeset_batching(&mut self, on: bool) {
+        match self {
+            Self::Sqlite(tx) => tx.set_changeset_batching(on),
+            Self::Postgres(pg) => pg.set_changeset_batching(on),
+        }
+    }
+
+    fn preload_derived_chain(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.preload_derived_chain(kind, version, start, limit),
+            Self::Postgres(pg) => pg.preload_derived_chain(kind, version, start, limit),
+        }
+    }
+
+    fn changeset_batching(&self) -> bool {
+        match self {
+            Self::Sqlite(tx) => tx.changeset_batching(),
+            Self::Postgres(pg) => pg.changeset_batching(),
+        }
+    }
+
+    fn flush_changeset_rows(&mut self, repo: RepoId) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.flush_changeset_rows(repo),
+            Self::Postgres(pg) => pg.flush_changeset_rows(repo),
         }
     }
 
@@ -688,6 +598,18 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.has_changeset(repo, id),
             Self::Postgres(pg) => pg.has_changeset(repo, id),
+        }
+    }
+
+    fn first_parent_page(
+        &mut self,
+        repo: RepoId,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.first_parent_page(repo, start, limit),
+            Self::Postgres(pg) => pg.first_parent_page(repo, start, limit),
         }
     }
 
@@ -717,6 +639,16 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.parents(id, id_gen),
             Self::Postgres(pg) => pg.parents(id, id_gen),
+        }
+    }
+
+    fn parents_many(
+        &mut self,
+        merges: &[(ChangesetId, i64)],
+    ) -> Result<Vec<Vec<(ChangesetId, i64)>>> {
+        match self {
+            Self::Sqlite(tx) => tx.parents_many(merges),
+            Self::Postgres(pg) => pg.parents_many(merges),
         }
     }
 
@@ -783,10 +715,24 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn put_trees(&mut self, trees: &[(TreeId, Vec<u8>)]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.put_trees(trees),
+            Self::Postgres(pg) => pg.put_trees(trees),
+        }
+    }
+
     fn get_tree(&mut self, id: TreeId) -> Result<Tree> {
         match self {
             Self::Sqlite(tx) => tx.get_tree(id),
             Self::Postgres(pg) => pg.get_tree(id),
+        }
+    }
+
+    fn get_trees(&mut self, ids: &[TreeId]) -> Result<Vec<Option<Vec<u8>>>> {
+        match self {
+            Self::Sqlite(tx) => tx.get_trees(ids),
+            Self::Postgres(pg) => pg.get_trees(ids),
         }
     }
 
@@ -811,7 +757,14 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
-    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<(RepoId, i64, String)>> {
+    fn add_repo_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.add_repo_blobs(repo, blobs),
+            Self::Postgres(pg) => pg.add_repo_blobs(repo, blobs),
+        }
+    }
+
+    fn stale_lands(&mut self, stale_secs: i64) -> Result<Vec<StaleLand>> {
         match self {
             Self::Sqlite(tx) => tx.stale_lands(stale_secs),
             Self::Postgres(pg) => pg.stale_lands(stale_secs),
@@ -872,10 +825,17 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
-    fn stored_changeset_body(&mut self, cs: &[u8]) -> Result<Option<Vec<u8>>> {
+    fn stored_changeset_bodies(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, Vec<u8>)>> {
         match self {
-            Self::Sqlite(tx) => tx.stored_changeset_body(cs),
-            Self::Postgres(pg) => pg.stored_changeset_body(cs),
+            Self::Sqlite(tx) => tx.stored_changeset_bodies(ids),
+            Self::Postgres(pg) => pg.stored_changeset_bodies(ids),
+        }
+    }
+
+    fn stored_changeset_body_lengths(&mut self, ids: &[Vec<u8>]) -> Result<Vec<(Vec<u8>, i64)>> {
+        match self {
+            Self::Sqlite(tx) => tx.stored_changeset_body_lengths(ids),
+            Self::Postgres(pg) => pg.stored_changeset_body_lengths(ids),
         }
     }
 
@@ -886,10 +846,41 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn repo_changesets_with_bodies(
+        &mut self,
+        repo: RepoId,
+    ) -> Result<Vec<(Vec<u8>, i64, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.repo_changesets_with_bodies(repo),
+            Self::Postgres(pg) => pg.repo_changesets_with_bodies(repo),
+        }
+    }
+
+    fn list_refs(&mut self, repo: RepoId) -> Result<Vec<(String, Vec<u8>, i64)>> {
+        match self {
+            Self::Sqlite(tx) => tx.list_refs(repo),
+            Self::Postgres(pg) => pg.list_refs(repo),
+        }
+    }
+
+    fn pending_lands(&mut self, repo: RepoId) -> Result<Vec<crate::meta::PendingLand>> {
+        match self {
+            Self::Sqlite(tx) => tx.pending_lands(repo),
+            Self::Postgres(pg) => pg.pending_lands(repo),
+        }
+    }
+
     fn delete_repo_blob(&mut self, repo: RepoId, blob: &[u8]) -> Result<()> {
         match self {
             Self::Sqlite(tx) => tx.delete_repo_blob(repo, blob),
             Self::Postgres(pg) => pg.delete_repo_blob(repo, blob),
+        }
+    }
+
+    fn delete_repo_blobs(&mut self, repo: RepoId, blobs: &[Vec<u8>]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.delete_repo_blobs(repo, blobs),
+            Self::Postgres(pg) => pg.delete_repo_blobs(repo, blobs),
         }
     }
 
@@ -975,6 +966,13 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn repo_missing_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<Vec<BlobId>> {
+        match self {
+            Self::Sqlite(tx) => tx.repo_missing_blobs(repo, blobs),
+            Self::Postgres(pg) => pg.repo_missing_blobs(repo, blobs),
+        }
+    }
+
     #[cfg(any(test, feature = "test-hooks"))]
     fn is_ancestor(
         &mut self,
@@ -1002,6 +1000,13 @@ impl MetaTx for BackendTx<'_> {
         }
     }
 
+    fn restore_ref(&mut self, repo: RepoId, name: &str, target: &[u8], version: i64) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.restore_ref(repo, name, target, version),
+            Self::Postgres(pg) => pg.restore_ref(repo, name, target, version),
+        }
+    }
+
     fn get_derived(
         &mut self,
         kind: &str,
@@ -1011,6 +1016,44 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.get_derived(kind, version, cs),
             Self::Postgres(pg) => pg.get_derived(kind, version, cs),
+        }
+    }
+
+    fn get_derived_batch(
+        &mut self,
+        kind: &str,
+        version: u32,
+        ids: &[ChangesetId],
+    ) -> Result<Vec<Option<Vec<u8>>>> {
+        match self {
+            Self::Sqlite(tx) => tx.get_derived_batch(kind, version, ids),
+            Self::Postgres(pg) => pg.get_derived_batch(kind, version, ids),
+        }
+    }
+
+    fn get_derived_chain(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, Vec<u8>)>> {
+        match self {
+            Self::Sqlite(tx) => tx.get_derived_chain(kind, version, start, limit),
+            Self::Postgres(pg) => pg.get_derived_chain(kind, version, start, limit),
+        }
+    }
+
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn bulk_seed(
+        &mut self,
+        repo: RepoId,
+        css: &[scion_core::Changeset],
+        derived: &[(&'static str, u32, ChangesetId, Vec<u8>)],
+    ) -> Result<Vec<ChangesetId>> {
+        match self {
+            Self::Sqlite(tx) => tx.bulk_seed(repo, css, derived),
+            Self::Postgres(pg) => pg.bulk_seed(repo, css, derived),
         }
     }
 
@@ -1069,6 +1112,13 @@ impl MetaTx for BackendTx<'_> {
         match self {
             Self::Sqlite(tx) => tx.put_git_import(repo, oid, cs),
             Self::Postgres(pg) => pg.put_git_import(repo, oid, cs),
+        }
+    }
+
+    fn put_git_imports(&mut self, repo: RepoId, pairs: &[(ObjectId, ChangesetId)]) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.put_git_imports(repo, pairs),
+            Self::Postgres(pg) => pg.put_git_imports(repo, pairs),
         }
     }
 
