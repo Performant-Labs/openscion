@@ -158,6 +158,11 @@ jobs:
           SCION_PG_URL: postgres://postgres:scion@localhost:5432/scion
           SCION_FAULT_PG: "1"
           SCION_FAULT_PG_CMD: docker restart ${{ job.services.postgres.id }}
+          # soak-fault.sh's restart wait runs bare `pg_isready`, whose
+          # default host is the local socket; on the runner Postgres is
+          # the service container's TCP port, so libpq looks there.
+          PGHOST: "127.0.0.1"
+          PGPORT: "5432"
         run: |
           # The same cap as the SQLite fault soak: 150 min covers 120
           # min of load.
