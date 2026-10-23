@@ -12,8 +12,8 @@ use std::sync::Arc;
 
 use open_scion::client::{set_put_pause, test_objects};
 use scion_proto::runtime::listen::Limits;
-use scion_server::test_support::service;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
+use scion_server::test_support::service;
 use scion_server::{Backend, Quotas};
 use tempfile::TempDir;
 use tokio::net::TcpListener;
@@ -251,7 +251,14 @@ struct Measured {
 
 fn commit_measured(fx: &Fixture, name: &str, file: &std::path::Path) -> Measured {
     let args = [
-        "--server", &fx.url, "--repo", REPO, "commit", "--message", "measured", "--put",
+        "--server",
+        &fx.url,
+        "--repo",
+        REPO,
+        "commit",
+        "--message",
+        "measured",
+        "--put",
     ];
     let put = format!("{name}={}", file.display());
     if cfg!(target_os = "macos") {
@@ -297,8 +304,7 @@ fn commit_measured(fx: &Fixture, name: &str, file: &std::path::Path) -> Measured
             while let Ok(text) = fs::read_to_string(&status) {
                 for line in text.lines() {
                     if let Some(kb) = line.strip_prefix("VmHWM:")
-                        && let Ok(kb) =
-                            kb.trim().trim_end_matches("kB").trim().parse::<u64>()
+                        && let Ok(kb) = kb.trim().trim_end_matches("kB").trim().parse::<u64>()
                     {
                         last = last.max(kb);
                     }
@@ -332,21 +338,16 @@ async fn a_file_that_shrinks_while_it_is_read_is_refused() {
         let short = fs::read(&torn).unwrap();
         fs::write(&torn, &short[..1024]).unwrap();
     })));
-    let mut ctx = open_scion::client::Ctx::connect(
-        &fx.url,
-        None,
-        TOKEN,
-        None,
-        REPO.to_owned(),
-        false,
-    )
-    .await
-    .unwrap();
+    let mut ctx =
+        open_scion::client::Ctx::connect(&fx.url, None, TOKEN, None, REPO.to_owned(), false)
+            .await
+            .unwrap();
     let put = ctx.put_blob_file(&file).await;
     set_put_pause(None);
     let err = put.err().expect("the shrunk file must refuse");
     assert!(
-        err.to_string().contains("changed while it was read; commit again"),
+        err.to_string()
+            .contains("changed while it was read; commit again"),
         "the refusal must name the change: {err:#}"
     );
 }
@@ -363,21 +364,16 @@ async fn a_file_that_grows_while_it_is_read_is_refused() {
         bytes.push(0xff);
         fs::write(&grown, bytes).unwrap();
     })));
-    let mut ctx = open_scion::client::Ctx::connect(
-        &fx.url,
-        None,
-        TOKEN,
-        None,
-        REPO.to_owned(),
-        false,
-    )
-    .await
-    .unwrap();
+    let mut ctx =
+        open_scion::client::Ctx::connect(&fx.url, None, TOKEN, None, REPO.to_owned(), false)
+            .await
+            .unwrap();
     let put = ctx.put_blob_file(&file).await;
     set_put_pause(None);
     let err = put.err().expect("the grown file must refuse");
     assert!(
-        err.to_string().contains("changed while it was read; commit again"),
+        err.to_string()
+            .contains("changed while it was read; commit again"),
         "the refusal must name the change: {err:#}"
     );
 }
@@ -395,21 +391,16 @@ async fn a_file_whose_mtime_changes_while_it_is_read_is_refused() {
         new.set_modified(std::time::SystemTime::now() + std::time::Duration::from_secs(2))
             .unwrap();
     })));
-    let mut ctx = open_scion::client::Ctx::connect(
-        &fx.url,
-        None,
-        TOKEN,
-        None,
-        REPO.to_owned(),
-        false,
-    )
-    .await
-    .unwrap();
+    let mut ctx =
+        open_scion::client::Ctx::connect(&fx.url, None, TOKEN, None, REPO.to_owned(), false)
+            .await
+            .unwrap();
     let put = ctx.put_blob_file(&file).await;
     set_put_pause(None);
     let err = put.err().expect("the touched file must refuse");
     assert!(
-        err.to_string().contains("changed while it was read; commit again"),
+        err.to_string()
+            .contains("changed while it was read; commit again"),
         "the refusal must name the change: {err:#}"
     );
 }
@@ -426,16 +417,10 @@ async fn the_client_refuses_a_torn_file() {
         let short = fs::read(&torn).unwrap();
         fs::write(&torn, &short[..3]).unwrap();
     })));
-    let mut ctx = open_scion::client::Ctx::connect(
-        &fx.url,
-        None,
-        TOKEN,
-        None,
-        REPO.to_owned(),
-        false,
-    )
-    .await
-    .unwrap();
+    let mut ctx =
+        open_scion::client::Ctx::connect(&fx.url, None, TOKEN, None, REPO.to_owned(), false)
+            .await
+            .unwrap();
     let put = ctx.put_blob_file(&file).await;
     set_put_pause(None);
     let err = put.err().expect("the torn read must fail");

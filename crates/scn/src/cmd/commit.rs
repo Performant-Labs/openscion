@@ -111,9 +111,10 @@ pub async fn commit(ctx: &mut Ctx, args: CommitArgs) -> Result<()> {
             }
             Edit::Put { file, exec } => {
                 check_put(&file)?;
-                let content = ctx.put_blob_file(&file).await.with_context(|| {
-                    format!("cannot upload {}", file.display())
-                })?;
+                let content = ctx
+                    .put_blob_file(&file)
+                    .await
+                    .with_context(|| format!("cannot upload {}", file.display()))?;
                 Some(FileState::Regular {
                     content,
                     executable: exec,

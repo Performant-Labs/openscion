@@ -15,8 +15,8 @@ use scion_proto::runtime::tls::ClientTls;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ResolveRefRequest};
-use tokio_stream::{StreamExt as _, wrappers::ReceiverStream};
 use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_PART_MESSAGE_BYTES};
+use tokio_stream::{StreamExt as _, wrappers::ReceiverStream};
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::Interceptor;
 use tonic::service::interceptor::InterceptedService;
@@ -97,8 +97,7 @@ impl Interceptor for Call {
 /// file: it changed while it was read, so the read saw a torn mix. Other
 /// errors pass as themselves.
 fn changed(file: &Path, e: std::io::Error) -> std::io::Error {
-    if e.kind() == std::io::ErrorKind::UnexpectedEof
-        || e.kind() == std::io::ErrorKind::InvalidData
+    if e.kind() == std::io::ErrorKind::UnexpectedEof || e.kind() == std::io::ErrorKind::InvalidData
     {
         std::io::Error::other(format!(
             "{} changed while it was read; commit again",
@@ -137,7 +136,7 @@ fn take_put_pause() {
 fn take_put_pause() {}
 
 /// Whether the streaming put's whole-file mutation lever is flipped
-/// (SCION_TEST_COMMIT_MUTATION = whole_file). Test-hooks only: the
+/// (`SCION_TEST_COMMIT_MUTATION` = `whole_file`). Test-hooks only: the
 /// ceiling guard sets it to prove the guard is not vacuous.
 #[cfg(any(test, feature = "test-hooks"))]
 fn mutation_whole_file() -> bool {
@@ -331,7 +330,10 @@ impl Ctx {
                 let mut f = fs::File::open(&path)?;
                 let mut left = len;
                 loop {
-                    let want = left.min(CHUNK_BYTES as u64) as usize;
+                    // The last chunk is the short one; CHUNK_BYTES fits
+                    // any pointer width.
+                    let want = usize::try_from(left.min(CHUNK_BYTES as u64))
+                        .expect("the chunk size fits usize");
                     let mut chunk = vec![0_u8; want];
                     f.read_exact(&mut chunk).map_err(|e| changed(&path, e))?;
                     left -= want as u64;
@@ -373,13 +375,11 @@ impl Ctx {
         // The reply decides with the read: a refusal of the read names
         // the file, whatever the server answered about the parts.
         let reply = self.client.put_blob(requests).await;
-        match done_rx.recv().unwrap_or(Ok(())) {
-            Err(e) => Err(e.into()),
-            Ok(()) => {
-                let reply = reply?.into_inner();
-                id_from(&reply.blob_id)
-            }
+        if let Err(e) = done_rx.recv().unwrap_or(Ok(())) {
+            return Err(e.into());
         }
+        let reply = reply?.into_inner();
+        id_from(&reply.blob_id)
     }
 
     /// Uploads one file's content in chunks. The first message names the repo;
