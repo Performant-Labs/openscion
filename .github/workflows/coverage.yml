@@ -425,6 +425,32 @@ jobs:
             ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
             2> target/coverage/report-stderr.txt \
             | tee target/coverage/report-summary.txt
+          # C65's diagnostic: name what the report drops. The profiles
+          # hold every function record with its hash; the report maps
+          # the ones whose hash matches a unit it rebuilt. The set
+          # difference, grouped by the crate each mangled name starts
+          # with, says WHAT the dropped set is and HOW BIG each part.
+          pd="$(rustc --print sysroot)/bin/llvm-profdata"
+          "$pd" merge -sparse target/coverage/*.profraw \
+            -o target/coverage/merged.profdata
+          "$pd" show --all-functions target/coverage/merged.profdata \
+            | grep -E '^[^ ].*:$' | sed 's/:$//' | sort -u \
+            > target/coverage/all-fn.txt
+          cargo llvm-cov export --format lcov \
+            --instr-profile target/coverage/merged.profdata \
+            ${COVERAGE_IGNORE:+--ignore-filename-regex "$COVERAGE_IGNORE"} \
+            | grep '^FN:' | sed 's/^FN:[0-9]*,//' | sort -u \
+            > target/coverage/mapped-fn.txt
+          comm -23 target/coverage/all-fn.txt target/coverage/mapped-fn.txt \
+            > target/coverage/unmapped-fn.txt
+          echo "functions in the profiles: $(wc -l < target/coverage/all-fn.txt | tr -d ' ')"
+          echo "functions the report mapped: $(wc -l < target/coverage/mapped-fn.txt | tr -d ' ')"
+          echo "functions dropped: $(wc -l < target/coverage/unmapped-fn.txt | tr -d ' ')"
+          echo "the dropped set, grouped by the mangled name's first crate token:"
+          sed -E 's/^_ZN[0-9]+([A-Za-z_]+)/\1 /' target/coverage/unmapped-fn.txt \
+            | awk '{print $1}' | sort | uniq -c | sort -rn | head -15
+          echo "the dropped set, first 10 names:"
+          head -10 target/coverage/unmapped-fn.txt
           # Guard 1: counters the report could not map are dropped
           # silently into a warning. That is how the split lost the
           # whole Postgres side while the total read 84.86% (run
