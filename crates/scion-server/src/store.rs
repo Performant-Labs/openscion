@@ -1,11 +1,8 @@
-//! Durable state: `SQLite` for metadata and trees, a folder of zstd files for
-//! blobs.
+//! Durable state: metadata in Postgres, a folder of zstd files for blobs.
 //!
 //! ```text
-//! <data>/lock                      shared by every process that uses <data>
+//! <data>/backend                   names the backend and its store UUID
 //! <data>/open.lock                 held while a process opens <data>
-//! <data>/server.lock               held by the one process that may land
-//! <data>/scion.db                  metadata and trees (see migrations/)
 //! <data>/objects/blob/ab/cd..      one zstd file per blob, named by ID
 //! <data>/tmp/                      staging for atomic blob writes and uploads,
 //!                                  one folder per process, held with a lock
@@ -13,17 +10,16 @@
 //!
 //! Every directory that a store makes, `<data>` and the ones above it
 //! included, gets mode 0700 whatever the umask
-//! ([`create_private_dir_all`]): the data is this user's alone, and the
-//! check of `<data>` below refuses a directory the group can write, as
-//! a plain mkdir under Ubuntu's umask 002 makes it.
+//! ([`create_private_dir_all`]): the data is this user's alone, and
+//! [`refuse_bad_dir`] refuses a directory the group can write, as a
+//! plain mkdir under Ubuntu's umask 002 makes it.
 //!
 //! The locks are `flock`s on open files. A forked child shares its parent's
 //! file descriptions, and with them the locks, until it execs, so a child
-//! spawned while a store is dropped can hold the dropped store's lock for
-//! that window. This server never forks, and a store drops only when its
-//! last user is done with it, so a server cannot hit the window. A library
-//! user that forks while it drops a `Store` can: its tests that assert a
-//! released lock must keep child spawns out of that window, as
+//! spawned while a blob store opens can hold its lock for that window.
+//! This server never forks, so a server cannot hit the window. A library
+//! user that forks while it opens a data directory can: its tests that
+//! assert a released lock must keep child spawns out of that window, as
 //! `spawn_guard` does in this crate's tests.
 
 // Every pub item of this module is re-exported by the test seam
@@ -34,25 +30,19 @@
 use std::collections::BTreeSet;
 use std::fs;
 use std::io::{self, ErrorKind, Read, Seek, Write};
-use std::ops::Deref;
-use std::os::unix::fs::{DirBuilderExt as _, MetadataExt as _};
+use std::os::unix::fs::DirBuilderExt as _;
 use std::path::{Path, PathBuf};
 use std::process;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError};
-use std::time::Instant;
-use std::time::{Duration, SystemTime};
+use std::time::SystemTime;
 
-use rusqlite::{Connection, OpenFlags, TransactionBehavior};
 use rustix::fs::FlockOperation;
 use rustix::io::Errno;
 use scion_core::{BlobHasher, BlobId};
 use scion_proto::runtime::auth::create_private_dir_all;
 
-use crate::db::SqliteTx;
-use crate::deadline::Deadline;
-use crate::derived::DeriveFlights;
-use crate::error::{Error, Result, Storage, from_sqlite};
+use crate::error::{Error, Result};
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[path = "test_support/store.rs"]
@@ -61,722 +51,42 @@ pub(crate) mod test_hooks;
 #[cfg(any(test, feature = "test-hooks"))]
 use test_hooks::{DurabilityLog, DurabilityStep, WritePark};
 
-/// The schema version this build makes and reads.
-#[allow(unreachable_pub)]
-pub const SCHEMA_VERSION: u32 = 10;
-
-/// Schema migrations in order. Migration `n`, from 1, moves the database from
-/// version `n - 1` to version `n`. A released migration never changes.
-const MIGRATIONS: [&str; SCHEMA_VERSION as usize] = [
-    include_str!("../migrations/0001_init.sql"),
-    include_str!("../migrations/0002_land_retention.sql"),
-    include_str!("../migrations/0003_derived_values.sql"),
-    include_str!("../migrations/0004_repo_blobs.sql"),
-    include_str!("../migrations/0005_path_history.sql"),
-    include_str!("../migrations/0006_land_created_at.sql"),
-    include_str!("../migrations/0007_tree_sizes.sql"),
-    include_str!("../migrations/0008_view_roots.sql"),
-    include_str!("../migrations/0009_view_trees.sql"),
-    include_str!("../migrations/0010_review.sql"),
-];
-
 /// Largest object accepted or read back, uncompressed: 100 MiB, the hard
 /// per-file limit on GitHub, so any file from a GitHub repository fits.
 pub const MAX_OBJECT_BYTES: usize = 100 << 20;
 
-/// Largest zstd window that a [`BlobReader`] accepts, as a power of two: 2 MiB,
-/// the most that [`Blobs::put`] writes at its level. A frame that needs a
-/// larger window is refused as corrupt.
+/// Largest zstd window that a [`BlobReader`] accepts, as a power of two:
+/// 2 MiB, the most that [`Blobs::put`] writes at its level. A frame that
+/// needs a larger window is refused as corrupt.
 const READER_WINDOW_LOG: u32 = 21;
 
-/// Most memory that a [`BlobReader`] holds between parts: its zstd window and
-/// the decoder's buffers and tables, which take less than 1 MiB.
+/// Most memory that a [`BlobReader`] holds between parts: its zstd window
+/// and the decoder's buffers and tables, which take less than 1 MiB.
 pub const READER_BYTES: usize = (1 << READER_WINDOW_LOG) + (1 << 20);
 
-/// Handle to one data directory. Cheap to clone.
-#[derive(Clone)]
-
-pub struct Store {
-    inner: Arc<Inner>,
-}
-
-/// Read-only connections of one [`Store`], so at most this many reads run at
-/// once. Each has its own page cache, so they are few. They are more than
-/// the graph queries that can run at once, so those never take every one.
+/// Read-only connections of one backend's Postgres pool, so at most this
+/// many reads run at once. They are more than the graph queries that can
+/// run at once, so those never take every one.
 pub(crate) const READERS: usize = 8;
 
 /// The cap on derive walks in flight, across all kinds and repos of one
-/// [`Store`]. Each walk holds the write connection in turns, so walks
-/// beyond the cap only repeat work and starve writes ([#142]).
+/// backend. Each walk holds a writer's turn, so walks beyond the cap only
+/// repeat work and starve writes ([#142]).
 pub(crate) const DERIVE_WALKS_CAP: usize = 8;
 
-/// Counts one writer that is waiting for the write connection, and
-/// subtracts it again, with a wake, when the writer gets in or gives up.
-/// A derive walk between steps waits while the count is above zero.
-struct WriteWaiter<'a>(&'a Mutex<usize>, &'a Condvar);
-
-impl Drop for WriteWaiter<'_> {
-    fn drop(&mut self) {
-        let mut waiting = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        *waiting -= 1;
-        self.1.notify_all();
-    }
+/// What is stored under a blob ID.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BlobStatus {
+    /// No file.
+    Missing,
+    /// The file unpacks to content with this ID.
+    Valid,
+    /// A file exists but is not this blob: torn, truncated or overwritten.
+    Corrupt,
 }
 
-struct Inner {
-    /// Read-only connections for [`Store::read`]. They come before `db`, so
-    /// they close first: the last connection to close checkpoints the log,
-    /// and a read-only one cannot.
-    readers: Readers,
-    /// The write connection, for every commit and [`Store::read_unflushed`].
-    db: Mutex<Connection>,
-    /// The schema versions this open moved, when it migrated. Version 0's
-    /// first open creates the schema, and reports none.
-    migrated: Option<(u32, u32)>,
-    /// Commits that a read may see. It grows under the `db` lock, right
-    /// before each COMMIT runs.
-    committing: AtomicU64,
-    /// Commits that ended. It grows under the `db` lock, right after each
-    /// COMMIT returns, also if it failed.
-    committed: AtomicU64,
-    /// How many of the ended commits a finished full flush covers.
-    flushed: AtomicU64,
-    blobs: Blobs,
-    /// This `Store` holds the directory alone: no other process may use it,
-    /// so a write cannot make one wait.
-    alone: bool,
-    /// `<data>/lock`, shared, until the last clone is dropped.
-    _lock: fs::File,
-    /// `<data>/server.lock`, for a server `Store`.
-    _server_lock: Option<fs::File>,
-    /// Write transactions run so far, for tests of how imports share the
-    /// write lock. Only a test-hooks build reads it, and only its unit
-    /// tests bump it.
-    #[cfg(any(test, feature = "test-hooks"))]
-    txes: AtomicU64,
-    /// How many of the next commits fail as a busy database, for tests of
-    /// the import's busy retry: the transaction ran and rolled back, so
-    /// nothing was written, exactly as a real busy commit ends.
-    fail_commits: AtomicU64,
-    /// The import's test hooks and busy-retry count, as Postgres keeps
-    /// its own.
-    #[cfg(any(test, feature = "test-hooks"))]
-    hooks: test_hooks::ImportHooks,
-    /// The derive walks of this store: which are in flight, and the cap
-    /// on how many may be.
-    derive: DeriveFlights,
-    /// Writers that are waiting for the write connection, with the condvar
-    /// woken when one gets in or gives up. A derive walk between steps
-    /// waits while the count is above zero, so writers have strict
-    /// priority over walk steps: a steady stream of writers delays a cold
-    /// read up to its deadline, never a land ([#142]).
-    writers: Mutex<usize>,
-    write_woken: Condvar,
-}
-
-impl Store {
-    /// The schema versions this open moved, when it migrated: the
-    /// process that opened records the move in its audit log.
-    pub(crate) fn migrated(&self) -> Option<(u32, u32)> {
-        self.inner.migrated
-    }
-
-    /// Gives the blob folder and the derive walks the server's metrics
-    /// registry, once, before the server serves. Import, fsck and gc
-    /// pass none, and nothing records.
-    pub(crate) fn set_metrics(&self, metrics: std::sync::Arc<crate::metrics::Metrics>) {
-        self.inner.blobs.set_metrics(Arc::clone(&metrics));
-        self.inner.derive.set_metrics(metrics);
-    }
-
-    /// Opens or creates a data directory as its server: the one `Store` that
-    /// may land. A new directory gets mode 0700. Lands are serialized in
-    /// memory, so a second server `Store`, in this process or another, is
-    /// refused. Shared `Store`s ([`Store::open_shared`]) may use the
-    /// directory at the same time.
-    ///
-    /// The locks are released when the last clone of the returned `Store` is
-    /// dropped.
-    ///
-    /// # Errors
-    ///
-    /// Fails if another server `Store` has the directory open, or a process
-    /// of an older build that holds it alone. Fails if the directory or
-    /// database cannot be created, or if the schema is newer than this build,
-    /// or older while another `Store` uses the directory.
-    pub fn open(dir: &Path) -> Result<Self> {
-        Self::open_as(dir, true, &build(), DeriveFlights::new(DERIVE_WALKS_CAP))
-    }
-
-    /// Opens or creates a data directory as its server, with a cap of
-    /// `walks` derive walks in flight. For tests of the cap.
-    #[cfg(test)]
-    pub(crate) fn open_with_walks(dir: &Path, walks: usize) -> Result<Self> {
-        Self::open_as(dir, true, &build(), DeriveFlights::new(walks))
-    }
-
-    /// Opens or creates a data directory as its server, with a byte budget
-    /// for its bounded derive walks. For tests of the budget.
-    #[cfg(test)]
-    pub(crate) fn open_with_walk_bytes(
-        dir: &Path,
-        walks: usize,
-        walk_bytes: crate::memory::Bytes,
-    ) -> Result<Self> {
-        Self::open_as(
-            dir,
-            true,
-            &build(),
-            DeriveFlights::with_walk_bytes(walks, walk_bytes),
-        )
-    }
-
-    /// Opens or creates a data directory for a process that does not land,
-    /// such as `scion-server import`. Any number of shared `Store`s may use
-    /// the directory, beside one server `Store`.
-    ///
-    /// Each commit of a shared `Store` is durable before any other process
-    /// can read it: the commit runs a full flush of the drive cache
-    /// (`fullfsync`). A server replies with what it reads without a flush of
-    /// its own, so this keeps its replies durable. The other way round,
-    /// [`Store::read`] of a shared `Store` waits only for its own commits: a
-    /// caller that relies on a commit of the server calls [`Store::flush`].
-    /// A shared `Store` must not land.
-    ///
-    /// # Errors
-    ///
-    /// As [`Store::open`], except that a server `Store` is no conflict.
-    pub fn open_shared(dir: &Path) -> Result<Self> {
-        Self::open_as(dir, false, &build(), DeriveFlights::new(DERIVE_WALKS_CAP))
-    }
-
-    /// Opens a data directory for a process of build `build` ([`build`]).
-    /// Refuses a data directory that a symlink or a group/others-writable
-    /// mode would make unsafe, before anything opens inside it. The
-    /// refusal is by kind, not by the link's mode: on macOS lchmod can
-    /// give a symlink any mode, so a mode check alone does not catch one,
-    /// and a link's target can change behind the checks.
-    fn refuse_bad_dir(dir: &Path) -> Result<()> {
-        let meta = fs::symlink_metadata(dir)?;
-        if meta.file_type().is_symlink() {
-            return Err(io::Error::new(
-                ErrorKind::PermissionDenied,
-                format!(
-                    "{} is a symlink (the data directory must be a real directory: a symlink's target and mode can change behind the checks)",
-                    dir.display()
-                ),
-            )
-            .into());
-        }
-        if meta.mode() & 0o022 != 0 {
-            return Err(io::Error::new(
-                ErrorKind::PermissionDenied,
-                format!(
-                    "{} can be written by group or others (fix: chmod go-w {})",
-                    dir.display(),
-                    dir.display()
-                ),
-            )
-            .into());
-        }
-        Ok(())
-    }
-
-    fn open_as(dir: &Path, server: bool, build: &str, derive: DeriveFlights) -> Result<Self> {
-        create_private_dir_all(dir)?;
-        // The blobs and the metadata are only as private as the directory:
-        // a group- or others-writable directory lets another user read or
-        // replace them, and so does one under a directory another user can
-        // change.
-        Self::refuse_bad_dir(dir)?;
-        let me = rustix::process::geteuid().as_raw();
-        let dir = scion_proto::runtime::auth::check_ancestors(dir, me)?;
-        // A second server fails here, before it waits for anything.
-        let server_lock = if server {
-            let file = lock_file(&dir, "server.lock")?;
-            if !flock(&file, FlockOperation::NonBlockingLockExclusive)? {
-                return Err(in_use(&dir, "server.lock", "another server"));
-            }
-            Some(file)
-        } else {
-            None
-        };
-        // Opens take turns, so no other open of this build runs until this
-        // one ends. If `lock` can be taken exclusive, no other process uses
-        // the directory. Shared from then on, it keeps out a process of an
-        // older build, which holds it exclusive for its whole life.
-        let opening = lock_file(&dir, "open.lock")?;
-        flock(&opening, FlockOperation::LockExclusive)?;
-        let lock = lock_file(&dir, "lock")?;
-        let alone = flock(&lock, FlockOperation::NonBlockingLockExclusive)?;
-        if !flock(&lock, FlockOperation::NonBlockingLockShared)? {
-            return Err(in_use(&dir, "lock", "a process that holds it alone"));
-        }
-        // The first process writes its build into `lock`, and every other
-        // one must have the same build.
-        if alone {
-            lock.set_len(0)?;
-            (&lock).write_all(build.as_bytes())?;
-        } else {
-            let mut theirs = String::new();
-            (&lock).read_to_string(&mut theirs)?;
-            if theirs != build {
-                return Err(Error::FailedPrecondition(format!(
-                    "data directory {} is in use by a process of another build \
-                     ({theirs}); this build is {build}. Stop it, or use the same build",
-                    dir.display()
-                )));
-            }
-        }
-        let blobs = Blobs::open(&dir)?;
-        // Every open removes the folders of dead processes; only an open
-        // that is alone also removes files, which a build older than the
-        // folders may have left.
-        blobs.sweep_tmp(alone)?;
-        let path = dir.join("scion.db");
-        let db = connect(&path, OpenFlags::default())?;
-        // `fullfsync = OFF` for a server: a commit ends with a plain fsync,
-        // and `write` then waits for a full flush of the drive cache that it
-        // shares with concurrent commits and blob syncs. With `ON`, each
-        // commit runs its own full flush under the write connection's lock,
-        // which a shared `Store` needs (see `open_shared`). Its commits are few and
-        // large. `checkpoint_fullfsync`: a checkpoint, which is rare, fully
-        // flushes the pages it copies before the log can be reused.
-        let pragmas = format!(
-            "PRAGMA journal_mode = WAL;
-             PRAGMA synchronous = FULL;
-             PRAGMA fullfsync = {};
-             PRAGMA checkpoint_fullfsync = ON;
-             PRAGMA foreign_keys = ON;",
-            if server { "OFF" } else { "ON" }
-        );
-        db.execute_batch(&pragmas).map_err(from_sqlite)?;
-        // Only a `Store` that is alone changes the schema.
-        let version = user_version(&mut SqliteTx(&db))?;
-        if !alone && version < SCHEMA_VERSION {
-            return Err(Error::FailedPrecondition(format!(
-                "database schema version {version} is older than this build \
-                 ({SCHEMA_VERSION}); stop the other processes that use {} so \
-                 that this one can upgrade it",
-                dir.display()
-            )));
-        }
-        let migrated = migrate(&db, SCHEMA_VERSION)?;
-        drop(opening);
-        // After the migrations, so no read sees an older schema.
-        let readers = Readers::open(&path)?;
-        Ok(Self {
-            inner: Arc::new(Inner {
-                readers,
-                db: Mutex::new(db),
-                migrated,
-                committing: AtomicU64::new(0),
-                committed: AtomicU64::new(0),
-                flushed: AtomicU64::new(0),
-                blobs,
-                alone,
-                _lock: lock,
-                _server_lock: server_lock,
-                #[cfg(any(test, feature = "test-hooks"))]
-                txes: AtomicU64::new(0),
-                fail_commits: AtomicU64::new(0),
-                #[cfg(any(test, feature = "test-hooks"))]
-                hooks: test_hooks::ImportHooks::default(),
-                derive,
-                writers: Mutex::new(0),
-                write_woken: Condvar::new(),
-            }),
-        })
-    }
-
-    /// How many writers are waiting for the write connection.
-    #[cfg(test)]
-    #[must_use]
-    pub(crate) fn writers_waiting(&self) -> usize {
-        *self
-            .inner
-            .writers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-    }
-
-    /// Waits while writers are waiting for the write connection, until the
-    /// deadline. Writers have strict priority over walk steps: a steady
-    /// stream of writers delays a cold read up to its deadline, never a
-    /// land ([#142]).
-    ///
-    /// # Errors
-    ///
-    /// Returns [`Error::DeadlineExceeded`] once the deadline has passed.
-    pub(crate) fn wait_for_writers(&self, deadline: Option<&Deadline>) -> Result<()> {
-        let mut waiting = self
-            .inner
-            .writers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner);
-        while *waiting > 0 {
-            let Some(deadline) = deadline else {
-                waiting = self
-                    .inner
-                    .write_woken
-                    .wait(waiting)
-                    .unwrap_or_else(PoisonError::into_inner);
-                continue;
-            };
-            let budget = deadline.remaining();
-            let (guard, timed_out) = self
-                .inner
-                .write_woken
-                .wait_timeout_while(waiting, budget, |waiting| *waiting > 0)
-                .unwrap_or_else(PoisonError::into_inner);
-            waiting = guard;
-            if timed_out.timed_out() {
-                return Err(Error::DeadlineExceeded(
-                    "the call ran past its deadline".to_owned(),
-                ));
-            }
-        }
-        Ok(())
-    }
-
-    /// The derive walks of this store: which are in flight, and the cap on
-    /// how many may be.
-    #[must_use]
-    pub(crate) fn derive_flights(&self) -> &DeriveFlights {
-        &self.inner.derive
-    }
-
-    /// The blob folder.
-    #[must_use]
-    pub fn blobs(&self) -> &Blobs {
-        &self.inner.blobs
-    }
-
-    /// Runs `f` on a read-only connection, outside any explicit transaction.
-    /// Each statement sees its own snapshot: every commit that it can see
-    /// when it starts. So a caller that needs one consistent view must read
-    /// it in one statement. (A snapshot held across the statements of
-    /// back-to-back reads would keep the log from ever restarting.) Reads run
-    /// beside each other and beside a write. If every read connection is in
-    /// use, this waits for one. Returns once every commit that `f` could see
-    /// is durable, so a reply never shows a commit that a power loss can
-    /// undo.
-    ///
-    /// # Errors
-    ///
-    /// Returns what `f` returns, or an error from [`Store::flush`].
-    pub fn read<T>(&self, f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>) -> Result<T> {
-        let (result, seen) = self.read_counted(f);
-        // An error is an answer too.
-        self.wait_durable(seen)?;
-        result
-    }
-
-    /// Like [`Store::read`], but returns before what `f` saw is durable. Also
-    /// returns a count that covers every commit `f` could see. Pass the
-    /// largest count of a reply's reads to [`Store::wait_durable`] before it
-    /// replies.
-    pub(crate) fn read_counted<T>(
-        &self,
-        f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>,
-    ) -> (Result<T>, u64) {
-        let reader = self.inner.readers.take();
-        let result = f(&mut SqliteTx(&reader));
-        (result, self.inner.committing.load(Ordering::Acquire))
-    }
-
-    /// Runs `f` on one reader connection inside one explicit read
-    /// transaction, so every statement of `f` sees one snapshot. Plain
-    /// [`Store::read`] runs each statement autocommit, and a commit
-    /// between them changes what the later ones see. The cost is the
-    /// snapshot: the log cannot restart while `f` runs.
-    ///
-    /// # Errors
-    ///
-    /// Returns what `f` returns, or an error from the transaction's
-    /// begin.
-    pub(crate) fn read_snapshot<T>(
-        &self,
-        f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>,
-    ) -> Result<T> {
-        let reader = self.inner.readers.take();
-        let result = reader
-            .unchecked_transaction()
-            .map_err(from_sqlite)
-            .and_then(|tx| {
-                // A read transaction: nothing to keep, and the drop rolls
-                // it back. The drop must not hide what `f` returned.
-                let out = f(&mut SqliteTx(&reader));
-                drop(tx);
-                out
-            });
-        self.wait_durable(self.inner.committing.load(Ordering::Acquire))?;
-        result
-    }
-
-    /// Returns once every commit that a read with count `seen` could see is
-    /// durable ([`Store::read_counted`]). Call it after that read.
-    ///
-    /// # Errors
-    ///
-    /// An error from [`Store::flush`].
-    pub(crate) fn wait_durable(&self, seen: u64) -> Result<()> {
-        // Why no reply shows a commit that is not durable. Say the read saw
-        // commit k: the k-th commit of this `Store` (they take turns under
-        // the `db` lock).
-        // 1. `commit` counts k in `committing` before its COMMIT runs, and
-        //    the read sees it only after that COMMIT made it visible. So
-        //    `seen`, loaded after the read, is at least k. (SQLite makes a
-        //    commit visible through its log index, under locks and memory
-        //    barriers, so the count is visible to the read too.)
-        // 2. If `flushed >= seen`, a flush loaded `committed >= k`, after
-        //    commit k ended, and then finished a full flush that covers it.
-        // 3. Else this call flushes. That flush starts after the read, and
-        //    with `synchronous = FULL` a commit's log reaches the drive
-        //    before the commit is visible. So the flush covers commit k.
-        // Counted after its COMMIT instead, a commit could be seen before it
-        // is counted, and the read would skip the flush.
-        if seen > self.inner.flushed.load(Ordering::Acquire) {
-            self.flush()?;
-        }
-        Ok(())
-    }
-
-    /// Runs `f` on the write connection, outside any explicit transaction.
-    /// It waits for a write in progress, and writes wait for it. Unlike
-    /// [`Store::read`], it returns before what `f` saw is durable. Use it
-    /// only inside a write that calls [`Store::flush`] before it replies.
-    ///
-    /// # Errors
-    ///
-    /// Returns what `f` returns.
-    pub fn read_unflushed<T>(
-        &self,
-        f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>,
-    ) -> Result<T> {
-        let db = self.lock();
-        f(&mut SqliteTx(&db))
-    }
-
-    /// Whether another process may use the directory at the same time. A
-    /// [`Store::open_shared`] shares even if it found nobody; only one that
-    /// took the directory alone is not shared.
-    pub(crate) fn is_shared(&self) -> bool {
-        !self.inner.alone
-    }
-
-    /// Runs `f` in one write transaction. Commits if `f` returns `Ok`, rolls
-    /// back otherwise. Returns once the commit is durable: [`Store::commit`],
-    /// then [`Store::flush`].
-    ///
-    /// # Errors
-    ///
-    /// As [`Store::commit`] and [`Store::flush`].
-    pub fn write<T>(&self, f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>) -> Result<T> {
-        let value = self.commit(f)?;
-        self.flush()?;
-        Ok(value)
-    }
-
-    /// Like [`Store::write`], but returns before the commit is durable. Call
-    /// [`Store::flush`] before replying with anything the commit wrote.
-    ///
-    /// # Errors
-    ///
-    /// Returns what `f` returns, or a database error from begin or commit.
-    pub fn commit<T>(
-        &self,
-        f: impl for<'x> FnOnce(&'x mut SqliteTx<'x>) -> Result<T>,
-    ) -> Result<T> {
-        *self
-            .inner
-            .writers
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) += 1;
-        let _waiting = WriteWaiter(&self.inner.writers, &self.inner.write_woken);
-        let mut db = self.lock();
-        let tx = db
-            .transaction_with_behavior(TransactionBehavior::Immediate)
-            .map_err(from_sqlite)?;
-        let value = f(&mut SqliteTx(&tx))?;
-        // Counted before a read can see it, and again once it ended (see
-        // `read` and `flush`).
-        self.inner.committing.fetch_add(1, Ordering::Release);
-        if self.inner.fail_commits.load(Ordering::Relaxed) > 0 {
-            self.inner.fail_commits.fetch_sub(1, Ordering::Relaxed);
-            // Counted as ended, as a real failed commit is. The transaction
-            // drops here, which rolls it back: nothing was written, exactly
-            // as a commit past `busy_timeout` ends.
-            self.inner.committed.fetch_add(1, Ordering::Release);
-            let fail = std::io::Error::other("the commit was made to fail by the test hook");
-            return Err(Error::Storage(Storage::busy(fail)));
-        }
-        let committed = tx.commit();
-        self.inner.committed.fetch_add(1, Ordering::Release);
-        #[cfg(test)]
-        self.inner.txes.fetch_add(1, Ordering::Relaxed);
-        committed.map_err(from_sqlite)?;
-        Ok(value)
-    }
-
-    /// Returns once every commit made before this call is durable.
-    ///
-    /// No write acknowledged after a flush is lost. A full flush of the drive
-    /// cache covers every commit before it, and the log recovered after a
-    /// crash is a prefix of the commits (the write-ahead log's checksums are
-    /// chained). So a land that builds on a head that is not durable yet
-    /// replies only after a flush that covers that head too, and every land
-    /// reply — an error reply that says the land stays pending included —
-    /// waits for a flush that covers the row it recorded.
-    ///
-    /// # Errors
-    ///
-    /// Fails if the flush fails. The commits stay, but may not be durable; a
-    /// retry sees them.
-    pub fn flush(&self) -> Result<()> {
-        // The full flush starts after this load, so it covers these commits:
-        // each ended, so its log reached the drive. Not `committing`: a
-        // commit counted there may not have written its log yet.
-        let covers = self.inner.committed.load(Ordering::Acquire);
-        // Concurrent calls share one flush, made outside the write
-        // connection's lock.
-        if FSYNC_LEAVES_DRIVE_CACHE {
-            self.inner.blobs.full_flush()?;
-        }
-        self.inner.flushed.fetch_max(covers, Ordering::Release);
-        Ok(())
-    }
-
-    fn lock(&self) -> MutexGuard<'_, Connection> {
-        // A panic mid-call drops its transaction, which rolls back, so the
-        // connection is still usable.
-        self.inner.db.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// Opens a connection to `path` with the settings that every connection
-/// needs.
-fn connect(path: &Path, flags: OpenFlags) -> Result<Connection> {
-    let db = Connection::open_with_flags(path, flags).map_err(from_sqlite)?;
-    // Writes of the processes take turns: one waits up to 5 s for the
-    // other's transaction. A read waits as long while another connection
-    // recovers the log.
-    db.busy_timeout(Duration::from_secs(5))
-        .map_err(from_sqlite)?;
-    // Enough for every hot statement, so none is prepared twice.
-    db.set_prepared_statement_cache_capacity(64);
-    Ok(db)
-}
-
-/// The [`READERS`] read-only connections of a [`Store`]. In WAL mode they
-/// read beside the write connection.
-struct Readers {
-    path: PathBuf,
-    idle: Mutex<Vec<Connection>>,
-    returned: Condvar,
-}
-
-impl Readers {
-    fn open(path: &Path) -> Result<Self> {
-        let idle = (0..READERS)
-            .map(|_| Self::connect(path))
-            .collect::<Result<_>>()?;
-        Ok(Self {
-            path: path.to_owned(),
-            idle: Mutex::new(idle),
-            returned: Condvar::new(),
-        })
-    }
-
-    fn connect(path: &Path) -> Result<Connection> {
-        let flags = OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX;
-        connect(path, flags)
-    }
-
-    /// Takes an idle connection, or waits until one is returned.
-    fn take(&self) -> Reader<'_> {
-        let mut idle = self.idle();
-        loop {
-            if let Some(conn) = idle.pop() {
-                return Reader {
-                    readers: self,
-                    conn: Some(conn),
-                };
-            }
-            idle = self
-                .returned
-                .wait(idle)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-    }
-
-    fn idle(&self) -> MutexGuard<'_, Vec<Connection>> {
-        // Nothing panics while the lock is held.
-        self.idle.lock().unwrap_or_else(PoisonError::into_inner)
-    }
-}
-
-/// A connection taken from [`Readers`]. It goes back when dropped, also when
-/// a read panics.
-struct Reader<'a> {
-    readers: &'a Readers,
-    /// `None` only while it goes back.
-    conn: Option<Connection>,
-}
-
-impl Deref for Reader<'_> {
-    type Target = Connection;
-
-    fn deref(&self) -> &Connection {
-        self.conn.as_ref().expect("a reader holds its connection")
-    }
-}
-
-impl Drop for Reader<'_> {
-    fn drop(&mut self) {
-        let Some(conn) = self.conn.take() else {
-            return;
-        };
-        // A connection left in a transaction would keep its snapshot for the
-        // next reads, and keep the log from restarting. So it is replaced.
-        let conn = if conn.is_autocommit() {
-            conn
-        } else {
-            drop(conn);
-            tracing::error!("a read left a transaction open; its connection is replaced");
-            match Readers::connect(&self.readers.path) {
-                Ok(conn) => conn,
-                Err(e) => {
-                    tracing::error!(%e, "cannot open a read connection; the pool has one fewer");
-                    return;
-                }
-            }
-        };
-        self.readers.idle().push(conn);
-        self.readers.returned.notify_one();
-    }
-}
-
-/// What processes that share a data directory must agree on: the schema,
-/// and the version of each kind of derived data. Each process removes the
-/// derived rows of older versions, which a process of an older build may
-/// still read.
-fn build() -> String {
-    use crate::derived::Kind;
-    use crate::graph::CommitGraph;
-    use crate::history::PathHistory;
-    use crate::tree::RootTree;
-    let kinds = [
-        (RootTree::NAME, RootTree::VERSION),
-        (CommitGraph::NAME, CommitGraph::VERSION),
-        (PathHistory::NAME, PathHistory::VERSION),
-    ];
-    let kinds = kinds.map(|(name, version)| format!("{name} {version}"));
-    format!("schema {SCHEMA_VERSION}, {}", kinds.join(", "))
-}
-
-/// Opens the lock file `<dir>/<name>`, made if missing. A lock on it lasts as
-/// long as the file is open.
+/// Opens (or makes) `dir`'s file `name`, for a `flock`. `open.lock`, the
+/// one open at a time, and the staging folders' `.lock` files ride on it.
 fn lock_file(dir: &Path, name: &str) -> io::Result<fs::File> {
     fs::OpenOptions::new()
         .create(true)
@@ -797,93 +107,46 @@ fn flock(file: &fs::File, op: FlockOperation) -> io::Result<bool> {
     }
 }
 
-fn in_use(dir: &Path, name: &str, by: &str) -> Error {
-    io::Error::new(
-        ErrorKind::WouldBlock,
-        format!(
-            "data directory {} is in use by {by} ({} is locked)",
-            dir.display(),
-            dir.join(name).display()
-        ),
-    )
-    .into()
-}
-
-fn user_version(db: &mut SqliteTx<'_>) -> Result<u32> {
-    db.pragma_query_value(None, "user_version", |row| row.get(0))
-        .map_err(from_sqlite)
-}
-
-/// Runs the migrations from the database's version up to `target`. Only
-/// tests stop below [`SCHEMA_VERSION`], to make an older database.
-/// Returns the `(from, to)` versions when it migrated, and `None` when
-/// the database was at `target` already. A fresh database's first open
-/// (version 0) creates the schema, and reports no migration: nothing is
-/// there for a migration to move.
-///
-/// # Errors
-///
-/// What the version read and the migrations' SQL return.
-#[allow(unreachable_pub)]
-pub fn migrate(db: &Connection, target: u32) -> Result<Option<(u32, u32)>> {
-    let version = user_version(&mut SqliteTx(db))?;
-    if version > SCHEMA_VERSION {
-        return Err(Error::Corrupt(format!(
-            "database schema version {version} is newer than this build ({SCHEMA_VERSION})"
-        )));
+/// Refuses a data directory that a symlink or a group/others-writable
+/// mode would make unsafe, before anything opens inside it. The refusal
+/// is by kind, not by the link's mode: on macOS lchmod can give a
+/// symlink any mode, so a mode check alone does not catch one, and a
+/// link's target can change behind the checks.
+pub(crate) fn refuse_bad_dir(dir: &Path) -> Result<()> {
+    let meta = fs::symlink_metadata(dir)?;
+    if meta.file_type().is_symlink() {
+        return Err(io::Error::new(
+            io::ErrorKind::PermissionDenied,
+            format!(
+                "{} is a symlink (the data directory must be a real directory: a symlink's target and mode can change behind the checks)",
+                dir.display()
+            ),
+        )
+        .into());
     }
-    if version == target {
-        return Ok(None);
-    }
-    tracing::info!(
-        from_version = version,
-        to_version = target,
-        "migrating the metadata schema"
-    );
-    // Each migration runs in its own transaction, with the version it sets.
-    // A crash rolls it back, and the next open runs it again from its start.
-    for (to, sql) in (1..=target).zip(MIGRATIONS).skip(version as usize) {
-        let step = Instant::now();
-        let tx = db.unchecked_transaction().map_err(from_sqlite)?;
-        tx.execute_batch(sql).map_err(from_sqlite)?;
-        if to == 4 {
-            // SQL cannot read the blob IDs inside changeset bytes.
-            crate::db::fill_repo_blobs(&tx)?;
+    // Readable is reachable: the daemon refuses a socket directory open
+    // to other users, and the store's data directory answers the same
+    // rule - group or others get no bits at all.
+    {
+        use std::os::unix::fs::MetadataExt as _;
+        if meta.mode() & 0o077 != 0 {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                format!(
+                    "{} can be read or written by group or others (fix: chmod 700 {})",
+                    dir.display(),
+                    dir.display()
+                ),
+            )
+            .into());
         }
-        tx.pragma_update(None, "user_version", to)
-            .map_err(from_sqlite)?;
-        tx.commit().map_err(from_sqlite)?;
-        tracing::info!(
-            from_version = to - 1,
-            to_version = to,
-            elapsed_ms = u64::try_from(step.elapsed().as_millis()).unwrap_or(u64::MAX),
-            "the metadata schema migrated one step"
-        );
     }
-    tracing::info!(
-        from_version = version,
-        to_version = target,
-        "the metadata migration is done"
-    );
-    // Version 0 was no schema at all: the first open creates one, and a
-    // creation moves nothing.
-    let migrated = if version == 0 {
-        None
-    } else {
-        Some((version, target))
-    };
-    Ok(migrated)
-}
-
-/// What is stored under a blob ID.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum BlobStatus {
-    /// No file.
-    Missing,
-    /// The file unpacks to content with this ID.
-    Valid,
-    /// A file exists but is not this blob: torn, truncated or overwritten.
-    Corrupt,
+    // The mode check covers the directory itself; the ancestors' check is
+    // the swappable parent: a group- or others-writable directory above
+    // the data lets another user replace the data directory whole.
+    let me = rustix::process::geteuid().as_raw();
+    scion_proto::runtime::auth::check_ancestors(dir, me)?;
+    Ok(())
 }
 
 /// The held fan-out directory flock of a blob: the handle's close
@@ -895,8 +158,6 @@ pub(crate) struct DirFlock {
 /// Immutable file contents, one zstd-compressed file per [`BlobId`].
 pub struct Blobs {
     root: PathBuf,
-    /// The staging folder for temp files of every process.
-    tmp: PathBuf,
     /// This process's folder in `tmp/`, held with a lock, so an open of
     /// another process can tell that this one lives.
     mine: PathBuf,
@@ -963,9 +224,24 @@ enum SyncStep<'a> {
 const WRITE_STRIPES: usize = 256;
 
 impl Blobs {
+    /// This process's staging folder under the data directory's `tmp/`:
+    /// a one-shot command removes it when it ends, whatever way it ends,
+    /// so its folder is not left for the next open to sweep.
+    #[must_use]
+    pub fn temp_folder(&self) -> &Path {
+        &self.mine
+    }
+
     pub(crate) fn open(dir: &Path) -> Result<Self> {
         // Folders of `tmp/` made in this process, so each `Blobs` gets its own.
         static FOLDERS: AtomicU64 = AtomicU64::new(0);
+        // Opens take turns: the open.lock is held for the folder creation
+        // and the sweep, so no other process creates a staging folder or
+        // sweeps while this one does. A folder whose `.lock` is not yet
+        // flocked would look dead to a concurrent sweep; the open lock
+        // closes that window.
+        let opening = lock_file(dir, "open.lock")?;
+        flock(&opening, FlockOperation::LockExclusive)?;
         let objects = dir.join("objects");
         let root = objects.join("blob");
         let tmp = dir.join("tmp");
@@ -1004,13 +280,16 @@ impl Blobs {
         for path in [&root, &objects, &tmp, dir] {
             fsync_dir(path)?;
         }
+        // The sweep runs under the open lock: no other open creates a
+        // folder or sweeps while this one does.
+        Self::sweep_tmp_dir(&tmp, &mine)?;
+        drop(opening);
         Ok(Self {
             // The park files live under the data dir, not under
             // `objects/blob`: the test writes them next to the data root.
             #[cfg(any(test, feature = "test-hooks"))]
             park: WritePark::from_env(dir),
             root,
-            tmp,
             mine,
             _mine_lock: mine_lock,
             write_locks: (0..WRITE_STRIPES).map(|_| Mutex::new(())).collect(),
@@ -1069,17 +348,18 @@ impl Blobs {
         Ok(DirFlock { _file: file })
     }
 
-    /// Removes what crashes left in `tmp/`: the folders of processes that no
-    /// longer hold them, with the blob writes that were never renamed, and,
-    /// when this open is alone, files of a build older than the folders. No
-    /// blob name points at any of them. The folders of live processes are
-    /// held, and this process's own folder is held too.
-    pub(crate) fn sweep_tmp(&self, alone: bool) -> io::Result<()> {
+    /// Removes what crashes left in `tmp/`: the folders of processes that
+    /// no longer hold them, with the blob writes that were never renamed.
+    /// No blob name points at any of them. The folders of live processes
+    /// are held, and this process's own folder is held too. Runs under the
+    /// open lock, from [`Blobs::open`], so no other open creates a folder
+    /// or sweeps while this one does.
+    fn sweep_tmp_dir(tmp: &Path, mine: &Path) -> io::Result<()> {
         let mut removed = 0;
-        for entry in fs::read_dir(&self.tmp)? {
+        for entry in fs::read_dir(tmp)? {
             let path = entry?.path();
             if path.is_dir() {
-                if path == self.mine {
+                if path == mine {
                     continue;
                 }
                 // A lock file that cannot be opened was never flocked: its
@@ -1092,9 +372,6 @@ impl Blobs {
                     fs::remove_dir_all(&path)?;
                     removed += 1;
                 }
-            } else if alone {
-                fs::remove_file(&path)?;
-                removed += 1;
             }
         }
         if removed > 0 {
@@ -1730,8 +1007,107 @@ fn too_large() -> Error {
 ///
 /// The `statvfs` of `dir` failed (a directory that is gone).
 pub fn free_bytes(dir: &Path) -> std::io::Result<u64> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    park_free_stat(dir);
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Some(bytes) = *TEST_FREE_BYTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+    {
+        return Ok(bytes);
+    }
     let stats = rustix::fs::statvfs(dir)?;
     Ok(stats.f_bavail.saturating_mul(stats.f_frsize))
+}
+
+/// Holds the free-space read of the parked directory, in a loop the
+/// test's reset ends: a test that needs a statvfs which never answers
+/// names its own directory and resets on the way out, so the parked
+/// thread comes back and no other directory's read waits. Test-only,
+/// and dead to the crates whose features build without the hooks.
+#[cfg(any(test, feature = "test-hooks"))]
+fn park_free_stat(dir: &Path) {
+    loop {
+        let parked = TEST_FREE_STAT_PARKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if parked.as_deref() != Some(dir) {
+            return;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(10));
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+static TEST_FREE_STAT_PARKED: std::sync::Mutex<Option<std::path::PathBuf>> =
+    std::sync::Mutex::new(None);
+
+/// Parks the free-space reads of one directory until the guard drops.
+/// The test hook of a statvfs that never answers, scoped to the
+/// directory the test itself stats, so the binary's other reads of
+/// other directories go on.
+#[cfg(any(test, feature = "test-hooks"))]
+#[allow(dead_code)]
+pub(crate) struct ParkFreeStat(std::path::PathBuf);
+
+#[cfg(any(test, feature = "test-hooks"))]
+#[allow(dead_code)]
+impl ParkFreeStat {
+    pub(crate) fn now(dir: std::path::PathBuf) -> Self {
+        *TEST_FREE_STAT_PARKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(dir.clone());
+        Self(dir)
+    }
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+impl Drop for ParkFreeStat {
+    fn drop(&mut self) {
+        *TEST_FREE_STAT_PARKED
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    }
+}
+
+/// The free-bytes read's test override: the tests that need a small
+/// filesystem set a value, and reset it to `None` on the way out. The
+/// override is process-global, so the tests that touch it share the
+/// preflight's test lock. The lib tests of other crates' features do
+/// not reach it; the dead-code lint is told, not fought.
+#[cfg(any(test, feature = "test-hooks"))]
+#[allow(dead_code)]
+pub(crate) fn test_set_free_bytes(value: Option<u64>) {
+    *TEST_FREE_BYTES
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = value;
+}
+
+#[cfg(any(test, feature = "test-hooks"))]
+static TEST_FREE_BYTES: std::sync::Mutex<Option<u64>> = std::sync::Mutex::new(None);
+
+/// The inodes free for this user on the filesystem that holds `dir`:
+/// the other wall of a blob store, one file per blob. `f_favail`, not
+/// `f_ffree`: the inodes a non-root process can really get. `None` when
+/// the filesystem has no fixed inode table (`f_files` == 0; btrfs
+/// reports 0 and grows inodes on demand), so an operator does not get a
+/// false `InodesCritical` on a healthy store.
+///
+/// # Errors
+///
+/// The `statvfs` of `dir` failed (a directory that is gone).
+pub fn free_inodes(dir: &Path) -> std::io::Result<Option<u64>> {
+    #[cfg(any(test, feature = "test-hooks"))]
+    park_free_stat(dir);
+    let stats = rustix::fs::statvfs(dir)?;
+    Ok(inode_headroom(stats.f_files, stats.f_favail))
+}
+
+/// The free-inode count a filesystem with an inode table reports; `None`
+/// when it has none. Pure, so the table test can pin both arms.
+fn inode_headroom(files: u64, avail: u64) -> Option<u64> {
+    if files == 0 { None } else { Some(avail) }
 }
 
 /// Blobs written but not yet durable. Call [`BlobBatch::sync`] before
@@ -2023,6 +1399,14 @@ impl GroupFlush {
         // Nothing panics while the lock is held.
         self.state.lock().unwrap_or_else(PoisonError::into_inner)
     }
+
+    /// The callers of [`GroupFlush::run`] in the wait, for the sharing
+    /// test's latch: the fake flush holds its run open until every caller
+    /// is inside, so none can arrive after the flushes have ended.
+    #[cfg(test)]
+    fn joined(&self) -> usize {
+        self.lock().waiting
+    }
 }
 
 /// Whether [`fsync`] can leave data in the drive cache: true on Apple
@@ -2064,24 +1448,24 @@ pub(crate) mod spawn_guard {
         f()
     }
 
-    /// Waits until the server lock of `dir` is free. Call it on the
+    /// Waits until the open lock of `dir` is free. Call it on the
     /// write side (inside [`Self::across_release`]), after dropping the
     /// stores and before the reopen that must see the lock released.
     ///
     /// The poll takes the real condition — the lock is free — instead of
-    /// a timing guess: it opens `<dir>/server.lock` and takes a
+    /// a timing guess: it opens `<dir>/open.lock` and takes a
     /// non-blocking exclusive flock every 1 ms, up to 2 s, then fails
     /// with the holder message, so a real leak still fails. The delay it
     /// absorbs is the operating system's: macOS tears a reaped child's
     /// inherited `flock` down one tick after `waitpid`, and about 7% of
     /// immediate reopens after a Rust spawn and its wait fail with
     /// `EWOULDBLOCK` there, sub-ms; Linux shows 0 of 2,000 rounds (a
-    /// standalone probe). The server never spawns a child, so
-    /// `Store::open` itself needs none of this.
+    /// standalone probe). The server never spawns a child, so an open
+    /// itself needs none of this.
     pub fn wait_for_lock_release(dir: &Path) {
         let deadline = Instant::now() + Duration::from_secs(2);
         loop {
-            let file = lock_file(dir, "server.lock")
+            let file = lock_file(dir, "open.lock")
                 .unwrap_or_else(|e| panic!("cannot open the lock of {dir:?}: {e}"));
             let free = flock(&file, FlockOperation::NonBlockingLockExclusive).unwrap_or(false);
             drop(file);
@@ -2119,17 +1503,18 @@ pub(crate) mod spawn_guard {
 
 #[cfg(test)]
 mod tests {
-    use crate::backend::old_store;
-    use crate::db::SqliteTx;
-    use crate::meta::MetaTx as _;
-    use std::cell::{Cell, RefCell};
-    use std::panic;
-    use std::rc::Rc;
+    use crate::Backend;
+    use std::sync::Barrier;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
-    use std::sync::{Barrier, mpsc};
+    use std::sync::mpsc;
     use std::thread;
+    use std::time::Duration;
 
     use super::*;
+
+    /// A URL that names no live database: the directory checks refuse
+    /// before the open reaches it, so a refused open never connects.
+    const NO_URL: &str = "postgres://postgres:scion@127.0.0.1:1/scion";
 
     /// A symlinked data directory is refused by kind, not by the link's
     /// mode: on macOS lchmod can give a symlink any mode, so a mode check
@@ -2137,11 +1522,11 @@ mod tests {
     /// the checks.
     #[test]
     fn a_symlinked_data_directory_is_refused() {
-        let real = tempfile::tempdir().unwrap();
-        let holder = tempfile::tempdir().unwrap();
+        let real = crate::test_support::private_tempdir();
+        let holder = crate::test_support::private_tempdir();
         let link = holder.path().join("data");
         std::os::unix::fs::symlink(real.path(), &link).unwrap();
-        let err = match Store::open(&link) {
+        let err = match Backend::open(&link, NO_URL, None) {
             Err(err) => err.to_string(),
             Ok(_) => panic!("a symlinked data directory is accepted"),
         };
@@ -2157,8 +1542,8 @@ mod tests {
     /// gRPC race of an upload with a copy stored reaches.
     #[test]
     fn a_write_of_one_blob_waits_for_the_stripe() {
-        held_stripe_waits(|store, id, content| {
-            let mut batch = store.blobs().batch();
+        held_stripe_waits(|blobs, id, content| {
+            let mut batch = blobs.batch();
             batch.put(content).unwrap();
             let _ = id;
         });
@@ -2166,8 +1551,8 @@ mod tests {
 
     #[test]
     fn a_replacing_upload_of_one_blob_waits_for_the_stripe() {
-        held_stripe_waits(|store, id, content| {
-            let mut batch = store.blobs().batch();
+        held_stripe_waits(|blobs, id, content| {
+            let mut batch = blobs.batch();
             batch.replace_stored(id, content.len(), content).unwrap();
             batch.flush_dirs().unwrap();
         });
@@ -2178,23 +1563,23 @@ mod tests {
     /// whole once the stripe is free. The lease drops the stripe
     /// however the test ends, so a panicking assert cannot wedge the
     /// writer ([#142]).
-    fn held_stripe_waits(write: impl Fn(&Store, BlobId, &'static [u8]) + Send + Sync) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+    fn held_stripe_waits(write: impl Fn(&Blobs, BlobId, &'static [u8]) + Send + Sync) {
+        let dir = crate::test_support::private_tempdir();
+        let blobs = Blobs::open(dir.path()).unwrap();
         let content = b"the same bytes for both writes";
         let id = BlobId::of(content);
         // The stripe is held by hand, and drops however the test ends: a
         // panicking assert frees the writer at the scope's join ([#142]).
-        let stripe = Mutex::new(store.blobs().write_lock(id));
+        let stripe = Mutex::new(blobs.write_lock(id));
         thread::scope(|scope| {
-            let writer = scope.spawn(|| write(&store, id, content));
+            let writer = scope.spawn(|| write(&blobs, id, content));
             // A ceiling only bounds the wait of the good code: the write
             // of the broken code renames at once, and the absence assert
             // fails.
             let until = std::time::Instant::now() + Duration::from_millis(200);
             let mut landed = false;
             while std::time::Instant::now() < until {
-                if store.blobs().verify(id).unwrap() == BlobStatus::Valid {
+                if blobs.verify(id).unwrap() == BlobStatus::Valid {
                     landed = true;
                     break;
                 }
@@ -2208,7 +1593,7 @@ mod tests {
             writer.join().unwrap();
         });
         assert_eq!(
-            store.blobs().verify(id).unwrap(),
+            blobs.verify(id).unwrap(),
             BlobStatus::Valid,
             "the blob of the held stripe"
         );
@@ -2222,16 +1607,18 @@ mod tests {
             mode.set_mode(0o777);
             fs::set_permissions(path, mode).unwrap();
         };
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("data");
         fs::create_dir(&path).unwrap();
         writable(&path);
-        let Err(err) = Store::open(&path) else {
+        // The directory checks run before the database is contacted, so
+        // a URL that names no live database never matters here.
+        let Err(err) = Backend::open(&path, NO_URL, None) else {
             panic!("the open of a writable data directory must fail");
         };
         assert!(
             err.to_string()
-                .contains("can be written by group or others"),
+                .contains("can be read or written by group or others (fix: chmod 700"),
             "{err}"
         );
         // The same through a parent that another user can change: a
@@ -2241,7 +1628,10 @@ mod tests {
         writable(&parent);
         let path = parent.join("data");
         fs::create_dir(&path).unwrap();
-        let Err(err) = Store::open(&path) else {
+        // The data directory itself is private here: the check under
+        // test is the swappable parent, not the directory's own mode.
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o700)).unwrap();
+        let Err(err) = Backend::open(&path, NO_URL, None) else {
             panic!("the open under a swappable parent must fail");
         };
         assert!(
@@ -2254,24 +1644,21 @@ mod tests {
 
     #[test]
     fn a_blob_size_comes_from_its_frame_header() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let dir = crate::test_support::private_tempdir();
+        let blobs = Blobs::open(dir.path()).unwrap();
         for raw in [b"".to_vec(), b"hello".to_vec(), vec![7; 100_000]] {
-            let id = store.blobs().put(&raw).unwrap();
-            assert_eq!(store.blobs().size(id).unwrap(), raw.len());
+            let id = blobs.put(&raw).unwrap();
+            assert_eq!(blobs.size(id).unwrap(), raw.len());
         }
 
         // A frame with no size in its header is refused, not guessed.
         let id = BlobId::of(b"streamed");
-        let (fan_out, file) = store.blobs().location(id);
+        let (fan_out, file) = blobs.location(id);
         fs::create_dir_all(fan_out).unwrap();
         fs::write(file, zstd::stream::encode_all(&b"streamed"[..], 3).unwrap()).unwrap();
-        assert!(matches!(store.blobs().size(id), Err(Error::Corrupt(_))));
+        assert!(matches!(blobs.size(id), Err(Error::Corrupt(_))));
         let absent = BlobId::of(b"absent");
-        assert!(matches!(
-            store.blobs().size(absent),
-            Err(Error::NotFound(_))
-        ));
+        assert!(matches!(blobs.size(absent), Err(Error::NotFound(_))));
     }
 
     /// A forked child shares the flock of every open file description
@@ -2305,18 +1692,16 @@ mod tests {
             })
         };
         for _ in 0..100 {
-            let dir = tempfile::tempdir().unwrap();
-            let first = Store::open(dir.path()).unwrap();
-            let clone = first.clone();
+            let dir = crate::test_support::private_tempdir();
+            let first = Blobs::open(dir.path()).unwrap();
             super::spawn_guard::across_release(|| {
                 drop(first);
-                drop(clone);
-                // The window between the drops and this open is where a
-                // forked child still holds the lock, one tick past the
-                // reaper on macOS. The poll waits for the real
+                // The window between the drop and this open is where a
+                // forked child still holds a lock the open took, one tick
+                // past the reaper on macOS. The poll waits for the real
                 // condition: the lock is free.
                 super::spawn_guard::wait_for_lock_release(dir.path());
-                Store::open(dir.path()).unwrap();
+                Blobs::open(dir.path()).unwrap();
             });
         }
         stop.store(true, Ordering::Relaxed);
@@ -2325,352 +1710,30 @@ mod tests {
 
     #[test]
     fn a_data_directory_opens_in_one_server_store_at_a_time() {
-        // The last part of this test drops every store and asserts the
-        // lock released, so no child may spawn beside it.
+        // The one-server lock is the database's advisory lock of the
+        // schema (the open refuses with "another server holds this
+        // store"); the open itself still serializes on the directory's
+        // open lock, so no child may spawn beside the drops.
         super::spawn_guard::across_release(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let first = Store::open(dir.path()).unwrap();
-            let clone = first.clone();
-            assert_in_use(Store::open(dir.path()), dir.path(), "another server");
-            // Shared stores open beside it, and a server beside them.
-            let shared = [0, 1].map(|_| Store::open_shared(dir.path()).unwrap());
-            drop(first);
-            assert!(
-                Store::open(dir.path()).is_err(),
-                "a live clone keeps the lock"
-            );
-            drop(clone);
-            super::spawn_guard::wait_for_lock_release(dir.path());
-            Store::open(dir.path()).unwrap();
-            drop(shared);
-        });
-    }
-
-    /// Asserts that an open failed because `by` uses the directory.
-    fn assert_in_use(opened: Result<Store>, dir: &Path, by: &str) {
-        match opened {
-            Err(Error::Io(e)) => {
-                let msg = e.to_string();
-                assert!(msg.contains(&dir.display().to_string()), "{msg}");
-                assert!(msg.contains(&format!("in use by {by}")), "{msg}");
-            }
-            other => panic!("expected the open to fail, got {:?}", other.err()),
-        }
-    }
-
-    /// Holds `<dir>/lock` with `op`, as a process of build `build` would.
-    fn hold_lock(dir: &Path, op: FlockOperation, build: &str) -> fs::File {
-        let file = lock_file(dir, "lock").unwrap();
-        assert!(flock(&file, op).unwrap());
-        (&file).write_all(build.as_bytes()).unwrap();
-        file
-    }
-
-    #[test]
-    fn only_an_open_that_is_alone_removes_temp_files() {
-        // The drops and reopens of this test must see a lock released, so
-        // no child may be in its fork-to-exec window (see `spawn_guard`).
-        super::spawn_guard::across_release(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let tmp = dir.path().join("tmp");
-            let server = Store::open(dir.path()).unwrap();
-            // The temp file of a write that the server has not renamed yet.
-            fs::write(tmp.join("live"), b"x").unwrap();
-            let shared = Store::open_shared(dir.path()).unwrap();
-            assert!(tmp.join("live").exists(), "another process uses it");
-            drop(server);
-            drop(shared);
-            super::spawn_guard::wait_for_lock_release(dir.path());
-            // Now it is what a crash left behind.
-            Store::open_shared(dir.path()).unwrap();
-            assert!(!tmp.join("live").exists());
-        });
-    }
-
-    #[test]
-    fn an_open_removes_the_temp_files_of_a_dead_process() {
-        // The drops and reopens of this test must see a lock released, so
-        // no child may be in its fork-to-exec window (see `spawn_guard`).
-        super::spawn_guard::across_release(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let tmp = dir.path().join("tmp");
-            let server = Store::open(dir.path()).unwrap();
-            // A live importer: its folder is held with its lock, and a blob
-            // write of it that was never renamed sits in the folder.
-            let importer = Store::open_shared(dir.path()).unwrap();
-            let live_dir = importer.blobs().mine.clone();
-            let live_file = live_dir.join("stage");
-            fs::write(&live_file, b"x").unwrap();
-            // What a crashed import left: a folder whose holder is gone.
-            let dead = tmp.join("dead-1");
-            fs::create_dir(&dead).unwrap();
-            fs::write(dead.join(".lock"), b"").unwrap();
-            fs::write(dead.join("stage"), b"x").unwrap();
-            // Another open, while the server and the importer use the directory:
-            // it removes what the dead process left, and nothing else.
-            Store::open_shared(dir.path()).unwrap();
-            assert!(!dead.exists(), "a dead process's folder is removed");
-            assert!(live_dir.exists(), "a live folder is not swept");
-            assert!(
-                live_file.exists(),
-                "a live process's temp file is not swept"
-            );
-            // The server's own staging folder is held, and still works.
-            let id = server.blobs().put(b"x").unwrap();
-            assert_eq!(server.blobs().verify(id).unwrap(), BlobStatus::Valid);
-            // The importer's folder is held only while it lives. Once it is
-            // gone, the next open removes the folder, with the file in it.
-            drop(importer);
-            // The server store stays alive, so the directory stays in use:
-            // no release to wait for.
-            Store::open_shared(dir.path()).unwrap();
-            assert!(!live_file.exists(), "a dead process's folder is removed");
-        });
-    }
-
-    #[test]
-    fn only_an_open_that_is_alone_upgrades_the_schema() {
-        // The drops and reopens of this test must see a lock released, so
-        // no child may be in its fork-to-exec window (see `spawn_guard`).
-        super::spawn_guard::across_release(|| {
-            let dir = tempfile::tempdir().unwrap();
-            {
-                let c = Connection::open(dir.path().join("scion.db")).unwrap();
-                migrate(&c, 1).unwrap();
-            }
-            let version = |store: &Store| store.read(user_version).unwrap();
-            // Another process of this build uses the directory.
-            let live = hold_lock(dir.path(), FlockOperation::NonBlockingLockShared, &build());
-            for open in [Store::open, Store::open_shared] {
-                match open(dir.path()) {
-                    Err(Error::FailedPrecondition(msg)) => {
-                        assert!(msg.contains("version 1 is older"), "{msg}");
-                    }
-                    other => panic!("expected the open to fail, got {:?}", other.err()),
-                }
-            }
-            drop(live);
-            super::spawn_guard::wait_for_lock_release(dir.path());
-            let store = Store::open_shared(dir.path()).unwrap();
-            assert_eq!(version(&store), SCHEMA_VERSION);
-            // A newer schema is refused, alone or not.
-            store
-                .write(|c| {
-                    c.pragma_update(None, "user_version", 99)
-                        .map_err(from_sqlite)
-                })
-                .unwrap();
-            drop(store);
-            super::spawn_guard::wait_for_lock_release(dir.path());
-            for open in [Store::open, Store::open_shared] {
-                assert!(matches!(open(dir.path()), Err(Error::Corrupt(_))));
-            }
-        });
-    }
-
-    /// A data directory written at schema version 1 opens on this build:
-    /// the open migrates it forward through every migration, and what it
-    /// held reads back ([#318]). The fixture is the rows a v1 store's
-    /// write paths left: one repo, one root changeset, its ref, and the
-    /// blob files, which carry no schema. The `repo_blobs` rows the v1
-    /// schema has no room for are filled by the upgrade's own Rust step
-    /// (`db::fill_repo_blobs`), and the trees the old format held are
-    /// dropped by the upgrade and rebuilt from the changesets on demand.
-    #[test]
-    fn a_store_of_schema_version_1_opens_upgrades_and_serves() {
-        super::spawn_guard::across_release(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let scratch = tempfile::tempdir().unwrap();
-            // The blob files, made by this build's writer and copied into
-            // the old directory: blob files are content-addressed and
-            // carry no schema.
-            let (blob_a, blob_b) = {
-                let store = Store::open(scratch.path()).unwrap();
-                let a = store.blobs().put(old_store::A).unwrap();
-                let b = store.blobs().put(old_store::B).unwrap();
-                for id in [a, b] {
-                    // The file of `id` sits at objects/blob/<2 hex>/<rest>
-                    // (the layout of a store's object folder); the copy
-                    // must land at the same place in the old directory.
-                    // A prefix strip would miss: an open may spell the
-                    // same directory through its canonical path, and on
-                    // macOS the two spellings differ (/var, /private/var).
-                    let (_, from) = store.blobs().location(id);
-                    let hex = id.to_string();
-                    let to = dir
-                        .path()
-                        .join("objects")
-                        .join("blob")
-                        .join(&hex[..2])
-                        .join(&hex[2..]);
-                    std::fs::create_dir_all(to.parent().unwrap()).unwrap();
-                    std::fs::copy(from, &to).unwrap();
-                }
-                (a, b)
-            };
-            // The metadata at version 1, as this build's migrations make
-            // it: the schema of 0001 alone, with one repo, its root
-            // changeset and its ref.
-            let cs = old_store::changeset(blob_a, blob_b);
-            let (body, id) = cs.encode_with_id();
-            {
-                let db = Connection::open(dir.path().join("scion.db")).unwrap();
-                super::migrate(&db, 1).unwrap();
-                db.execute("INSERT INTO repos (repo_id, name) VALUES (1, 'main')", [])
-                    .unwrap();
-                db.execute(
-                    "INSERT INTO changesets (id, gen, body) VALUES (?1, 1, ?2)",
-                    rusqlite::params![&id.as_bytes()[..], &body],
-                )
-                .unwrap();
-                db.execute(
-                    "INSERT INTO repo_changesets (repo_id, cs) VALUES (1, ?1)",
-                    rusqlite::params![&id.as_bytes()[..]],
-                )
-                .unwrap();
-                db.execute(
-                    "INSERT INTO refs (repo_id, name, target, version) \
-                     VALUES (1, 'main', ?1, 1)",
-                    rusqlite::params![&id.as_bytes()[..]],
-                )
-                .unwrap();
-            }
-            // A plain open of this build, alone in the directory, moves
-            // the schema to this build's version and serves.
-            let store = Store::open(dir.path()).unwrap();
-            assert_eq!(store.read(user_version).unwrap(), SCHEMA_VERSION);
-            let backend = crate::Backend::sqlite(store);
-            old_store::assert_serves(&backend, &cs, id, blob_a, blob_b);
-        });
-    }
-
-    /// The shipped migrations are frozen: a store an old build made was
-    /// built from these files as they shipped, and an edit would cut
-    /// that store off — its schema and its data would no longer match
-    /// what this build's migrations expect. A change ships as a new
-    /// migration that repairs the data (the `db::fill_repo_blobs` step
-    /// of 0004 is one), never as an edit ([#318]).
-    #[test]
-    fn the_shipped_migrations_stay_as_they_shipped() {
-        for (name, file, hex) in [
-            (
-                "0001_init",
-                include_bytes!("../migrations/0001_init.sql").as_slice(),
-                "eb65ae7921f3617de1e5e1f4e56d6ede0ab665347e3234750d0f823ecaf3ed33",
-            ),
-            (
-                "0002_land_retention",
-                include_bytes!("../migrations/0002_land_retention.sql").as_slice(),
-                "b78776cc8a0e9c819d26b128d0447855d92f54d11fd57a6f9b09180fb49d5e60",
-            ),
-            (
-                "0003_derived_values",
-                include_bytes!("../migrations/0003_derived_values.sql").as_slice(),
-                "24eca54488a578d89eaab1605dc4d7f0de6ab193b894d0b006efc1fc18a16f56",
-            ),
-            (
-                "0004_repo_blobs",
-                include_bytes!("../migrations/0004_repo_blobs.sql").as_slice(),
-                "a0daf78fdc229c5566733a2f024b83406c1db44099c3bdcbb5420ab5b0254ae4",
-            ),
-            (
-                "0005_path_history",
-                include_bytes!("../migrations/0005_path_history.sql").as_slice(),
-                "d2f6208c0ac468954dc8b1c042a5e49b4670eab01db3166991f54b1bae62b410",
-            ),
-            (
-                "0006_land_created_at",
-                include_bytes!("../migrations/0006_land_created_at.sql").as_slice(),
-                "65b9444e6acb7e2ea464ae57cc6353d7ebe678b9ffd36da62ad1cf55e9056392",
-            ),
-            (
-                "0007_tree_sizes",
-                include_bytes!("../migrations/0007_tree_sizes.sql").as_slice(),
-                "147d93ba2ea43a186914895350986cc5e604d3da0a763d455ba3ba6c03d046eb",
-            ),
-            (
-                "0008_view_roots",
-                include_bytes!("../migrations/0008_view_roots.sql").as_slice(),
-                "a6e9a1945d8568082356fb2a7c9b690f83767d291b3e86327501e3176c30c281",
-            ),
-            (
-                "0009_view_trees",
-                include_bytes!("../migrations/0009_view_trees.sql").as_slice(),
-                "f185aa49659731e6da817dc050c8689b1d7618d290d22d98a70998b601704e32",
-            ),
-            (
-                "0010_review",
-                include_bytes!("../migrations/0010_review.sql").as_slice(),
-                "096867491224659d3f997c2d3193845e3af274a040c938ef8fb0721ab50fe43c",
-            ),
-        ] {
-            assert_eq!(
-                blake3::hash(file).to_hex().as_str(),
-                hex,
-                "migration {name} shipped: add a new migration, never edit one",
-            );
-        }
-    }
-
-    #[test]
-    fn a_process_that_holds_the_directory_alone_keeps_every_store_out() {
-        // The drops and reopens of this test must see a lock released, so
-        // no child may be in its fork-to-exec window (see `spawn_guard`).
-        super::spawn_guard::across_release(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let old = hold_lock(dir.path(), FlockOperation::NonBlockingLockExclusive, "");
-            let by = "a process that holds it alone";
-            assert_in_use(Store::open(dir.path()), dir.path(), by);
-            assert_in_use(Store::open_shared(dir.path()), dir.path(), by);
-            drop(old);
-            super::spawn_guard::wait_for_lock_release(dir.path());
-            // A store of this build holds the directory shared once it is open,
-            // so an older build, which takes it alone, is kept out in turn.
-            let store = Store::open(dir.path()).unwrap();
-            let file = lock_file(dir.path(), "lock").unwrap();
-            assert!(!flock(&file, FlockOperation::NonBlockingLockExclusive).unwrap());
-            drop(store);
-            super::spawn_guard::wait_for_lock_release(dir.path());
-        });
-    }
-
-    #[test]
-    fn processes_of_two_builds_never_share_a_directory() {
-        // The drops and reopens of this test must see a lock released, so
-        // no child may be in its fork-to-exec window (see `spawn_guard`).
-        super::spawn_guard::across_release(|| {
-            let dir = tempfile::tempdir().unwrap();
-            let ours = build();
-            // A build with one more kind.
-            let other = format!("{ours}, blame 1");
-            let refused = |opened: Result<Store>| match opened {
+            let dir = crate::test_support::private_tempdir();
+            let first = Backend::open_test(dir.path()).unwrap();
+            match Backend::open_test(dir.path()) {
                 Err(Error::FailedPrecondition(msg)) => {
-                    assert!(msg.contains("another build"), "{msg}");
+                    assert!(msg.contains("another server holds this store"), "{msg}");
                 }
-                other => panic!("expected the open to fail, got {:?}", other.err()),
-            };
-            let server = Store::open(dir.path()).unwrap();
-            refused(Store::open_as(
-                dir.path(),
-                false,
-                &other,
-                DeriveFlights::new(DERIVE_WALKS_CAP),
-            ));
-            Store::open_shared(dir.path()).unwrap();
-            drop(server);
-            // The import of the other build opened alone, so its build counts.
-            let import = Store::open_as(
-                dir.path(),
-                false,
-                &other,
-                DeriveFlights::new(DERIVE_WALKS_CAP),
-            )
-            .unwrap();
-            refused(Store::open(dir.path()));
-            refused(Store::open_shared(dir.path()));
-            drop(import);
-            super::spawn_guard::wait_for_lock_release(dir.path());
-            Store::open(dir.path()).unwrap();
+                other => panic!("expected the second server to fail, got {:?}", other.err()),
+            }
+            // Shared stores open beside it, the way an import does.
+            let shared = [0, 1].map(|_| Backend::open_test_shared(dir.path()).unwrap());
+            drop(first);
+            // The advisory lock rides the server's connection: until its
+            // session ends, the database still refuses a second server.
+            // The worker closes it on its own clock, so the reopen waits
+            // for the real condition, like `wait_for_lock_release` does
+            // for a file lock. The expect keeps a lock that never clears
+            // a test failure: the helper returns the last result.
+            Backend::reopen_test(dir.path()).expect("the store reopens once the old session ends");
+            drop(shared);
         });
     }
 
@@ -2682,7 +1745,7 @@ mod tests {
             // What a crashed import left: its staging folder with many temp
             // files, so removing it takes a while.
             const LEFT: usize = 5_000;
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::private_tempdir();
             let tmp = dir.path().join("tmp");
             let dead = tmp.join("dead");
             fs::create_dir_all(&dead).unwrap();
@@ -2694,14 +1757,14 @@ mod tests {
             // folder lists them.
             let listed_first = fs::read_dir(&dead).unwrap().next().unwrap().unwrap().path();
             let path = dir.path().to_owned();
-            let first = thread::spawn(move || Store::open(&path));
+            let first = thread::spawn(move || Blobs::open(&path));
             while listed_first.exists() && !first.is_finished() {
                 thread::yield_now();
             }
             // The first open is removing the dead folder. A second open waits
             // for it, so the folder that it writes next is safe from that sweep:
             // the dead folder is gone, and the two live ones stay.
-            let second = Store::open_shared(dir.path()).unwrap();
+            let second = Blobs::open(dir.path()).unwrap();
             assert_eq!(fs::read_dir(&tmp).unwrap().count(), 2);
             drop((first.join().unwrap().unwrap(), second));
         });
@@ -2712,12 +1775,12 @@ mod tests {
         // The drops and reopens of this test must see a lock released, so
         // no child may be in its fork-to-exec window (see `spawn_guard`).
         super::spawn_guard::across_release(|| {
-            let dir = tempfile::tempdir().unwrap();
+            let dir = crate::test_support::private_tempdir();
             // Another store is opening the directory.
             let opening = lock_file(dir.path(), "open.lock").unwrap();
             assert!(flock(&opening, FlockOperation::NonBlockingLockExclusive).unwrap());
             let path = dir.path().to_owned();
-            let open = thread::spawn(move || Store::open_shared(&path).map(drop));
+            let open = thread::spawn(move || Blobs::open(&path).map(drop));
             // The open must not finish while the lock is held: a negative
             // cannot be polled for once, so it is asserted across a
             // window, every 20 ms. A slow start of the thread only
@@ -2733,33 +1796,56 @@ mod tests {
     }
 
     #[test]
-    fn a_shared_store_commits_with_full_flushes() {
-        let dir = tempfile::tempdir().unwrap();
-        // Of the write connection, which commits.
-        let fullfsync = |store: &Store| -> bool {
-            store
-                .read_unflushed(|c| {
-                    c.pragma_query_value(None, "fullfsync", |row| row.get(0))
-                        .map_err(from_sqlite)
-                })
-                .unwrap()
-        };
-        assert!(!fullfsync(&Store::open(dir.path()).unwrap()));
-        assert!(fullfsync(&Store::open_shared(dir.path()).unwrap()));
+    fn an_open_spares_the_folder_another_is_still_making() {
+        // The race the open lock covers: the first open sweeps `tmp/`
+        // while the second sits between making its folder and flocking
+        // it (no lock file yet, so the sweep would call it dead and
+        // remove it, uploads and all). The lock holds the sweep back
+        // until the window is over, and the folder the second process
+        // made survives its own sweep's turn.
+        super::spawn_guard::across_release(|| {
+            let dir = crate::test_support::private_tempdir();
+            let tmp = dir.path().join("tmp");
+            fs::create_dir_all(tmp.join("mid-window")).unwrap();
+            fs::write(tmp.join("mid-window").join("staged"), b"").unwrap();
+            // The first open of the directory is in progress.
+            let opening = lock_file(dir.path(), "open.lock").unwrap();
+            assert!(flock(&opening, FlockOperation::NonBlockingLockExclusive).unwrap());
+            let path = dir.path().to_owned();
+            let second = thread::spawn(move || Blobs::open(&path));
+            // A negative cannot be polled for once, so the folder's
+            // survival is asserted across a window, every 20 ms. A slow
+            // start of the thread only strengthens the check.
+            let give_up = std::time::Instant::now() + Duration::from_secs(2);
+            while std::time::Instant::now() < give_up {
+                assert!(
+                    tmp.join("mid-window").exists(),
+                    "an open swept a folder its maker had not locked yet"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+            // The window closes, the second open takes its turn, and the
+            // unheld folder goes: its maker never claimed it.
+            drop(opening);
+            let second = second.join().unwrap().unwrap();
+            assert!(!tmp.join("mid-window").exists());
+            assert_eq!(fs::read_dir(&tmp).unwrap().count(), 1);
+            drop(second);
+        });
     }
 
     #[test]
     fn a_put_records_one_observation_per_fsync_of_the_blob_path() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
-        let store = Store::open(dir.path()).unwrap();
-        store.set_metrics(Arc::clone(&metrics));
+        let blobs = Blobs::open(dir.path()).unwrap();
+        blobs.set_metrics(Arc::clone(&metrics));
         assert!(
             !metrics.render().contains("scion_blob_sync_seconds"),
             "nothing synced yet: {}",
             metrics.render()
         );
-        store.blobs().put(b"recorded").unwrap();
+        blobs.put(b"recorded").unwrap();
         let text = metrics.render();
         // One put fsyncs the temp file and the fan-out directory in
         // `sync`, and `sync` then runs one full flush of the drive cache
@@ -2779,15 +1865,32 @@ mod tests {
 
     #[test]
     fn free_bytes_of_a_tempdir_is_positive() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let free = free_bytes(dir.path()).unwrap();
         assert!(free > 0, "{free}");
     }
 
     #[test]
+    fn free_inodes_of_a_tempdir_is_positive() {
+        let dir = crate::test_support::private_tempdir();
+        let free = free_inodes(dir.path())
+            .unwrap()
+            .expect("a tempdir has an inode table");
+        assert!(free > 0, "{free}");
+    }
+
+    #[test]
+    fn a_filesystem_without_an_inode_table_reports_none() {
+        // (0, 0) is btrfs: no table, no gauge, no false InodesCritical.
+        assert_eq!(inode_headroom(0, 0), None);
+        // (1000, 10) is ext4-like: 10 free inodes of 1000.
+        assert_eq!(inode_headroom(1000, 10), Some(10));
+    }
+
+    #[test]
     fn concurrent_puts_share_full_flushes() {
         const WRITERS: u64 = 32;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let blobs = Blobs::open(dir.path()).unwrap();
         // Odd writers put a blob that is already stored.
         blobs.put(b"stored").unwrap();
@@ -2889,7 +1992,7 @@ mod tests {
 
     #[test]
     fn a_reader_gives_what_put_wrote_in_parts() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let blobs = Blobs::open(dir.path()).unwrap();
         // Larger than the window, so the frame uses the whole window.
         let raw: Vec<u8> = (0..5_u32 << 20)
@@ -2907,7 +2010,7 @@ mod tests {
 
     #[test]
     fn verify_gives_the_same_answer_as_get() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let blobs = Blobs::open(dir.path()).unwrap();
         let packed = zstd::bulk::compress(b"content", 3).unwrap();
         let mut flipped = packed.clone();
@@ -2967,7 +2070,7 @@ mod tests {
 
     #[test]
     fn verify_reports_a_read_error_as_io_not_as_corrupt() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let blobs = Blobs::open(dir.path()).unwrap();
         // A directory opens like a file, but every read of it fails.
         let id = BlobId::of(b"content");
@@ -3000,7 +2103,7 @@ mod tests {
 
     #[test]
     fn an_upload_stores_the_blob_of_all_its_parts() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let blobs = Blobs::open(dir.path()).unwrap();
         let cases: [&[&[u8]]; 4] = [&[], &[b""], &[b"a", b"", b"bc"], &[b"abc"]];
         for parts in cases {
@@ -3020,7 +2123,7 @@ mod tests {
     #[test]
     fn an_upload_keeps_its_parts_on_disk_not_in_memory() {
         const PART: usize = 1 << 20;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let blobs = Blobs::open(dir.path()).unwrap();
         // A period (251) that does not divide the part size, so parts stored
         // in the wrong order give other bytes.
@@ -3040,7 +2143,7 @@ mod tests {
 
     #[test]
     fn one_byte_over_the_limit_fails_an_upload() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let blobs = Blobs::open(dir.path()).unwrap();
         // As if all but one byte of the limit had arrived.
         let mut upload = blobs.upload().unwrap();
@@ -3055,31 +2158,31 @@ mod tests {
 
     #[test]
     fn a_crash_before_the_rename_leaves_no_blob_and_no_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
+        let dir = crate::test_support::private_tempdir();
+        let blobs = Blobs::open(dir.path()).unwrap();
         let content = b"never stored";
         let id = BlobId::of(content);
         // A crash during an upload: no destructor runs.
-        std::mem::forget(store.blobs().upload().unwrap().append(content).unwrap());
+        std::mem::forget(blobs.upload().unwrap().append(content).unwrap());
         // A crash after the compressed file is written, before its rename,
         // in the staging folder of the process that crashed.
-        let mut torn = tempfile::NamedTempFile::new_in(&store.blobs().mine).unwrap();
+        let mut torn = tempfile::NamedTempFile::new_in(&blobs.mine).unwrap();
         torn.write_all(&zstd::bulk::compress(content, 3).unwrap())
             .unwrap();
         torn.keep().unwrap();
-        assert_eq!(staged(store.blobs()), 1, "the spool file has no name");
-        drop(store);
+        assert_eq!(staged(&blobs), 1, "the spool file has no name");
+        drop(blobs);
 
-        let store = Store::open(dir.path()).unwrap();
-        assert_eq!(store.blobs().verify(id).unwrap(), BlobStatus::Missing);
+        let blobs = Blobs::open(dir.path()).unwrap();
+        assert_eq!(blobs.verify(id).unwrap(), BlobStatus::Missing);
         // The folder of the dead process is gone, and this one is empty.
-        assert_eq!(staged(store.blobs()), 0, "open removes what a crash left");
+        assert_eq!(staged(&blobs), 0, "open removes what a crash left");
     }
 
     #[test]
     fn concurrent_uploads_of_one_blob_leave_one_file() {
         const UPLOADERS: usize = 8;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let blobs = Blobs::open(dir.path()).unwrap();
         let content: Vec<u8> = (0..251_u8).cycle().take(3 << 20).collect();
         let ready = Barrier::new(UPLOADERS);
@@ -3110,7 +2213,7 @@ mod tests {
     #[test]
     fn a_put_of_a_stored_blob_still_waits_for_a_full_flush() {
         // Another put may have renamed the file and not synced it yet.
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let blobs = Blobs::open(dir.path()).unwrap();
         blobs.put(b"stored").unwrap();
         let before = blobs.full_flushes();
@@ -3123,7 +2226,6 @@ mod tests {
         const CALLERS: usize = 8;
         let group = GroupFlush::default();
         let runs = AtomicUsize::new(0);
-        let ready = AtomicUsize::new(0);
         let started = AtomicBool::new(false);
         let arrive = Barrier::new(CALLERS);
         let results: Vec<io::Result<()>> = thread::scope(|s| {
@@ -3131,29 +2233,23 @@ mod tests {
                 .map(|_| {
                     s.spawn(|| {
                         arrive.wait();
-                        // Every caller announces itself before the call,
-                        // so the flush that owns the group can hold it
-                        // open until every caller has had the chance to
-                        // share it. A fixed sleep here rested the sharing
-                        // on luck: under load, a caller that arrives late
-                        // runs its own flush, and the count goes wrong.
-                        ready.fetch_add(1, Ordering::SeqCst);
                         group.run(|| {
                             runs.fetch_add(1, Ordering::Relaxed);
                             if started.swap(true, Ordering::SeqCst) {
-                                // A straggler that missed the group runs
-                                // its own flush; the count assert below
-                                // still holds.
+                                // Two leads of one flush race only on
+                                // which of them got the group first; the
+                                // loser runs the closure a second time,
+                                // and the count assert below still holds.
                                 return Err(io::Error::other("the drive is gone"));
                             }
-                            // Generous, so a loaded machine only slows
-                            // the test; the bound keeps a lost scheduler
-                            // slice from hanging it.
+                            // The first flush holds itself open until
+                            // every caller is inside the group's wait,
+                            // so none can arrive after the flushes have
+                            // ended and run its own. The bound keeps a
+                            // lost scheduler slice from hanging it.
                             let give_up = std::time::Instant::now() + Duration::from_secs(30);
-                            while ready.load(Ordering::SeqCst) < CALLERS
-                                && std::time::Instant::now() < give_up
-                            {
-                                thread::sleep(Duration::from_millis(5));
+                            while group.joined() < CALLERS && std::time::Instant::now() < give_up {
+                                thread::sleep(Duration::from_millis(1));
                             }
                             Err(io::Error::other("the drive is gone"))
                         })
@@ -3170,354 +2266,346 @@ mod tests {
         }
     }
 
+    /// The EIO gates count down and then fail one call: an armed hook
+    /// lets the first two calls through and answers the third with the
+    /// disk's error, and the call after it passes. A gate that never
+    /// arms (a body that just passes), or one whose countdown grows or
+    /// divides instead of falling, never answers with the error, and
+    /// the same asserts catch both.
     #[test]
-    fn a_write_returns_after_a_full_flush_where_fsync_leaves_the_cache() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        let before = store.blobs().full_flushes();
-        store
-            .write(|c| c.execute_batch("CREATE TABLE t (x)").map_err(from_sqlite))
-            .unwrap();
-        // Elsewhere the commit's own fsync flushes the cache: no extra flush.
-        assert_eq!(
-            store.blobs().full_flushes(),
-            before + u64::from(FSYNC_LEAVES_DRIVE_CACHE)
+    fn the_eio_gates_fail_one_call_each_and_then_spend() {
+        let dir = crate::test_support::private_tempdir();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        let content = b"the gates' one failing call";
+
+        // The write gate: two writes pass, the third fails, the fourth
+        // passes. The gate's errno is 28 (ENOSPC) unless set otherwise.
+        blobs.fail_writes.store(2, Ordering::SeqCst);
+        blobs.put(content).unwrap();
+        blobs.put(content).unwrap();
+        let err = blobs.put(content).unwrap_err().to_string();
+        assert!(err.contains("os error 28"), "{err}");
+        let id = blobs.put(content).unwrap();
+        assert_eq!(blobs.get(id).unwrap(), content, "the spent write gate");
+
+        // The read gate: two reads pass, the third fails, the fourth
+        // passes.
+        blobs.fail_reads.store(2, Ordering::SeqCst);
+        assert_eq!(blobs.get(id).unwrap(), content);
+        assert_eq!(blobs.get(id).unwrap(), content);
+        let err = blobs.get(id).unwrap_err().to_string();
+        assert!(err.contains("os error 5"), "{err}");
+        assert_eq!(blobs.get(id).unwrap(), content, "the spent read gate");
+
+        // The fsync gate: one put gates three fsyncs - the blob's temp
+        // file, its stored file's directory, and the drive cache - so an
+        // armed countdown of two is spent inside the first put, whose
+        // third fsync fails. The next put runs clean. A countdown that
+        // grows or divides instead of falling never reaches zero, every
+        // put passes, and the first put's assert catches it the same way
+        // a never-arming gate does.
+        blobs.fail_fsyncs.store(2, Ordering::SeqCst);
+        let err = blobs.put(content).unwrap_err().to_string();
+        assert!(err.contains("os error 5"), "{err}");
+        let id = blobs.put(content).unwrap();
+        assert_eq!(blobs.get(id).unwrap(), content, "the spent fsync gate");
+    }
+
+    /// `file_exists` is a cheap stat: it says yes for a blob the store
+    /// holds and no for one it does not. The importer's skip reads it,
+    /// so a constant answer either skips every reimport or reimports
+    /// everything.
+    #[test]
+    fn file_exists_says_what_is_on_disk() {
+        let dir = crate::test_support::private_tempdir();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        let id = blobs.put(b"the blob whose file exists\n").unwrap();
+        assert!(blobs.file_exists(id), "the store holds this blob");
+        let absent = BlobId::of(b"content no put ever wrote");
+        assert!(!blobs.file_exists(absent), "no put made this blob");
+    }
+
+    /// A reader that has not read its content is not ended: `ended` is
+    /// the drain's signal that the decoder is freed, and a reader that
+    /// claims it at once would free a decoder still holding a window.
+    #[test]
+    fn a_reader_is_not_ended_before_its_content_is_read() {
+        let dir = crate::test_support::private_tempdir();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        let id = blobs.put(b"not yet read").unwrap();
+        let mut reader = blobs.reader(id).unwrap();
+        assert!(!reader.ended(), "the reader holds a live decoder");
+        while reader.read_part(1 << 20).unwrap().is_some() {}
+        assert!(reader.ended(), "the content is read and checked");
+    }
+
+    /// `free_bytes` and `free_inodes` read the real filesystem: the
+    /// values are the drive's, far above any constant answer. The
+    /// positive tests above only pin `> 0`, which a constant `Ok(1)`
+    /// would pass; these pin magnitudes, so a stub answer is refused.
+    #[test]
+    fn free_bytes_and_free_inodes_read_the_real_filesystem() {
+        let dir = crate::test_support::private_tempdir();
+        let bytes = free_bytes(dir.path()).unwrap();
+        assert!(
+            bytes > 1 << 20,
+            "a real filesystem holds more than a token {bytes}"
+        );
+        let inodes = free_inodes(dir.path()).unwrap();
+        let inodes = inodes.expect("a temp filesystem has an inode table");
+        assert!(
+            inodes > 100,
+            "a real filesystem has inodes to spare: {inodes}"
         );
     }
 
-    /// Full flushes that one read runs.
-    fn flushes_in_read(store: &Store) -> u64 {
-        let before = store.blobs().full_flushes();
-        store
-            .read(|c| {
-                c.query_row("SELECT count(*) FROM repos", [], |_| Ok(()))
-                    .map_err(from_sqlite)
-            })
+    /// A parked free-stat read holds until the guard drops: the hook
+    /// lets a test hold `statvfs` still, and the drop is what releases
+    /// it. A park that never parks, or a drop that never resets, leaves
+    /// the reader running or stuck.
+    #[test]
+    fn a_parked_free_stat_holds_until_the_guard_drops() {
+        let dir = crate::test_support::private_tempdir();
+        let guard = ParkFreeStat::now(dir.path().to_path_buf());
+        let (tx, rx) = std::sync::mpsc::channel();
+        let path = dir.path().to_path_buf();
+        thread::spawn(move || {
+            let _ = free_bytes(&path);
+            tx.send(()).unwrap();
+        });
+        assert!(
+            rx.recv_timeout(Duration::from_millis(300)).is_err(),
+            "the parked read came back while the guard still held"
+        );
+        drop(guard);
+        rx.recv_timeout(Duration::from_secs(5))
+            .expect("the dropped guard released the parked read");
+    }
+
+    /// The open's sweep removes the temp folders no process holds, and
+    /// keeps the ones a live holder has flocked: a crash's half-written
+    /// folder goes, a running process's staging folder stays.
+    #[test]
+    fn an_open_sweeps_a_dead_temp_folder_and_keeps_a_live_one() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::test_support::private_tempdir();
+        let tmp = dir.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        let live = tmp.join("live");
+        std::fs::create_dir_all(&live).unwrap();
+        std::fs::set_permissions(&live, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let lock = std::fs::File::create(live.join(".lock")).unwrap();
+        rustix::fs::flock(&lock, rustix::fs::FlockOperation::NonBlockingLockExclusive).unwrap();
+        let dead = tmp.join("dead");
+        std::fs::create_dir_all(&dead).unwrap();
+        std::fs::set_permissions(&dead, std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::File::create(dead.join(".lock")).unwrap();
+
+        Blobs::open(dir.path()).unwrap();
+
+        assert!(live.is_dir(), "the sweep removed a folder a process holds");
+        assert!(!dead.is_dir(), "the sweep kept a folder nothing holds");
+        drop(lock);
+    }
+
+    /// The open's folder loop refuses when the staging folder cannot be
+    /// made: `tmp/` is read-only, so every create fails with a
+    /// permission error, and the open returns that error. The `!=` flip
+    /// of the `AlreadyExists` check loops forever on it, so the open
+    /// runs on a thread and the join is bounded: the test fails red with
+    /// a message instead of hanging.
+    #[test]
+    fn an_open_whose_staging_folder_cannot_be_made_is_refused() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::test_support::private_tempdir();
+        let tmp = dir.path().join("tmp");
+        std::fs::create_dir_all(&tmp).unwrap();
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o555)).unwrap();
+        let data = dir.path().to_path_buf();
+        let opened = thread::spawn(move || Blobs::open(&data));
+        let refused = std::sync::mpsc::channel();
+        let done = thread::spawn(move || {
+            let result = opened.join();
+            let _ = refused.0.send(result);
+        });
+        let result = refused
+            .1
+            .recv_timeout(Duration::from_secs(60))
+            .unwrap_or_else(|_| panic!("the open looped instead of refusing a read-only tmp"));
+        drop(done);
+        let err = match result {
+            Ok(Ok(_)) => panic!("an open on a read-only tmp succeeded"),
+            Ok(Err(err)) => err.to_string(),
+            Err(join_err) => {
+                let _ = join_err;
+                panic!("the open's thread panicked instead of refusing")
+            }
+        };
+        assert!(err.contains("Permission denied"), "{err}");
+        std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// The read path's bound on what a stored file may be: a packed file
+    /// past `compress_bound(MAX_OBJECT_BYTES)` is refused as corrupt by
+    /// name, one exactly at the bound goes to the decoder and fails as
+    /// garbage, a frame that unpacks past `MAX_OBJECT_BYTES` is refused
+    /// as oversized, and one that unpacks to exactly the limit verifies.
+    /// The limit checks sit on a trust boundary - the file on disk is
+    /// hostile - so each is pinned by its own verdict message.
+    #[test]
+    fn the_read_path_refuses_what_the_limits_name() {
+        let dir = crate::test_support::private_tempdir();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        let limit = zstd::zstd_safe::compress_bound(MAX_OBJECT_BYTES);
+
+        // (a) one byte past the packed bound: refused by name.
+        let a = BlobId::of(b"a");
+        store_raw(&blobs, a, vec![0xFF; limit + 1]);
+        let err = blobs.get(a).unwrap_err().to_string();
+        assert!(err.contains("file is larger than"), "{err}");
+
+        // (b) exactly at the bound: the size check passes, the bytes are
+        // not a frame, so the decoder refuses them.
+        let b = BlobId::of(b"b");
+        store_raw(&blobs, b, vec![0xFF; limit]);
+        let err = blobs.get(b).unwrap_err().to_string();
+        assert!(err.contains("cannot unpack"), "{err}");
+
+        // (c) a frame that unpacks one byte past the object limit: the
+        // decoder sees the overshoot and calls the blob corrupt. A take
+        // bound that grew past the limit would instead match the ID and
+        // call the same blob valid, which this assert refuses.
+        let raw_c = vec![0u8; MAX_OBJECT_BYTES + 1];
+        let c = BlobId::of(&raw_c);
+        let packed_c = zstd::bulk::compress(&raw_c, 3).unwrap();
+        store_raw(&blobs, c, packed_c);
+        assert_eq!(blobs.verify(c).unwrap(), BlobStatus::Corrupt);
+
+        // (d) a frame that unpacks to exactly the limit: intact.
+        let raw_d = vec![0u8; MAX_OBJECT_BYTES];
+        let d = BlobId::of(&raw_d);
+        let packed_d = zstd::bulk::compress(&raw_d, 3).unwrap();
+        store_raw(&blobs, d, packed_d);
+        assert_eq!(blobs.verify(d).unwrap(), BlobStatus::Valid);
+    }
+
+    /// Writes `bytes` as blob `id`'s stored file by hand, past `put`'s
+    /// own size check: the read path's limits name what is on disk, and
+    /// the disk is hostile.
+    fn store_raw(blobs: &Blobs, id: BlobId, bytes: Vec<u8>) {
+        let (folder, path) = blobs.location(id);
+        std::fs::create_dir_all(&folder).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    /// A put past the object limit is refused, and one exactly at it is
+    /// stored: the write path's own bound on what a client sends, below
+    /// the RPC layer's, so a client that streams the bytes reaches it.
+    #[test]
+    fn a_put_past_the_object_limit_is_refused_and_one_at_it_stored() {
+        let dir = crate::test_support::private_tempdir();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        let too_big = vec![0u8; MAX_OBJECT_BYTES + 1];
+        let err = blobs.put(&too_big).unwrap_err().to_string();
+        assert!(
+            err.contains("too large") || err.contains("larger than"),
+            "{err}"
+        );
+        let at_limit = vec![0u8; MAX_OBJECT_BYTES];
+        let id = blobs.put(&at_limit).unwrap();
+        assert_eq!(id, BlobId::of(&at_limit));
+    }
+
+    /// A put that keeps a stored copy touches it: the file's mtime moves
+    /// to now, so the grace period of `gc` counts from the last upload,
+    /// not the first. A touch that does nothing leaves the old time, and
+    /// the same assert catches it.
+    #[test]
+    fn a_put_that_keeps_a_stored_copy_touches_its_file() {
+        let dir = crate::test_support::private_tempdir();
+        let blobs = Blobs::open(dir.path()).unwrap();
+        let content = b"the blob whose file the gc grace reads";
+        let id = blobs.put(content).unwrap();
+        let (_, path) = blobs.location(id);
+        let old = std::time::SystemTime::now() - std::time::Duration::from_secs(3600);
+        std::fs::File::options()
+            .write(true)
+            .open(&path)
+            .unwrap()
+            .set_modified(old)
             .unwrap();
-        store.blobs().full_flushes() - before
+        assert_eq!(blobs.verify(id).unwrap(), BlobStatus::Valid);
+        blobs.put(content).unwrap();
+        let moved = std::fs::metadata(&path).unwrap().modified().unwrap();
+        assert!(
+            moved.elapsed().unwrap() < std::time::Duration::from_secs(60),
+            "the kept file's mtime stayed an hour old: {moved:?}"
+        );
     }
 
-    fn create_repo(c: &mut SqliteTx<'_>) -> Result<()> {
-        c.create_repo("main").map(drop)
-    }
-
+    /// A failed flush fails only the callers that shared it: the next
+    /// run leads a fresh flush and passes. A guard that pins every later
+    /// run to the old failure would fail the clean call, and the same
+    /// assert catches it.
     #[test]
-    fn a_read_with_no_unflushed_commit_runs_no_flush() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        assert_eq!(flushes_in_read(&store), 0);
+    fn a_failed_flush_does_not_fail_the_next_run() {
+        let group = GroupFlush::default();
+        let fail = AtomicBool::new(true);
+        let err = group
+            .run(|| {
+                if fail.swap(false, Ordering::SeqCst) {
+                    Err(io::Error::other("the drive is gone"))
+                } else {
+                    Ok(())
+                }
+            })
+            .expect_err("the first run fails");
+        assert_eq!(err.to_string(), "the drive is gone");
+        group
+            .run(|| Ok(()))
+            .expect("the run after a failed one leads its own flush");
     }
 
+    /// A caller that waits while another's flush runs leads the next one
+    /// when that flush ends: its target is the flush after the leader's,
+    /// and `finished < target` makes it lead rather than wait again. The
+    /// join is bounded, so a caller that never comes back from the wait
+    /// fails red instead of hanging.
     #[test]
-    fn a_read_of_an_unflushed_commit_waits_for_a_full_flush() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        store.commit(create_repo).unwrap();
-        // None where the commit's own fsync flushes the drive cache.
-        assert_eq!(flushes_in_read(&store), u64::from(FSYNC_LEAVES_DRIVE_CACHE));
-        // That flush covers the commit.
-        assert_eq!(flushes_in_read(&store), 0);
-    }
-
-    #[test]
-    fn a_read_after_a_write_runs_no_flush() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        store.write(create_repo).unwrap();
-        assert_eq!(flushes_in_read(&store), 0);
-    }
-
-    fn repos(c: &mut SqliteTx<'_>) -> Result<i64> {
-        c.query_row("SELECT count(*) FROM repos", [], |row| row.get(0))
-            .map_err(from_sqlite)
-    }
-
-    fn add_repo(name: &'static str) -> impl Fn(&mut SqliteTx<'_>) -> Result<()> {
-        move |c| c.create_repo(name).map(drop)
-    }
-
-    #[test]
-    fn a_long_read_blocks_no_write_and_no_other_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        store.write(add_repo("a")).unwrap();
-        let (held, holding) = mpsc::channel();
-        let (done, finished) = mpsc::channel();
+    fn a_caller_that_waited_through_a_flush_leads_the_next_one() {
+        let group = GroupFlush::default();
+        let both_there = Barrier::new(2);
+        let (done_tx, done_rx) = mpsc::channel();
         thread::scope(|s| {
-            let store = &store;
-            let long = s.spawn(move || {
-                store.read(|c| {
-                    assert_eq!(repos(c)?, 1);
-                    held.send(()).unwrap();
-                    finished
-                        .recv_timeout(Duration::from_secs(10))
-                        .expect("a write or a read waited for this read");
-                    // Each statement has its own snapshot, so this one sees
-                    // the write.
-                    assert_eq!(repos(c)?, 2);
+            // The first caller's flush holds until the second waits.
+            let first = s.spawn(|| {
+                let group = &group;
+                group.run(|| {
+                    both_there.wait();
                     Ok(())
                 })
             });
-            holding.recv().unwrap();
-            store.write(add_repo("b")).unwrap();
-            assert_eq!(store.read(repos).unwrap(), 2);
-            done.send(()).unwrap();
-            long.join().unwrap().unwrap();
-        });
-        // A read cannot write, so no commit skips the counts of `commit`.
-        let write = store.read(|c| c.execute("DELETE FROM repos", []).map_err(from_sqlite));
-        assert!(write.is_err());
-    }
-
-    #[test]
-    fn a_write_in_progress_blocks_no_read() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        store.write(add_repo("a")).unwrap();
-        let (held, holding) = mpsc::channel();
-        let (done, finished) = mpsc::channel();
-        thread::scope(|s| {
-            // As a server write that waits for the write lock of an import,
-            // this one holds the write connection.
-            let store = &store;
-            let write = s.spawn(move || {
-                store.write(|c| {
-                    add_repo("b")(c)?;
-                    held.send(()).unwrap();
-                    finished
-                        .recv_timeout(Duration::from_secs(10))
-                        .expect("a read waited for this write");
-                    Ok(())
-                })
+            s.spawn(|| {
+                let result = group.run(|| Ok(()));
+                done_tx.send(result).unwrap();
             });
-            holding.recv().unwrap();
-            // Not committed yet, so not seen.
-            assert_eq!(store.read(repos).unwrap(), 1);
-            done.send(()).unwrap();
-            write.join().unwrap().unwrap();
-        });
-        assert_eq!(store.read(repos).unwrap(), 2);
-    }
-
-    thread_local! {
-        /// What the WAL hook of a test runs.
-        static ON_COMMIT: RefCell<Option<Box<dyn FnMut()>>> = const { RefCell::new(None) };
-    }
-
-    #[test]
-    fn a_read_that_sees_a_commit_waits_until_it_is_durable() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        // None where the commit's own fsync flushes the drive cache.
-        let flush = u64::from(FSYNC_LEAVES_DRIVE_CACHE);
-
-        // A commit that ends after the read began, before its first
-        // statement.
-        let before = store.blobs().full_flushes();
-        let seen = store.read(|c| {
-            store.commit(add_repo("a"))?;
-            repos(c)
-        });
-        assert_eq!(seen.unwrap(), 1);
-        assert_eq!(store.blobs().full_flushes() - before, flush);
-
-        // A commit that is visible while its COMMIT still runs. SQLite runs
-        // a WAL hook on the thread that commits, once the commit is visible
-        // to other connections, before COMMIT returns.
-        store
-            .read_unflushed(|c| {
-                c.wal_hook(Some(|_, _| {
-                    ON_COMMIT.with_borrow_mut(|f| f.as_mut().map(|f| f()));
-                    Ok(())
-                }));
-                Ok(())
-            })
-            .unwrap();
-        let seen = Rc::new(Cell::new(None));
-        ON_COMMIT.set(Some(Box::new({
-            let (store, seen) = (store.clone(), Rc::clone(&seen));
-            move || {
-                let before = store.blobs().full_flushes();
-                let repos = store.read(repos).unwrap();
-                seen.set(Some((repos, store.blobs().full_flushes() - before)));
+            // The second is inside the wait before the first's flush ends,
+            // so its target was counted against the running one.
+            let give_up = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while group.joined() < 2 && std::time::Instant::now() < give_up {
+                thread::sleep(Duration::from_millis(1));
             }
-        })));
-        store.commit(add_repo("b")).unwrap();
-        ON_COMMIT.set(None);
-        assert_eq!(seen.get(), Some((2, flush)));
-    }
-
-    #[test]
-    fn a_read_that_panics_returns_its_connection() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        let readers = store.inner.readers.idle().len();
-        let read = panic::catch_unwind(|| store.read(|_| -> Result<()> { panic!("a bug") }));
-        assert!(read.is_err());
-        assert_eq!(store.inner.readers.idle().len(), readers);
-        // Its transaction ended, so the connection reads again.
-        assert_eq!(store.read(repos).unwrap(), 0);
-    }
-
-    #[test]
-    fn the_last_store_to_close_moves_the_log_into_the_database() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        store.write(add_repo("a")).unwrap();
-        assert_eq!(store.read(repos).unwrap(), 1);
-        drop(store);
-        // So a copy of `scion.db` alone holds every commit.
-        assert!(!dir.path().join("scion.db-wal").exists());
-    }
-
-    #[test]
-    fn the_log_restarts_while_reads_run_back_to_back() {
-        const COMMITS: usize = 600;
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        store
-            .write(|c| {
-                c.execute_batch("CREATE TABLE t (x BLOB)")
-                    .map_err(from_sqlite)
-            })
-            .unwrap();
-        let done = AtomicBool::new(false);
-        thread::scope(|s| {
-            // Two long reads at a time, as graph walks are.
-            for _ in 0..2 {
-                s.spawn(|| {
-                    while !done.load(Ordering::Relaxed) {
-                        store
-                            .read(|c| (0..10_000).try_for_each(|_| repos(c).map(drop)))
-                            .unwrap();
-                    }
-                });
-            }
-            // 600 commits of 64 KiB: 37.5 MiB, more than 9 times the 4 MiB
-            // after which each commit checkpoints the log.
-            for _ in 0..COMMITS {
-                let insert = "INSERT INTO t VALUES (zeroblob(65536))";
-                store
-                    .commit(|c| c.execute(insert, []).map(drop).map_err(from_sqlite))
-                    .unwrap();
-            }
-            done.store(true, Ordering::Relaxed);
+            assert_eq!(
+                group.joined(),
+                2,
+                "the second caller never reached the wait"
+            );
+            both_there.wait();
+            first.join().unwrap().unwrap();
+            let second_result = done_rx
+                .recv_timeout(Duration::from_secs(60))
+                .expect("the second caller never came back from the wait");
+            second_result.unwrap();
         });
-        // The log file never shrinks, so its size is the most it held: about
-        // 4 MiB. With a snapshot held for each whole read, the log never
-        // restarts and holds every commit.
-        let log = fs::metadata(dir.path().join("scion.db-wal")).unwrap().len();
-        assert!(log < 16 << 20, "the log grew to {} MiB", log >> 20);
-    }
-
-    #[test]
-    fn a_connection_left_in_a_transaction_is_replaced() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        store.write(add_repo("a")).unwrap();
-        store
-            .read(|c| {
-                c.execute_batch("BEGIN").map_err(from_sqlite)?;
-                repos(c).map(drop)
-            })
-            .unwrap();
-        store.write(add_repo("b")).unwrap();
-        // The pool gives the connection returned last to the next read. Kept,
-        // its snapshot would show one repo.
-        assert_eq!(store.read(repos).unwrap(), 2);
-        assert_eq!(store.inner.readers.idle().len(), READERS);
-    }
-
-    /// A blob a batch acks is durable before the ack, by construction:
-    /// the recorded steps of every blob it wrote read, in order, tmp
-    /// write, file fsync, rename, dir fsync of the blob's fan-out
-    /// directory, a full flush, and the batch's answer. A blob a batch
-    /// kept reads its stored-file fsync and dir fsync before the answer.
-    /// If the directory fsync is deleted from `flush_dirs`, the dir step
-    /// disappears and this test fails.
-    #[test]
-    fn a_batch_answers_after_its_blobs_dir_fsyncs() {
-        use tempfile::TempDir;
-
-        use DurabilityStep as S;
-        let dir = TempDir::new().unwrap();
-        let store = Store::open(dir.path()).unwrap();
-        let raws: Vec<&[u8]> = vec![b"one", b"two", b"three"];
-        let ids: Vec<BlobId> = {
-            let mut batch = store.blobs().batch();
-            let ids = raws.iter().map(|raw| batch.put(raw).unwrap()).collect();
-            batch.sync().unwrap();
-            ids
-        };
-        // The keep path: the same bytes again. Nothing is written, and
-        // the stored file is fsynced with its directory before the
-        // answer.
-        let kept: Vec<BlobId> = {
-            let mut batch = store.blobs().batch();
-            let ids = raws.iter().map(|raw| batch.put(raw).unwrap()).collect();
-            batch.sync().unwrap();
-            ids
-        };
-        let steps = store.durability_steps();
-        let answers: Vec<usize> = steps
-            .iter()
-            .enumerate()
-            .filter_map(|(i, step)| (*step == S::Answer).then_some(i))
-            .collect();
-        assert_eq!(answers.len(), 2, "two batches answered");
-
-        let steps_of = |log: &[DurabilityStep], step: &DurabilityStep| {
-            log.iter()
-                .position(|s| s == step)
-                .unwrap_or_else(|| panic!("no {step:?} in the batch's steps"))
-        };
-        let batch1 = &steps[..answers[0]];
-        for id in &ids {
-            let (dir, _) = store.blobs().location(*id);
-            let tmp_write = steps_of(batch1, &S::TmpWrite(*id));
-            let file_fsync = steps_of(batch1, &S::FileFsync(*id));
-            let rename = steps_of(batch1, &S::Rename(*id));
-            let dir_fsync = batch1
-                .iter()
-                .position(|s| matches!(s, S::DirFsync(path) if *path == dir))
-                .unwrap_or_else(|| panic!("no dir fsync of {} before the answer", dir.display()));
-            let full_flush = batch1
-                .iter()
-                .position(|s| *s == S::FullFlush)
-                .expect("no full flush before the answer");
-            assert!(
-                tmp_write < file_fsync
-                    && file_fsync < rename
-                    && rename < dir_fsync
-                    && dir_fsync < full_flush
-                    && full_flush < answers[0],
-                "the durability steps of {id} are out of order: \
-                 tmp write {tmp_write}, file fsync {file_fsync}, rename {rename}, \
-                 dir fsync {dir_fsync}, full flush {full_flush}, answer {}",
-                answers[0]
-            );
-        }
-        // The keep path: no tmp write of the kept blobs in the second
-        // batch, but a stored-file fsync and a dir fsync before the
-        // answer.
-        let batch2 = &steps[answers[0] + 1..answers[1]];
-        for id in &kept {
-            let log = batch2;
-            assert!(
-                log.iter().all(|s| *s != S::TmpWrite(*id)),
-                "a kept blob was written again"
-            );
-            assert!(
-                log.contains(&S::StoredFileFsync(*id)),
-                "no stored-file fsync before the answer"
-            );
-            let (dir, _) = store.blobs().location(*id);
-            assert!(
-                log.iter()
-                    .any(|s| matches!(s, S::DirFsync(path) if *path == dir)),
-                "no dir fsync of {} before the answer",
-                dir.display()
-            );
-        }
     }
 }

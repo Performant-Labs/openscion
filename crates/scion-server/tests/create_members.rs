@@ -8,6 +8,19 @@ use scion_server::Backend;
 use scion_server::test_support::deadline::Deadline;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::write::create_changeset;
+use std::sync::{Mutex, MutexGuard};
+
+/// The statement log these tests read is one process-wide seam: the
+/// tests run in parallel, and the counting test's window must hold
+/// only its own statements. Every test that resets or reads the log
+/// holds the lock for its whole body.
+static LOG_LOCK: Mutex<()> = Mutex::new(());
+
+fn log_guard() -> MutexGuard<'static, ()> {
+    LOG_LOCK
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
 
 fn later() -> Deadline {
     Deadline::new(std::time::Instant::now() + std::time::Duration::from_secs(600))
@@ -39,7 +52,7 @@ fn regular(content: &str) -> FileState {
 /// the changeset, so the measured window is the member check's own
 /// statements.
 fn store_with_root(n_blobs: usize) -> (tempfile::TempDir, Backend, scion_core::ChangesetId) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let store = Backend::open_test(dir.path()).unwrap();
     store.blobs().put(b"seed\n").unwrap();
     let root = store
@@ -100,10 +113,9 @@ fn refused_statements(store: &Backend, n: usize, parent: scion_core::ChangesetId
 /// The member check reads its blob list in batches: 1,000 distinct puts
 /// cost no more statements than 100 of them plus the batch's own two.
 /// One statement per blob would cost about 900 more for the 1,000.
-/// SQLite counts no statements (its check is local), so the assert
-/// holds trivially there.
 #[test]
 fn the_member_check_costs_one_batch_not_one_query_per_blob() {
+    let _log = log_guard();
     let (_dir, store, root) = store_with_root(1000);
     let small = refused_statements(&store, 100, root);
     let large = refused_statements(&store, 1000, root);

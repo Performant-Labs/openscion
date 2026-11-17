@@ -1,8 +1,11 @@
 # Releasing
 
-How to cut a release of openscion. v0.1.x is a source release: one
-SSH-signed annotated git tag plus one immutable GitHub release with
-notes. Nothing publishes crates: the owner has decided (D12) that no
+How to cut a release of openscion. A v0.1.x release is one
+SSH-signed annotated git tag plus one immutable GitHub release whose
+notes name the artifacts (v0.1.0 shipped the four binaries for
+`linux-x86_64` and `macos-aarch64`, the source tarball, and an SBOM
+per shipped binary's crate, each with an attestation and a checksum).
+Nothing publishes crates: the owner has decided that no
 crate publishes before a real outside consumer exists, so a narrow
 client crate is the only publish ever planned. Nothing here tags by
 itself: each step is run by a person.
@@ -29,11 +32,15 @@ itself: each step is run by a person.
 A release is cut through one PR from a branch named
 `release/<version>`. Its checklist:
 
-1. **Merge the CHANGELOG fragments.** Run
-   `scripts/merge-changelog.sh v0.1.0` (or the release's section), so
+1. **Refresh the release.** Run
+   `scripts/release-refresh.sh v0.1.0` (or the release's version), so
    that the fragments under `changes/` (`changes/<slug>.<section>.md`)
-   are merged into the version's section. Review the result, and
-   commit it on the release branch.
+   are merged into the version's section. Beyond the fold the script
+   also demands the release-notes file (`docs/release-notes/<version>.md`)
+   and refuses one that still carries a PENDING capacity slot, and
+   reminds about the release date while the section still says
+   "unreleased". Review the result, and commit it on the release
+   branch.
 2. **Set the date in `CHANGELOG.md`.** Rename the `## [v0.1.0] -
    unreleased` section to `## [v0.1.0] - YYYY-MM-DD` with the release
    day, and add a fresh empty `## [Unreleased]` above it. The note that
@@ -50,22 +57,43 @@ A release is cut through one PR from a branch named
    the first release nothing is bumped: the five already say 0.1.0,
    and the step is the check that they are equal. A later release
    bumps all five in one commit.
-4. **Notes regenerated from the tagged commit.** The GitHub release
-   notes come from the version's `CHANGELOG.md` section read at the
-   tagged commit (`git show v0.1.0:CHANGELOG.md`), never from a local
-   working tree or an edited copy. The command prints the whole file;
-   the version's section alone comes out of
+4. **Bump the corpus's `since: unreleased` headers.** Every
+   transcript under `crates/scn/tests/transcripts/` that says
+   `since: unreleased` names a behaviour that exists in this release:
+   set each one to the release's tag. The N-1 transcript legs refuse
+   an `unreleased` file on every N-1 side, so a release that forgets
+   this step leaves those behaviours unproven by the version matrix.
+5. **Notes regenerated from the tagged commit.** The release body is
+   the notes file (`docs/release-notes/<version>.md`) read at the
+   tagged commit — never from a local working tree or an edited copy —
+   followed by one line pointing at the full change list: the
+   version's section of `CHANGELOG.md` at the tag. The workflow fails
+   without the file: every release ships its notes, so the file is
+   written before the tag. The release body is not the changelog
+   section itself (a section can be past the 125000-character body
+   limit the release API enforces), but the workflow still proves the
+   section was folded for this version: it reads the version's
+   section at the tagged commit and fails unless it exists and holds
+   at least one row. The section alone comes out of
 
    ```sh
    git show v0.1.0:CHANGELOG.md | awk \
      '/^## \[v0.1.0\]/{f=1} f && /^## \[/{if(++n==2) exit} f'
    ```
-5. **A clean-checkout build and quick-start smoke.** From a fresh
+6. **A clean-checkout build and quick-start smoke.** From a fresh
    clone of the tagged commit, build the workspace and run the
-   README's `Try it` flow end to end.
-6. **The umask-002 run.** Once #302's CI job exists, it runs on the
-   release commit and its green result is part of the release.
-7. **Benchmark numbers with their provenance.** A number that a
+   README's `Try it` flow end to end (it needs the Postgres container
+   the flow starts, so Docker runs on the machine doing this). The tagged commit is also the
+   operator's source for the binaries (see `docs/operations.md`,
+   "Upgrades"): a source release says so in its notes (the binaries
+   build from this tag: `git checkout <tag>; cargo build --release
+   --locked`); a release that ships binaries says that instead. Either
+   way the notes point the operator at keeping the previous release's
+   binaries beside the new ones, because a rollback needs them.
+7. **The umask-002 run.** #302 is closed by choice: the group-writable
+   rule stays fail-closed and the refusal names the chmod, so the
+   release's umask-002 run proves the refusal, not an exception.
+8. **Benchmark numbers with their provenance.** A number that a
    release note states records the commit it measured, the OS, the
    filesystem, the dataset, the command, and the variance across runs.
    A release note never names the maintainer's machine.
@@ -74,8 +102,20 @@ A release is cut through one PR from a branch named
 
 1. **Tag, signed.** Cut an annotated tag from the commit that the
    release notes describe. The owner signs it personally with their SSH
-   key (D18), so the signature a verifier checks is the owner's, not a
-   CI secret's:
+   signing key (the public key file they registered on GitHub as a
+   Signing key), so the signature a verifier checks is the owner's, not
+   a CI secret's.
+
+   Before the first tag, once: register that public key at GitHub
+   Settings → SSH and GPG keys as a **Signing key**, and check the
+   account carries it (the list must not be empty):
+
+   ```sh
+   curl -s https://api.github.com/users/<owner>/ssh_signing_keys | jq length
+   ```
+
+   Then sign. The key file below is an example (an ed25519 key in the
+   default place); pass the public key file you registered:
 
    ```sh
    git -c gpg.format=ssh -c user.signingkey="$HOME/.ssh/id_ed25519.pub" \
@@ -124,7 +164,7 @@ A release is cut through one PR from a branch named
    - **The registry the SBOMs name is not secret; nothing else to
      add.** The workflow needs no key: the tag's SSH signature is
      verified by GitHub at push time against the key on the owner's
-     account (D18), and the build signs nothing of its own — the
+     account, and the build signs nothing of its own — the
      provenance comes from GitHub's hosted builder.
 
    The dry-run proves all of it before the first tag: dispatch the

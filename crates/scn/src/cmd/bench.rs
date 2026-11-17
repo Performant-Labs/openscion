@@ -18,7 +18,7 @@ use crate::outln;
 /// Arguments of `scn bench`.
 #[derive(clap::Args)]
 pub struct BenchArgs {
-    /// Concurrent agents.
+    /// Concurrent agents, at most one per land.
     #[arg(long, default_value_t = 200)]
     agents: usize,
     /// Total lands across all agents.
@@ -44,6 +44,10 @@ struct Stats {
     landed: Vec<ChangesetId>,
     conflicts: usize,
     rejected: usize,
+    /// Time of the upload's `PutBlob` alone.
+    put: Vec<Duration>,
+    /// Time of the `CreateChangeset` RPC alone.
+    create: Vec<Duration>,
     /// Time of the Land RPC alone.
     land: Vec<Duration>,
     /// Upload + create + land.
@@ -62,11 +66,11 @@ pub async fn bench(ctx: &Ctx, args: BenchArgs) -> Result<()> {
         "--agents and --lands must be positive"
     );
     let start = ctx.clone().resolve("main").await?;
-    let per_agent = lands.div_ceil(agents);
+    let counts = lands_per_agent(agents, lands);
+    let agents = counts.len();
     let started = Instant::now();
     let mut tasks = JoinSet::new();
-    for agent in 0..agents {
-        let count = per_agent.min(lands.saturating_sub(agent * per_agent));
+    for (agent, count) in counts.into_iter().enumerate() {
         tasks.spawn(run_agent(ctx.clone(), agent, count, start, base));
     }
     let mut stats = Stats::default();
@@ -75,6 +79,8 @@ pub async fn bench(ctx: &Ctx, args: BenchArgs) -> Result<()> {
         stats.landed.extend(agent.landed);
         stats.conflicts += agent.conflicts;
         stats.rejected += agent.rejected;
+        stats.put.extend(agent.put);
+        stats.create.extend(agent.create);
         stats.land.extend(agent.land);
         stats.total.extend(agent.total);
     }
@@ -99,9 +105,11 @@ async fn run_agent(
             Base::Fresh => ctx.resolve("main").await?,
         };
         // Unique per run, so every run pays for new blobs and runs compare.
+        let putting = Instant::now();
         let blob = ctx
             .put_blob(format!("run {start} agent {agent} change {i}\n").into_bytes())
             .await?;
+        let put = putting.elapsed();
         let path = RepoPath::new(format!("bench/agent-{agent:04}/{i:06}.txt"))?;
         let changeset = Changeset::new(
             vec![parent],
@@ -111,7 +119,7 @@ async fn run_agent(
                 now_unix_secs()?,
                 0,
             )
-            .expect("identity fits the format"),
+            .context("the bench identity does not fit a changeset field")?,
             None,
             format!("bench: agent {agent} change {i}\n").into_bytes(),
             BTreeMap::from([(
@@ -122,8 +130,10 @@ async fn run_agent(
                 }),
             )]),
         )
-        .expect("changeset fits the format");
+        .context("the changeset fields do not fit the format")?;
+        let creating = Instant::now();
         let id = ctx.create_changeset(&changeset).await?;
+        let create = creating.elapsed();
         let landing = Instant::now();
         let reply = ctx
             .client
@@ -135,6 +145,8 @@ async fn run_agent(
             })
             .await?
             .into_inner();
+        stats.put.push(put);
+        stats.create.push(create);
         stats.land.push(landing.elapsed());
         stats.total.push(began.elapsed());
         match reply.state() {
@@ -199,6 +211,17 @@ fn check_landed(landed: &[ChangesetId], history: &HashSet<ChangesetId>) -> Resul
     Ok(())
 }
 
+/// How many of the `lands` each agent makes: as even as can be, the first
+/// `lands % agents` one more. No more agents than lands, so every agent
+/// lands at least once and the report names only agents that ran.
+fn lands_per_agent(agents: usize, lands: usize) -> Vec<usize> {
+    let agents = agents.min(lands);
+    let (each, extra) = (lands / agents, lands % agents);
+    (0..agents)
+        .map(|agent| each + usize::from(agent < extra))
+        .collect()
+}
+
 /// Percentiles of `sorted`, in milliseconds.
 fn percentiles_ms(sorted: &[Duration]) -> [f64; 3] {
     let at = |p: f64| {
@@ -214,8 +237,12 @@ fn percentiles_ms(sorted: &[Duration]) -> [f64; 3] {
 }
 
 fn report(json: bool, agents: usize, stats: &mut Stats, elapsed: Duration) -> Result<()> {
+    stats.put.sort();
+    stats.create.sort();
     stats.land.sort();
     stats.total.sort();
+    let [put_p50, put_p99, _] = percentiles_ms(&stats.put);
+    let [create_p50, create_p99, _] = percentiles_ms(&stats.create);
     let [land_p50, land_p99, land_max] = percentiles_ms(&stats.land);
     let [total_p50, total_p99, _] = percentiles_ms(&stats.total);
     let landed = stats.landed.len();
@@ -230,6 +257,8 @@ fn report(json: bool, agents: usize, stats: &mut Stats, elapsed: Duration) -> Re
             "seconds": elapsed.as_secs_f64(),
             "lands_per_second": rate,
             "land_ms": { "p50": land_p50, "p99": land_p99, "max": land_max },
+            "put_ms": { "p50": put_p50, "p99": put_p99 },
+            "create_ms": { "p50": create_p50, "p99": create_p99 },
             "end_to_end_ms": { "p50": total_p50, "p99": total_p99 },
             "verified_on_main": true,
         });
@@ -242,6 +271,8 @@ fn report(json: bool, agents: usize, stats: &mut Stats, elapsed: Duration) -> Re
     );
     outln!("conflicts {}, rejected {}", stats.conflicts, stats.rejected);
     outln!("land RPC     p50 {land_p50:.1} ms  p99 {land_p99:.1} ms  max {land_max:.1} ms");
+    outln!("put blob     p50 {put_p50:.1} ms  p99 {put_p99:.1} ms");
+    outln!("create cs    p50 {create_p50:.1} ms  p99 {create_p99:.1} ms");
     outln!("end to end   p50 {total_p50:.1} ms  p99 {total_p99:.1} ms  (upload + create + land)");
     outln!("verified: main gained exactly the {landed} landed changesets");
     Ok(())
@@ -253,6 +284,109 @@ mod tests {
 
     fn id(n: u8) -> ChangesetId {
         ChangesetId::from_bytes([n; 32])
+    }
+
+    #[test]
+    fn every_agent_lands_and_the_lands_add_up() {
+        // A share rounded up ran out early: 9 agents and 10 lands gave
+        // 2, 2, 2, 2, 2, 0, 0, 0, 0, so only 5 agents landed.
+        assert_eq!(lands_per_agent(9, 10), [2, 1, 1, 1, 1, 1, 1, 1, 1]);
+        assert_eq!(lands_per_agent(3, 10), [4, 3, 3]);
+        assert_eq!(lands_per_agent(1, 5), [5]);
+        // More agents than lands: one land each, no idle agent.
+        assert_eq!(lands_per_agent(5, 3), [1, 1, 1]);
+        for (agents, lands) in [(300, 1000), (200, 10_000), (100, 2000), (7, 7)] {
+            let counts = lands_per_agent(agents, lands);
+            assert_eq!(counts.len(), agents, "{agents} agents, {lands} lands");
+            assert_eq!(counts.iter().sum::<usize>(), lands);
+            assert!(counts.iter().all(|&n| n > 0), "an agent with no land");
+        }
+    }
+
+    /// `verify` must refuse a reported set that `main` does not hold.
+    /// The mutant that answers `Ok(())` skips the walk and the check.
+    #[tokio::test]
+    async fn verify_refuses_lands_main_does_not_hold() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        let data = tempfile::tempdir().unwrap();
+        let store = scion_server::Backend::open_test(data.path()).unwrap();
+        {
+            let dir = tempfile::tempdir().unwrap();
+            std::fs::write(dir.path().join("seed.txt"), b"one\n").unwrap();
+            let git = |args: &[&str]| {
+                let out = std::process::Command::new("git")
+                    .args(args)
+                    .current_dir(dir.path())
+                    .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                    .env("GIT_CONFIG_NOSYSTEM", "1")
+                    .env("GIT_AUTHOR_NAME", "Ada")
+                    .env("GIT_AUTHOR_EMAIL", "ada@example.com")
+                    .env("GIT_COMMITTER_NAME", "Ada")
+                    .env("GIT_COMMITTER_EMAIL", "ada@example.com")
+                    .output()
+                    .unwrap();
+                assert!(out.status.success(), "git {args:?}");
+            };
+            git(&["init", "-q"]);
+            git(&["add", "-A"]);
+            git(&["commit", "-q", "-m", "root"]);
+            git(&["branch", "-M", "main"]);
+            scion_server::import_git(
+                &store,
+                "r",
+                dir.path(),
+                &scion_server::ImportOptions {
+                    rev: "HEAD".into(),
+                    target_ref: "main".into(),
+                    verify_sample: 0,
+                },
+            )
+            .unwrap();
+        }
+        let runtime = tokio::runtime::Handle::current();
+        runtime.spawn(scion_server::test_support::service::serve(
+            store,
+            listener,
+            "secret",
+            scion_server::test_support::service::ServeOptions {
+                data: data.path().to_path_buf(),
+                audit: scion_server::test_support::audit::Audit::off(),
+                limits: scion_proto::runtime::listen::Limits::default(),
+                quotas: scion_server::Quotas::off(),
+                pending_lands: None,
+                land_stale_secs: 1 << 40,
+                tls: None,
+                metrics: std::sync::Arc::default(),
+                reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
+            },
+            None,
+            std::future::pending(),
+        ));
+        let mut ctx = Ctx::connect(&url, None, "secret", None, "r".into(), false)
+            .await
+            .unwrap();
+        let start = ctx.resolve("main").await.unwrap();
+        let foreign = ChangesetId::from_bytes([9; 32]);
+        assert!(verify(ctx.clone(), start, &[foreign]).await.is_err());
+    }
+
+    #[test]
+    fn percentiles_answer_the_known_ranks() {
+        let sorted: [Duration; 5] = [
+            Duration::from_millis(10),
+            Duration::from_millis(20),
+            Duration::from_millis(30),
+            Duration::from_millis(40),
+            Duration::from_millis(50),
+        ];
+        // p50 of 5 items: rank (5-1)*0.5 = 2 -> 30 ms; p99: rank 3.96 -> 4 -> 50 ms;
+        // max: the last item.
+        assert_eq!(percentiles_ms(&sorted), [30.0, 50.0, 50.0]);
+        // The ranks feed the report's rate, so 0 ms entries stay 0 and the
+        // max is the tail, not the sum.
+        let zero: [Duration; 1] = [Duration::from_millis(0)];
+        assert_eq!(percentiles_ms(&zero), [0.0, 0.0, 0.0]);
     }
 
     #[test]

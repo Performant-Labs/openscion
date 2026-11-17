@@ -26,27 +26,30 @@ marked supported here.
 | Component | OS | Arch | Data filesystem | Postgres | Status | CI job | Why |
 |---|---|---|---|---|---|---|---|
 | scion-server | Linux | x64 | ext4 | — | supported | `test` (ci.yml) | The default runner disk; the whole workspace suite runs on it |
-| scion-server | Linux | x64 | ext4 | 16 | experimental | `test-postgres` (ci.yml) | Tested in CI; not yet recommended for production or relied on for data-safety evidence. Runs nightly and on release candidates |
-| scion-server | Linux | x64 | ext4 | 17 | experimental | `test-postgres` (ci.yml) | Tested in CI; not yet recommended for production or relied on for data-safety evidence. The one major that also runs per push, on data-path changes |
-| scion-server | Linux | x64 | ext4 | 18 | experimental | `test-postgres` (ci.yml) | Tested in CI; not yet recommended for production or relied on for data-safety evidence. Runs nightly and on release candidates |
+| scion-server | Linux | x64 | ext4 | 16 | supported | `test-postgres` (ci.yml) | The metadata store; the suite runs on it. Runs nightly and on release candidates |
+| scion-server | Linux | x64 | ext4 | 17 | supported | `test-postgres` (ci.yml) | The metadata store; the suite runs on it. The one major that also runs per push |
+| scion-server | Linux | x64 | ext4 | 18 | supported | `test-postgres` (ci.yml) | The metadata store; the suite runs on it. Runs nightly and on release candidates |
 | scion-server | Linux | x64 | ext4 | 15 | unsupported | — | Upstream supports 15 until November 2027, but the project does not claim it yet; one matrix line adds it when an operator asks |
 | scion-server | Linux | x64 | tmpfs | — | supported | `test` (ci.yml) | The `disk_full` step fills a real tmpfs (`SCION_DISK_REQUIRE=1`) |
-| scion-server | Linux | arm64 | ext4 | — | best effort | `test-arm64` (ci.yml) | The arm64 suite runs nightly and on release candidates, not per push; the cell is best effort until v0.8, and the Linux arm64 binaries return with the v0.8 support wave |
-| scion-server | Linux | arm64 | ext4 | 17 | best effort | — | No job runs Postgres on arm64; the Postgres-backed arm64 run comes with the Postgres-major wave |
+| scion-server | Linux | arm64 | ext4 | — | best effort | `test-arm64-server` (ci.yml) | The server suite runs on arm64 nightly and on release candidates, not per push; the cell is best effort until v0.8, and the Linux arm64 binaries return with the v0.8 support wave |
+| scion-server | Linux | arm64 | ext4 | 17 | best effort | `test-arm64-server` (ci.yml) | The arm64 server suite runs on Postgres 17 when the arm64 job runs; the cell is best effort because the job itself is not per push |
 | scion-server | Linux | x64 | xfs | — | best effort | `test-xfs` (ci.yml) | Every store the server suite opens lands on a real xfs loop device (TMPDIR); the job runs nightly and on release candidates, not per push |
+| scion-server | Linux | x64 | ext4 | 17 | best effort | `test-umask-002` (ci.yml) | The whole workspace suite under `umask 002`, on its own Postgres service: an operator's umask is not the suite's to choose. Runs on the nightly only |
+| scion-server | Linux | x64 | ext4 | — | best effort | `test-restore-ceiling` (ci.yml) | The streamed restore's RSS ceiling (`archive_restore_stream`) runs release-shaped on main pushes, the nightly and dispatches — not on pull requests, where the fixture's disk cost buys nothing; the job measures the restore's own peak against the twin's baseline |
 | scion-server | macOS | arm64 | APFS | — | supported | `test-macos` (ci.yml) | Native `macos-15` runner, full workspace suite; the runner's disk is APFS |
 | scion-server | Windows | x64 | any | — | unsupported | — | No job builds or tests it; the lock files and paths assume POSIX. Unsupported until a native job exists |
 | scion-cache | Linux | x64 | memory | — | supported | `test` (ci.yml) | The suite covers the tier crate; objects live in memory |
-| scion-cache | Linux | arm64 | memory | — | best effort | `test-arm64` (ci.yml) | The suite covers the tier crate on arm64; the job runs nightly and on release candidates |
+| scion-cache | Linux | arm64 | memory | — | best effort | `test-arm64-rest` (ci.yml) | The suite covers the tier crate on arm64; the job runs nightly and on release candidates |
 | scion-cache | macOS | arm64 | memory | — | supported | `test-macos` (ci.yml) | The suite covers the tier crate |
 | scion-daemon | Linux | x64 | local disk | — | supported | `test` (ci.yml) | The suite covers the tier crate; the daemon's power-cut evidence is the `power-loss` job (LazyFS fault injection, a harness — not a filesystem promise) |
-| scion-daemon | Linux | arm64 | local disk | — | best effort | `test-arm64` (ci.yml) | The suite covers the tier crate on arm64; the job runs nightly and on release candidates; the power-cut evidence stays on x64 (`power-loss`) |
+| scion-daemon | Linux | arm64 | local disk | — | best effort | `test-arm64-rest` (ci.yml) | The suite covers the tier crate on arm64; the job runs nightly and on release candidates; the power-cut evidence stays on x64 (`power-loss`) |
 | scion-daemon | macOS | arm64 | local disk (APFS) | — | supported | `test-macos` (ci.yml) | The suite covers the tier crate |
 | scn | Linux | x64 | any | — | supported | `test` (ci.yml) | The CLI suite runs in the workspace job |
-| scn | Linux | arm64 | any | — | best effort | `test-arm64` (ci.yml) | The CLI suite runs in the arm64 job, which runs nightly and on release candidates |
-| scn | macOS | arm64 | any | — | supported | `test-macos` (ci.yml) | The CLI suite runs in the macOS job; the runner's disk is APFS |
-| scn mount | Linux | x64 | NFS | — | supported | `nfs-mount` (ci.yml) | The kernel NFS client mounts scn's server on the runner |
-| scn mount | macOS | arm64 | NFS | — | best effort | — | macOS can mount NFS, but no job proves it |
+| scn | Linux | arm64 | any | — | best effort | `test-arm64-rest` (ci.yml) | The CLI suite runs in the arm64 job, which runs nightly and on release candidates |
+| scn | macOS | arm64 | any | — | supported | `test-macos` (ci.yml) | The CLI suite runs in the macOS job; the runner's disk is APFS. The mount and commit tests that fork passed 100 runs in a row on macos-15 ([the mount-reps run](https://github.com/bnsd55/openscion/actions/runs/39310255775)) |
+| scn mount | Linux | x64 | NFS | — | experimental | `nfs-mount` (ci.yml) | The kernel NFS client mounts scn's server on the runner. The mounted mode is read-only and experimental, outside the v1 support contract; the write mode is the `unstable-writable-mount` build feature, off in every release binary |
+| scn mount | Linux | x64 | NFS, the `unstable-writable-mount` build | — | best effort | `test-writable` (ci.yml) | The feature build's from_mount suite mounts and writes on the runner; the write path stays out of every release binary |
+| scn mount | macOS | arm64 | NFS | — | best effort | — | macOS can mount NFS, but no job proves it. The write mode is the `unstable-writable-mount` build feature, off in every release binary |
 | scn mount | Windows | any | any | — | unsupported | — | The mount serves NFSv3 and rides POSIX mounts |
 
 Runner labels move (macOS versions retire, Ubuntu releases come): the
@@ -59,14 +62,13 @@ experimental row may name the scheduled job that still runs it — the
 test checks that the named job exists — and flips to supported only
 when that job runs the cell per push.
 
-Postgres majors are promised per cell, not as a family. Every Postgres
-cell is **experimental** in v0.1.0: tested in CI, but not yet
-recommended for production or relied on for data-safety evidence —
-SQLite is the backend the alpha builds its evidence on. The
-`test-postgres` job runs Postgres 17 per push (on data-path changes),
-and all three supported-upstream majors (16, 17, 18) nightly and on
-release candidates; adding a major is one service line plus its suite
-minutes — the cell row is added when the job runs it.
+Postgres majors are promised per cell, not as a family. Postgres is
+the supported metadata store: the server keeps its metadata in
+Postgres 16, 17 or 18, and a SQLite data directory is not opened.
+The `test-postgres` job runs Postgres 17 on every push, and all three
+supported-upstream majors (16, 17, 18) nightly and on release
+candidates; adding a major is one service line plus its suite minutes —
+the cell row is added when the job runs it.
 
 ## Severity levels
 
@@ -109,3 +111,100 @@ There is no long-term-support minor in 0.x: every minor can change
 what [stability.md](stability.md) does not pin, and only the latest
 minor takes the full fix list. The first release that could carry an
 LTS promise is v1.0, per the roadmap.
+
+## Directory width
+
+A tree object holds a whole directory, so a change to one name
+rewrites the directory's whole tree entry set: the cost of a change
+grows with the directory's width, not with the change's size. The
+supported width is **100,000 names in one directory**.
+
+The measured shape, on the land and read paths CI runs (the `dir_width`
+measurement, release build, CI runners):
+
+| Names in the directory | One change writes (trees) | Land time | ListDir reply | ListDir time |
+|---|---|---|---|---|
+| 1,000 | 54 KB | 34 ms | 54 KB | 5 ms |
+| 10,000 | 540 KB | 57 ms | 540 KB | 16 ms |
+| 100,000 | 5.4 MB | 105 ms | 5.4 MB | 28 ms |
+| 1,000,000 | 54 MB | 1,210 ms | 54 MB | 304 ms |
+
+Each name costs about 54 bytes of tree (the name plus its entry), so
+the storage cost matters more than the time: trees are stored in the
+database as their v1 bytes, uncompressed (only blobs are zstd files),
+and each change stores a new tree, content-addressed. A hundred
+changes to a 100,000-name directory store about 540 MB of trees.
+
+Past the supported width, nothing refuses at 100,000: it works, at the
+cost the table states, until `ListDir` reaches the reply cap — a
+directory's reply is its whole tree, and replies above 100 MB are
+refused, which nine-byte names reach near 1.85 million names. A
+directory wider than the supported width is a signal to restructure
+it; the remedy if a real workload needs one is chunked directories, a
+new tree format ([#114](https://github.com/bnsd55/openscion/issues/114)),
+which is the change the 1.x freeze would close off. A test pins the
+supported width's cost per change in `tests/dir_width.rs`.
+
+
+## Blob count
+
+The store keeps one file per blob, so the costs that scale with the
+blob count are file costs: fsck reads every file, gc walks every file,
+and each blob spends one inode and one directory entry of the
+filesystem that holds the data directory. The supported count is
+**1,000,000 blobs per data directory**.
+
+The measured shape, on the fixed `ubuntu-24.04` CI runner (4 vCPU,
+16 GiB RAM, ext4; the `blob-count` job of
+[bench.yml](../.github/workflows/bench.yml), a dispatch that fills a
+store of small blobs through the store's own put path in a release
+build and then measures - see
+`crates/scion-server/tests/bench_blob_count.rs`):
+
+| Blobs | Fill (s) | fsck, first walk (s) | fsck, warm (s) | gc --dry-run (s) | Reopen (s) | Inodes used | Blob bytes | Bytes on disk |
+|---|---|---|---|---|---|---|---|---|
+| 100,000 | 47.7 | 2.06 | - | 0.80 | 0.023 | +0.1M | 6.4 MB | ~0.4 GB |
+| 1,000,000 | 383.6 | 61.7 | 16.8 | 9.1 | 0.025 | +1.0M | 64 MB | 4.2 GB |
+| 5,000,000 | 2,142.3 | 863.1 | - | 37.9 | 0.031 | +5.0M | 320 MB | ~21 GB |
+
+The 100,000 and 5,000,000 rows are
+[run 41694111403](https://github.com/bnsd55/openscion/actions/runs/41694111403);
+the 1,000,000 row is
+[run 41716921823](https://github.com/bnsd55/openscion/actions/runs/41716921823),
+which also measured the warm walk and the counters the read below
+names.
+
+Read of the table:
+
+- **Reopen is flat**: the server's open scans nothing, so a restart
+  costs the same at five million blobs as at one hundred thousand.
+- **Fill is linear**, about 2,400 blobs per second on the runner.
+- **fsck's steady state is flat**: a walk with the page cache warm
+  costs about 17 microseconds per blob (16.8 s at 1M). The first walk
+  in a fresh process pays a one-time warm-up that grows with the count
+  (45 s extra at 1M); the profile shows it asks the device for nothing
+  at 1M - the blob bytes are 64 MB - so the warm-up is the kernel
+  populating its per-file caches, not reading data.
+- **The wall is RAM.** Small blobs cost a 4 KiB block each: 1M blobs
+  hold 4.2 GB, and 5M hold about 21 GB. Past the host's RAM the page
+  cache cannot hold the store, so the warm-flat walk is not available
+  and fsck is expected to pay a device read per file; the measurement
+  shows the cost (863 s at 5M, about 173 microseconds per blob, 10x
+  the warm 1M walk) but not the mechanism - the read counter ran at
+  100k and 1M only. A host that sizes RAM to its store keeps fsck warm
+  and flat; a store larger than RAM makes fsck minutes per million
+  blobs.
+- **gc --dry-run** grows a little faster than the count (7.8x for 5x)
+  but stays far under fsck; it stats every file and reads none.
+
+One inode per blob is the second wall: 5M blobs spent 5M of the
+runner's 19.5M inodes. The inode budget and how to size it are in
+[operations.md](operations.md) (capacity, "The inode budget"); check a
+live filesystem with `df -i`.
+
+Past the supported count, nothing refuses: the costs are the table's,
+and the first cost to bite is fsck on a store larger than RAM. The
+remedy if a real workload needs more is the one the file-per-blob
+layout has always pointed at - packing small blobs into fewer files -
+tracked with the profile that names the cold-walk cost in
+[#824](https://github.com/bnsd55/openscion/issues/828).

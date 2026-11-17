@@ -89,6 +89,8 @@ pub(crate) struct ObjectsService {
     quotas: Quotas,
     /// The tokens of the server: every call of this service but
     /// `GetObjects` needs one. An object read's permission is its ticket.
+    /// The refusal sink rides on it, so a refused token is counted and
+    /// recorded the way the Scion service's is.
     auth: Auth,
     /// The keys that mint the tickets of `GetRootTree` replies. `None`
     /// keeps every object read closed: a reply then carries no ticket.
@@ -104,16 +106,23 @@ impl ObjectsService {
         quotas: Quotas,
         tickets: Option<Arc<Keys>>,
         metrics: Arc<Metrics>,
+        auth: Auth,
     ) -> Self {
         Self {
             worker,
-            auth: access.auth(),
+            auth,
             access,
             quotas,
             tickets,
             metrics,
             in_flight: Arc::new(Semaphore::new(IN_FLIGHT_BYTES)),
         }
+    }
+
+    /// The worker, for the crate's tests of a cancelled call.
+    #[cfg(test)]
+    pub(crate) fn worker(&self) -> &Worker {
+        &self.worker
     }
 
     pub(crate) fn into_server(self) -> ObjectsServer<Self> {
@@ -289,13 +298,13 @@ async fn start_reply(
     // within the busy wait: the call ends `RESOURCE_EXHAUSTED`. A walk that
     // decoded nothing takes no share.
     let walk_share = if decoded > 0 {
-        Some(reply::take(&in_flight, decoded, busy).await)
+        let Some(permit) = reply::take(&in_flight, decoded, busy).await else {
+            return Err(reply::busy());
+        };
+        Some(permit)
     } else {
         None
     };
-    if decoded > 0 && walk_share.is_none() {
-        return Err(reply::busy());
-    }
     let first = find(&worker, &in_flight, busy, read, &allowed, zstd, key)
         .await
         .ok_or_else(reply::busy)?;
@@ -318,7 +327,15 @@ async fn start_reply(
                     key,
                 )
             };
-            reply::send_objects(first, rest, tx, waits.stall, stalled, slot, produce).await;
+            reply::send_objects(
+                first,
+                rest,
+                tx,
+                reply::ReplyStall::new(waits.stall, stalled, slot),
+                reply::READS_IN_FLIGHT,
+                produce,
+            )
+            .await;
         }
         // The reply runs outside the call, but stays in its span.
         .instrument(tracing::Span::current()),
@@ -330,9 +347,12 @@ async fn start_reply(
 /// `in_flight` for the memory that reading it holds, and only then reads it.
 /// Then keeps only the share of the bytes it sends. `None` if the share is
 /// not free within `busy`.
-// SHORTCUT: two blocking hops per object and no read-ahead, so many small
-// objects are read one after another. Upgrade: read a batch capped by bytes
-// per hop, or keep a few reads in flight (issue #6).
+// SHORTCUT: each read is still two blocking hops (plan, then read), but the
+// reply keeps READS_IN_FLIGHT of them running ahead of its sends, so the
+// hops of many small objects overlap. What stays serialized is the pair of
+// hops within one object. Upgrade: one hop that plans and reads together
+// (a store API that returns the object in one call; the section 9 row that
+// names this file).
 async fn find(
     worker: &Worker,
     in_flight: &Arc<Semaphore>,
@@ -365,13 +385,15 @@ impl Objects for ObjectsService {
         &self,
         mut request: Request<ResolveRefRequest>,
     ) -> Result<Response<ResolveRefResponse>, Status> {
-        // No interceptor on this service: `GetObjects` has none, and the
-        // service's token-checked calls name their caller themselves.
+        // The check is handler-side on this service (`GetObjects` carries
+        // no token, so the service has no interceptor), and the refusal
+        // records through the auth's own sink: the same counted line per
+        // peer the interceptor's refusals make.
         let caller = self.auth.caller_of(&request)?;
         request.extensions_mut().insert(caller);
         resolve_ref(&self.worker, &self.access, &self.quotas, request)
             .await
-            .map(Response::new)
+            .map(|r| crate::service::count_reply(Response::new(r)))
     }
 
     async fn get_root_tree(
@@ -381,8 +403,12 @@ impl Objects for ObjectsService {
         let caller = self.auth.caller_of(&request)?;
         let _call = self.quotas.enter(&caller).map_err(Status::from)?;
         // The derivation of a first view walks the real tree, under the
-        // call's deadline.
+        // call's deadline. A client that cancels drops this call; the
+        // guard says so to the job's loop checks, so its cold derive
+        // stops at its next step and frees its reader, instead of
+        // running on to the deadline.
         let deadline = Deadline::of_call(&request, crate::deadline::CALL_LIMIT);
+        let _call_gone = deadline.guard();
         let GetRootTreeRequest { repo, changeset_id } = request.into_inner();
         check_reader(&self.access, &caller, &repo)?;
         let cs = parse_id(&changeset_id, "changeset_id")?;
@@ -422,10 +448,12 @@ impl Objects for ObjectsService {
             // ticket fails every read that carries it.
             None => Vec::new(),
         };
-        Ok(Response::new(GetRootTreeResponse {
-            tree_id: tree.as_bytes().to_vec(),
-            ticket,
-        }))
+        Ok(crate::service::count_reply(Response::new(
+            GetRootTreeResponse {
+                tree_id: tree.as_bytes().to_vec(),
+                ticket,
+            },
+        )))
     }
 
     type GetObjectsStream = ObjectStream;
@@ -510,7 +538,7 @@ impl Objects for ObjectsService {
             zstd,
             decoded,
         );
-        Ok(Response::new(stream.await?))
+        Ok(crate::service::mark_stream(Response::new(stream.await?)))
     }
 }
 
@@ -589,17 +617,48 @@ fn of(key: &Key) -> (ObjectKind, [u8; 32]) {
 
 #[cfg(test)]
 mod tests {
+    use super::*;
     use crate::backend::Backend;
-    use crate::store::Store;
     use std::io::Read as _;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// The second read's hold: the semaphore, the second's key, the three
+    /// shares (second, third, budget), so the read can wait for the exact
+    /// accounting.
+    type SecondHold = (Arc<Semaphore>, Key, usize, usize, usize);
+
+    /// The second read's hold, for the cut-off test: the read waits until
+    /// the third's share is taken, so the read-ahead is forced, not hoped
+    /// for. A `Read` is a plain fn pointer, so the hold rides a static.
+    static SECOND_HOLD: Mutex<Option<SecondHold>> = Mutex::new(None);
+
+    /// The cut-off test's read: the second's key spins until the free
+    /// budget names all three shares (the first is back, the second and
+    /// the third are held), with a bound so a broken window fails loudly
+    /// instead of hanging.
+    fn read_with_hold(store: &Backend, key: Key, plan: Plan) -> Result<Outgoing> {
+        let hold = SECOND_HOLD
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone();
+        if let Some((in_flight, second_key, second, third, budget)) = hold
+            && key == second_key
+        {
+            for _ in 0..5_000 {
+                if in_flight.available_permits() == budget - second - third {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(2));
+            }
+        }
+        read_object(store, key, plan)
+    }
 
     use scion_proto::CHUNK_BYTES;
     use scion_proto::runtime::object::Assembler;
     use tokio_stream::StreamExt as _;
     use tonic::Code;
-
-    use super::*;
 
     /// Waits until `done` holds, at most 10 s.
     async fn until(done: impl Fn() -> bool) {
@@ -620,7 +679,7 @@ mod tests {
     }
 
     /// The length of a blob's stored file.
-    fn packed_len(store: &Store, key: Key) -> usize {
+    fn packed_len(store: &Backend, key: Key) -> usize {
         let Key::Blob(id) = key else {
             panic!("not a blob")
         };
@@ -639,21 +698,33 @@ mod tests {
     // test sees the second object hold its share, however busy the machine.
     #[tokio::test(start_paused = true)]
     async fn a_client_that_stops_reading_is_cut_off_and_frees_its_budget() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
-        let raw = store.as_sqlite().expect("the client tests run on SQLite");
+        // The client mechanics read the blob files' packed sizes
+        // (`packed_len`): the test measures the object bytes on the store's
+        // own files.
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
         let keys: Vec<Key> = [b"one".as_slice(), b"second", b"three"]
             .iter()
             .map(|data| Key::Blob(store.blobs().put(data).unwrap()))
             .collect();
-        let second = packed_len(raw, keys[1]);
+        let second = packed_len(&store, keys[1]);
+        let third = packed_len(&store, keys[2]);
         // Files of two sizes, so the free budget shows which object holds a
         // share. With one size, the first object, before it is sent, looks
         // like the second.
-        assert_ne!(packed_len(raw, keys[0]), second);
+        assert_ne!(packed_len(&store, keys[0]), second);
+        assert_ne!(second, third);
         let budget = 1000;
         let in_flight = Arc::new(Semaphore::new(budget));
         let stall = Duration::from_millis(50);
+        // The read-ahead is forced, not hoped for: the second's read
+        // holds until the third's share is taken, so the exact accounting
+        // below holds whatever order the two reads' plans finish in. A
+        // spin with a bound: the read runs on a blocking thread, and the
+        // window's polls keep coming while it waits. The hold rides a
+        // static, because a `Read` is a plain fn pointer.
+        *SECOND_HOLD.lock().unwrap() =
+            Some((Arc::clone(&in_flight), keys[1], second, third, budget));
         let reply = start_reply(
             Worker::new(store),
             keys.clone(),
@@ -664,16 +735,18 @@ mod tests {
                 stalled: None,
                 call: Call::default(),
             },
-            read_object,
+            read_with_hold,
             true,
             0,
         );
         let mut stream = reply.await.unwrap();
 
-        // Nobody reads: the first object waits in the channel, and its share
-        // is back. The second holds its share while its send stalls, then
-        // the reply ends and gives it back.
-        until(|| in_flight.available_permits() == budget - second).await;
+        // Nobody reads: the first object waits in the channel, and its
+        // share is back. The second holds its share while its send stalls,
+        // and the third's read runs one ahead and holds its own share:
+        // reads in flight are shares held, exactly as the reply's doc
+        // says. The reply ends at the stall, and every share goes back.
+        until(|| in_flight.available_permits() == budget - second - third).await;
         until(|| in_flight.available_permits() == budget).await;
         let first = stream.next().await.unwrap().unwrap();
         let (header, data) = Assembler::new(Header::of(&first, true).unwrap(), first).finish();
@@ -689,8 +762,8 @@ mod tests {
             read_object(store, key, plan)
         }
 
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
         let a = Key::Blob(store.blobs().put(b"a blob").unwrap());
         let budget = 1000;
         let in_flight = Arc::new(Semaphore::new(budget));
@@ -731,8 +804,8 @@ mod tests {
     // fails the call before any object is read.
     #[tokio::test]
     async fn a_walk_bigger_than_the_free_budget_ends_resource_exhausted() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
         let a = Key::Blob(store.blobs().put(b"a blob").unwrap());
         let budget = 1000;
         let in_flight = Arc::new(Semaphore::new(budget));
@@ -770,8 +843,8 @@ mod tests {
     /// deadline, not after the 30 s limit.
     #[tokio::test]
     async fn a_wait_for_room_ends_before_the_deadline() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
         let a = Key::Blob(store.blobs().put(b"a blob").unwrap());
         let in_flight = Arc::new(Semaphore::new(1000));
         let _others = reply::try_take(&in_flight, 1000).unwrap();
@@ -810,8 +883,8 @@ mod tests {
             read_object(store, key, plan)
         }
 
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
         let content = vec![b'x'; 5000];
         let key = Key::Blob(store.blobs().put(&content).unwrap());
         let in_flight =
@@ -859,8 +932,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_blob_goes_out_as_its_stored_file_in_parts_or_unpacked() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
         // Over three parts once packed: bytes that do not compress.
         let mut state = 1_u64;
         let content: Vec<u8> = (0..3 * CHUNK_BYTES + 100)
@@ -924,6 +997,334 @@ mod tests {
         assert_eq!(in_flight.available_permits(), IN_FLIGHT_BYTES);
     }
 
+    /// A 0-byte blob file holds no frame; the size reader answers 0 for
+    /// it, and the plan must send it RAW, not as a zstd frame that does
+    /// not exist. The writer always frames its content, so the file is
+    /// emptied by hand: this is the state the arm exists for (only the
+    /// empty blob's file may be 0 bytes; `Blobs::verify` says so).
+    #[test]
+    fn an_empty_blob_file_plans_raw() {
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
+        let id = BlobId::of(b"");
+        let hex = id.to_string();
+        let path = dir
+            .path()
+            .join("objects")
+            .join("blob")
+            .join(&hex[..2])
+            .join(&hex[2..]);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, b"").unwrap();
+        let size = store.blobs().size(id).unwrap();
+        assert_eq!(size, 0, "the empty file's content size");
+        let plan = plan(&store, Key::Blob(id), &HashSet::from([Key::Blob(id)]), true).unwrap();
+        assert_eq!(plan.encoding, Encoding::Raw, "{plan:?}");
+    }
+
+    /// The walk's cap arithmetic: the bytes it holds plus the next
+    /// tree's bytes must fit the cap - not their product, and the
+    /// boundary is exclusive. Two trees whose sum is exactly the cap
+    /// go through; under `held * bytes` or `>=` the walk refuses.
+    #[test]
+    fn the_walk_cap_takes_the_sum_of_two_trees_to_its_exact_bound() {
+        use scion_core::{Entry, FileEntry, FileState, PathElem, Tree};
+        use std::collections::BTreeMap;
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
+        let blob = BlobId::of(b"blob");
+        let entry = |name: &str| {
+            Tree::new(BTreeMap::from([(
+                PathElem::new(name.as_bytes().to_vec()).unwrap(),
+                Entry::File(FileEntry::new(
+                    FileState::Regular {
+                        content: blob,
+                        executable: false,
+                    },
+                    0,
+                )),
+            )]))
+            .expect("tree fits the format")
+        };
+        let (mid_body, mid_id) = entry("m").encode_with_id();
+        let (root_body, root_id) = Tree::new(BTreeMap::from([(
+            PathElem::new("d").unwrap(),
+            Entry::Dir(mid_id),
+        )]))
+        .expect("tree fits the format")
+        .encode_with_id();
+        let (refs, cap) = store
+            .write(|c| {
+                // The bodies the walk decodes are exactly these.
+                c.put_trees(&[(mid_id, mid_body.clone()), (root_id, root_body.clone())])?;
+                let leaf = c.put_tree(&entry("f"))?;
+                let refs = [(Key::Tree(leaf), b"d/m".to_vec())];
+                Ok((refs, root_body.len() + mid_body.len()))
+            })
+            .unwrap();
+        let (_, decoded) = prove(&store, *root_id.as_bytes(), &refs, cap, None).unwrap();
+        assert!(decoded > 0, "{decoded}");
+    }
+
+    /// The tree-size guard's boundary: a tree whose body is exactly the
+    /// object limit reads; one byte over would be damage. The mutants
+    /// that move the comparison (`>` to `==` or `>=`) refuse the
+    /// exact-limit tree.
+    #[test]
+    fn a_tree_at_the_object_limit_plans_raw() {
+        use scion_core::{Entry, FileEntry, FileState, PathElem, Tree};
+        use scion_proto::MAX_OBJECT_BYTES;
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
+        let blob = BlobId::of(b"blob");
+        // Build the tree, measure, then shave the excess off the tail
+        // names, from the last one back, keeping every name at least
+        // 1 byte. A name's bytes are the body's bytes one for one.
+        let wide = 4096_usize;
+        let base_count = MAX_OBJECT_BYTES / (wide + 44);
+        let mut names: Vec<Vec<u8>> = Vec::new();
+        for i in 0..base_count {
+            let mut name = vec![b'n'; wide];
+            let byte = |v: usize| u8::try_from(v % 46 + 1).unwrap();
+            name[0] = byte(i);
+            name[1] = byte(i / 46);
+            name[2] = byte(i / 2_116);
+            names.push(name);
+        }
+        names.push(vec![b'z'; 44]);
+        let (body, _id) = {
+            let tree = Tree::new(
+                names
+                    .iter()
+                    .map(|n| {
+                        (
+                            PathElem::new(n.clone()).unwrap(),
+                            Entry::File(FileEntry::new(
+                                FileState::Regular {
+                                    content: blob,
+                                    executable: false,
+                                },
+                                0,
+                            )),
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("tree fits the format");
+            tree.encode_with_id()
+        };
+        let mut over = body.len() - MAX_OBJECT_BYTES;
+        for name in names.iter_mut().rev() {
+            if over == 0 {
+                break;
+            }
+            let shave = over.min(name.len() - 1);
+            name.truncate(name.len() - shave);
+            over -= shave;
+        }
+        assert_eq!(over, 0, "the tail carried the whole excess");
+        let (body, id) = {
+            let tree = Tree::new(
+                names
+                    .iter()
+                    .map(|n| {
+                        (
+                            PathElem::new(n.clone()).unwrap(),
+                            Entry::File(FileEntry::new(
+                                FileState::Regular {
+                                    content: blob,
+                                    executable: false,
+                                },
+                                0,
+                            )),
+                        )
+                    })
+                    .collect(),
+            )
+            .expect("tree fits the format");
+            tree.encode_with_id()
+        };
+        assert_eq!(body.len(), MAX_OBJECT_BYTES, "{}", body.len());
+        let tree_id = TreeId::try_from(id.as_bytes().as_slice()).unwrap();
+        store.write(|c| c.put_trees(&[(tree_id, body)])).unwrap();
+        let plan = plan(
+            &store,
+            Key::Tree(tree_id),
+            &HashSet::from([Key::Tree(tree_id)]),
+            true,
+        )
+        .unwrap();
+        assert_eq!(plan.encoding, Encoding::Raw, "{plan:?}");
+    }
+
+    /// A stored file bigger than a zstd frame of its content size is
+    /// damage, and the plan refuses it by name. The writer never writes
+    /// one - a real frame's blocks add a fraction of the bound - so the
+    /// file is grown by hand: the same state a damaged store carries.
+    #[test]
+    fn a_packed_file_over_its_zstd_bound_is_corrupt() {
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
+        let id = store.blobs().put(b"a blob").unwrap();
+        // The frame stays; the file grows past the bound of its content.
+        let hex = id.to_string();
+        let path = dir
+            .path()
+            .join("objects")
+            .join("blob")
+            .join(&hex[..2])
+            .join(&hex[2..]);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.extend(vec![b'x'; 1024]);
+        std::fs::write(&path, bytes).unwrap();
+        let size = store.blobs().size(id).unwrap();
+        let stored = usize::try_from(std::fs::metadata(&path).unwrap().len()).unwrap();
+        assert!(zstd_bound(size) < stored);
+        let err = plan(&store, Key::Blob(id), &HashSet::from([Key::Blob(id)]), true).unwrap_err();
+        assert!(matches!(err, Error::Corrupt(_)), "{err:?}");
+    }
+
+    /// The caller's deadline, read from the request's `grpc-timeout`
+    /// into the reply's waits, ends a reply whose budget is fully held:
+    /// the waits end at the deadline with `RESOURCE_EXHAUSTED`, not at
+    /// the 30-second busy window. The initializer that reads the
+    /// request is what the mutation run dropped; without it the waits
+    /// ride the default `Until::NONE` and wait out the window.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn the_requests_deadline_ends_the_replys_waits() {
+        use crate::objects::ObjectsService;
+        use scion_proto::v1::objects_server::Objects as _;
+        use scion_proto::v1::{GetObjectsRequest, ObjectKind, ObjectRef};
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
+        // A repo whose README the ticket's walk reaches.
+        let blob = store.blobs().put(b"# hello\n").unwrap();
+        let (root, _content) = store
+            .write(|c| {
+                let repo = c.create_repo("r")?;
+                let content = BlobId::of(b"# hello\n");
+                let cs = c.insert_changeset(
+                    repo,
+                    &scion_core::Changeset::new(
+                        vec![],
+                        scion_core::IdentityTime::new(
+                            b"Ada".to_vec(),
+                            b"ada@example.com".to_vec(),
+                            1_700_000_000,
+                            0,
+                        )
+                        .expect("identity fits the format"),
+                        None,
+                        b"root\n".to_vec(),
+                        [(
+                            scion_core::RepoPath::new("README").unwrap(),
+                            Some(scion_core::FileState::Regular {
+                                content,
+                                executable: false,
+                            }),
+                        )]
+                        .into(),
+                    )
+                    .expect("changeset fits the format"),
+                )?;
+                c.cas_ref(repo, "main", None, cs)?;
+                Ok((cs, content))
+            })
+            .unwrap();
+        let root_tree = crate::test_support::read::root_tree(
+            &store,
+            "r",
+            root,
+            &crate::test_support::deadline::Deadline::new(
+                std::time::Instant::now() + std::time::Duration::from_secs(300),
+            ),
+        )
+        .unwrap();
+        let keys = crate::tickets::Keys::generate();
+        let ticket = keys.sign("r", "alice", *root_tree.as_bytes()).unwrap();
+        let mut service = ObjectsService::new(
+            Worker::new(store),
+            Arc::new(crate::Access::single("t")),
+            crate::Quotas::off(),
+            Some(Arc::new(keys)),
+            Arc::default(),
+            crate::Access::single("t").auth(),
+        );
+        // The budget, small and fully held: the reply's waits wait.
+        service.in_flight = Arc::new(Semaphore::new(1000));
+        let _others = reply::try_take(&service.in_flight, 1000).unwrap();
+        let request = GetObjectsRequest {
+            ticket,
+            accept: Vec::new(),
+            refs: vec![ObjectRef {
+                kind: ObjectKind::Blob as i32,
+                id: blob.as_bytes().to_vec(),
+                path: b"README".to_vec(),
+            }],
+        };
+        let mut request = tonic::Request::new(request);
+        request.set_timeout(Duration::from_secs(2));
+        let started = std::time::Instant::now();
+        let reply = service.get_objects(request).await;
+        let elapsed = started.elapsed();
+        let status = reply.unwrap_err();
+        assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+        // The deadline (2 s less the server's margin), not the 30 s
+        // busy window, ended the wait. The waits may take the deadline
+        // twice (the walk's share, then the reply's own); the window is
+        // ten times longer, so the order of magnitude tells them apart.
+        assert!(elapsed < Duration::from_secs(15), "{elapsed:?}");
+    }
+
+    /// The walk's share refusal is the reply's answer: when the walk
+    /// decoded more than the budget will ever free, the reply ends
+    /// `RESOURCE_EXHAUSTED` at the walk share's own wait - it does not
+    /// go on to wait for the first object's smaller share, which a
+    /// later freeing would satisfy. The regression test for #1016: the
+    /// refusal wrapped the take in `Some`, and `Some(None).is_none()`
+    /// is false, so a refused walk share served the objects anyway.
+    #[tokio::test(start_paused = true)]
+    async fn a_refused_walk_share_ends_the_reply_busy() {
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
+        // The buggy path must have an object to serve.
+        let blob_id = store.blobs().put(b"a blob").unwrap();
+        // More than the 30 the budget frees below, so the walk share
+        // waits to the deadline; start_reply takes it as a plain number.
+        let decoded = 100;
+        // The budget: 1000 bytes, all held. 30 come back two paused
+        // seconds in - less than the walk's share, more than the blob's.
+        let in_flight = Arc::new(Semaphore::new(1000));
+        let _held = reply::try_take(&in_flight, 970).unwrap();
+        let gift = reply::try_take(&in_flight, 30).unwrap();
+        let freer = tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(2)).await;
+            drop(gift);
+        });
+        let a = Key::Blob(blob_id);
+        let waits = Waits {
+            until: Until::after(Duration::from_secs(3)),
+            ..WAITS
+        };
+        let reply = start_reply(
+            Worker::new(store),
+            vec![a],
+            HashSet::from([a]),
+            Reply {
+                in_flight,
+                waits,
+                stalled: None,
+                call: Call::default(),
+            },
+            read_object,
+            true,
+            decoded,
+        );
+        let status = reply.await.unwrap_err();
+        assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+        freer.await.unwrap();
+    }
+
     /// The ticket walk pays as it goes: a tree is handed to the walk only
     /// while the bytes it holds fit the reply budget, and an expired
     /// deadline stops the walk before the first tree. The walk reaches a
@@ -933,8 +1334,8 @@ mod tests {
     fn a_ticket_walk_stops_before_it_decodes_past_the_budget() {
         use scion_core::{Entry, FileEntry, FileState, PathElem, Tree};
         use std::collections::BTreeMap;
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
         // A middle tree whose one file entry has a wide name, so its body
         // is hundreds of bytes, under a root of one small entry, over a
         // leaf the ref ends at.
@@ -1018,7 +1419,7 @@ mod tests {
     fn a_tree_size_reads_the_octets_of_a_stored_tree() {
         use scion_core::Tree;
         use std::collections::BTreeMap;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let store = Backend::open_test(dir.path()).unwrap();
         let tree = Tree::new(BTreeMap::new()).expect("tree fits the format");
         let id = store.write(|c| c.put_tree(&tree)).unwrap();
@@ -1035,7 +1436,7 @@ mod tests {
         use crate::meta::MetaTx as _;
         use scion_core::{Changeset, IdentityTime};
         use std::collections::BTreeMap;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let store = Backend::open_test(dir.path()).unwrap();
         let repo = store.write(|c| c.create_repo("fsck-rows")).unwrap();
         // The derived table's foreign key names a stored changeset.

@@ -53,7 +53,7 @@ async fn served() -> (
     ScionClient<InterceptedService<tonic::transport::Channel, Bearer>>,
     scion_core::ChangesetId,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let store = {
         let path = dir.path().to_path_buf();
         tokio::task::spawn_blocking(move || Backend::open_test(&path).unwrap())
@@ -101,6 +101,7 @@ async fn served() -> (
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::clone(&metrics),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         Some(Arc::new(Keys::generate())),
         async {

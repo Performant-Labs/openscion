@@ -5,9 +5,10 @@
 use scion_proto::runtime::auth::token_digest;
 use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::ResolveRefRequest;
+use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::scion_client::ScionClient;
 
-use scion_core::ChangesetId;
+use scion_core::{BlobId, ChangesetId};
 use scion_server::test_support::audit::{Audit, Event};
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::service;
@@ -34,6 +35,7 @@ impl Interceptor for Bearer {
 }
 
 type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
+type Objects = ObjectsClient<InterceptedService<Channel, Bearer>>;
 
 fn access() -> Access {
     let digest = blake3::Hash::from(token_digest("ci")).to_hex().to_string();
@@ -103,6 +105,7 @@ async fn serve_with_audit(
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::new(Metrics::default()),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         Some(Arc::new(Keys::generate())),
         async {
@@ -120,6 +123,14 @@ async fn client(url: &str, token: &str) -> Scion {
     ScionClient::with_interceptor(channel, Bearer(Some(value)))
 }
 
+async fn objects_client(url: &str, token: &str) -> Objects {
+    let channel = common::channel(url).await.unwrap();
+    let value = format!("Bearer {token}")
+        .parse()
+        .expect("a bearer header parses");
+    ObjectsClient::with_interceptor(channel, Bearer(Some(value)))
+}
+
 fn read_lines(path: &std::path::Path) -> Vec<serde_json::Value> {
     let bytes = std::fs::read(path).unwrap();
     String::from_utf8(bytes)
@@ -132,7 +143,7 @@ fn read_lines(path: &std::path::Path) -> Vec<serde_json::Value> {
 
 #[tokio::test]
 async fn refused_authentication_is_one_counted_line_per_peer_and_names_no_token() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let store = store(dir.path());
     let audit_path = dir.path().join("audit.log");
     let audit = Audit::open(&audit_path).unwrap();
@@ -168,6 +179,62 @@ async fn refused_authentication_is_one_counted_line_per_peer_and_names_no_token(
     // never per call, and a port rotation cannot bury anyone.
     assert_eq!(refusals.len(), 1, "one line per address, not per call");
     assert_eq!(refusals[0]["count"], 40, "every refusal is counted");
+    assert_eq!(refusals[0]["peer"], "127.0.0.1");
+    let bytes = std::fs::read(&audit_path).unwrap();
+    let text = String::from_utf8(bytes).unwrap();
+    assert!(!text.contains(wrong), "the refused token never appears");
+    let digest = blake3::Hash::from(token_digest(wrong)).to_hex().to_string();
+    assert!(
+        !text.contains(&digest),
+        "the refused token's digest never appears"
+    );
+}
+
+/// The same stream on the Objects service's `ResolveRef`: every client
+/// read starts here, and a refused token must be counted and recorded
+/// exactly as the Scion service's refusal is - one line per peer, the
+/// count of every refusal, and never the token or its digest.
+#[tokio::test]
+async fn refused_authentication_on_the_objects_service_is_counted_like_the_scion_service_s_is() {
+    let dir = scion_server::test_support::private_tempdir();
+    let store = store(dir.path());
+    let audit_path = dir.path().join("audit.log");
+    let audit = Audit::open(&audit_path).unwrap();
+    audit
+        .record(Event::new(
+            "admin",
+            "ok",
+            serde_json::json!({ "what": "start" }),
+        ))
+        .await
+        .unwrap();
+    let (stop, url) = serve_with_audit(&store, dir.path(), access(), audit).await;
+
+    // Twenty refused calls on the read path's own service.
+    let wrong = "wrong-token-4e8b1d";
+    let mut objects = objects_client(&url, wrong).await;
+    for _ in 0..20 {
+        let err = objects
+            .resolve_ref(ResolveRefRequest {
+                repo: REPO.into(),
+                name: "main".into(),
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(err.code(), Code::Unauthenticated, "{err:?}");
+    }
+
+    // The stop flushes the meter's counts before the server ends.
+    stop.send(()).unwrap();
+    wait_for_lines(&audit_path, 2).await;
+
+    let lines = read_lines(&audit_path);
+    let refusals: Vec<_> = lines
+        .iter()
+        .filter(|line| line["event"] == "auth" && line["outcome"] == "refused")
+        .collect();
+    assert_eq!(refusals.len(), 1, "the Objects refusal is recorded");
+    assert_eq!(refusals[0]["count"], 20, "every refusal is counted");
     assert_eq!(refusals[0]["peer"], "127.0.0.1");
     let bytes = std::fs::read(&audit_path).unwrap();
     let text = String::from_utf8(bytes).unwrap();
@@ -268,6 +335,63 @@ async fn writer(url: &str, request_id: &str) -> Writer {
     ScionClient::with_interceptor(channel, WriteCall(request_id.to_owned()))
 }
 
+/// A multi-chunk upload is one write whose intent line says the true
+/// total of every chunk's bytes. Kills the mutant that subtracts (or
+/// multiplies) instead of adding the later chunks - the line then names
+/// a wrapped or wrong count - and the mutant that flips the only-the-
+/// first-message-names-the-repo check, which refuses every upload whose
+/// later chunk arrives.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_multi_chunk_upload_records_the_true_total_of_its_bytes() {
+    use scion_proto::v1::PutBlobRequest;
+
+    let dir = scion_server::test_support::private_tempdir();
+    let store = store(dir.path());
+    let audit_path = dir.path().join("audit.log");
+    let audit = Audit::open(&audit_path).unwrap();
+    let (stop, url) = serve_with_audit(&store, dir.path(), write_access(), audit).await;
+    let mut ci = writer(&url, "t-chunks").await;
+
+    // Three chunks: the first names the repo, the later two do not.
+    let chunks = vec![b"aaa".to_vec(), b"bbbbb".to_vec(), b"c".to_vec()];
+    let total: usize = chunks.iter().map(Vec::len).sum();
+    let reqs = chunks
+        .clone()
+        .into_iter()
+        .enumerate()
+        .map(|(i, data)| PutBlobRequest {
+            repo: if i == 0 { REPO.into() } else { String::new() },
+            data,
+        })
+        .collect::<Vec<_>>();
+    let reply = ci
+        .put_blob(tokio_stream::iter(reqs))
+        .await
+        .expect("the multi-chunk upload is allowed")
+        .into_inner();
+
+    // The blob reads back whole: the loop carried every chunk's data.
+    let blob_id = BlobId::try_from(reply.blob_id.as_slice()).expect("the reply names a blob");
+    let whole = chunks.concat();
+    assert_eq!(
+        &*store.blobs().get(blob_id).unwrap(),
+        &whole,
+        "the chunks together are the blob"
+    );
+
+    stop.send(()).unwrap();
+    wait_for_lines(&audit_path, 2).await;
+
+    let lines = read_lines(&audit_path);
+    let writes = pairs(&lines, "write");
+    assert_eq!(writes.len(), 1, "one upload pair: {lines:?}");
+    assert_eq!(writes[0].0["rpc"], "PutBlob", "the pair is the upload's");
+    assert_eq!(
+        writes[0].0["bytes"], total,
+        "the intent line says the true total: {lines:?}"
+    );
+}
+
 /// Every state change records an intent line before it runs and a
 /// result line after, and the pair joins by the request ID. No line
 /// names a blob or a tree.
@@ -276,7 +400,7 @@ async fn a_write_changeset_and_land_record_intent_and_result_pairs() {
     use scion_proto::v1::{CreateChangesetRequest, LandRequest, PutBlobRequest};
     use tokio_stream::once;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let store = store(dir.path());
     let audit_path = dir.path().join("audit.log");
     let audit = Audit::open(&audit_path).unwrap();
@@ -368,6 +492,26 @@ async fn a_write_changeset_and_land_record_intent_and_result_pairs() {
     assert!(!text.contains(&blob_hex), "no blob digest in the audit");
 }
 
+/// Bounds one await of the drain test. The #965 hang was an await
+/// that never returned, and it showed only when the whole binary ran
+/// (0 in 400 solo reps). Without a deadline the job times out at 25
+/// minutes with no data; with one, the test fails in seconds and the
+/// panic names the call, the bound, and the elapsed time, so the log
+/// says which await hung.
+async fn bound<F, T>(secs: u64, what: &'static str, fut: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    let started = std::time::Instant::now();
+    match tokio::time::timeout(std::time::Duration::from_secs(secs), fut).await {
+        Ok(value) => value,
+        Err(tokio::time::error::Elapsed { .. }) => panic!(
+            "{what} was still pending after {secs}s (elapsed {:?}) - the #965 hang trap",
+            started.elapsed()
+        ),
+    }
+}
+
 /// A write whose audit intent was not made durable does not happen:
 /// the upload is refused, and the store holds no new blob.
 #[tokio::test(flavor = "multi_thread")]
@@ -375,21 +519,28 @@ async fn a_write_whose_intent_fails_is_refused() {
     use scion_proto::v1::{PutBlobRequest, ResolveRefRequest};
     use tokio_stream::once;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let store = store(dir.path());
     let audit_path = dir.path().join("audit.log");
     let audit = Audit::open(&audit_path).unwrap();
     audit.fail_next_appends(1).unwrap();
-    let (stop, url) = serve_with_audit(&store, dir.path(), write_access(), audit).await;
-    let mut ci = writer(&url, "t-fail").await;
+    let (stop, url) = bound(
+        30,
+        "the server's readiness",
+        serve_with_audit(&store, dir.path(), write_access(), audit),
+    )
+    .await;
+    let mut ci = bound(10, "the writer's connect", writer(&url, "t-fail")).await;
 
-    let status = ci
-        .put_blob(once(PutBlobRequest {
+    let status = bound(30, "put_blob (the refused write)", async {
+        ci.put_blob(once(PutBlobRequest {
             repo: REPO.into(),
             data: b"never lands\n".to_vec(),
         }))
         .await
-        .unwrap_err();
+    })
+    .await
+    .unwrap_err();
     assert_eq!(status.code(), tonic::Code::Unavailable, "{status:?}");
 
     // The blob is not in the store: resolve it? An upload names no
@@ -405,18 +556,43 @@ async fn a_write_whose_intent_fails_is_refused() {
     // supervisor restarts a server that can prove its lines again.
     // The call rides the connection the drain is still finishing, so
     // poll with a deadline instead of racing the drain once.
+    //
+    // The per-call bound sits above the server's own tightest wait on
+    // this path, not below it: a `resolve_ref` takes a reader from the
+    // pool, and the pool's own wait is `READER_WAIT` (pg.rs, 30 s), with
+    // the read statement behind it bounded at minutes. On a runner whose
+    // Postgres is shared with other suites' runtimes, one call can
+    // legitimately hold for tens of seconds (run 43150672619 fired the
+    // 5 s trap exactly there), so a trap under 30 s mistakes a slow runner
+    // for a hung server. 35 s covers the pool's own bound plus slop; a call
+    // that is still pending at 35 s is one the server's pool wait should
+    // have answered, and the trap names it.
+    //
+    // The poll as a whole is bounded too: 40 polls of at most 35 s (the
+    // drain's own refusal arrives in the first seconds), so a slow
+    // runner costs the test at most a couple of minutes and a truly hung
+    // call still fails inside a minute.
+    let poll_started = std::time::Instant::now();
     let mut drained = false;
-    for _ in 0..100 {
-        let later = ci
-            .resolve_ref(ResolveRefRequest {
+    for _ in 0..40 {
+        let later = bound(
+            35,
+            "resolve_ref (the drain poll)",
+            ci.resolve_ref(ResolveRefRequest {
                 repo: REPO.into(),
                 name: "main".into(),
-            })
-            .await;
+            }),
+        )
+        .await;
         if later.is_err() {
             drained = true;
             break;
         }
+        assert!(
+            poll_started.elapsed() < std::time::Duration::from_secs(240),
+            "the drain never refused a call in 240 s (elapsed {:?}) - the #965 poll bound",
+            poll_started.elapsed()
+        );
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
     assert!(drained, "a server whose audit lost a line drains");
@@ -462,7 +638,7 @@ async fn concurrent_lands_ref_lines_tell_one_true_history() {
     use scion_proto::v1::LandRequest;
     use std::fmt::Write as _;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let store = store(dir.path());
     let audit_path = dir.path().join("audit.log");
     let audit = Audit::open(&audit_path).unwrap();
@@ -701,7 +877,7 @@ async fn wait_for_lines(path: &std::path::Path, n: usize) {
 async fn a_land_whose_call_is_cut_still_writes_its_result_and_ref_lines() {
     use scion_proto::v1::{CreateChangesetRequest, LandRequest, PutBlobRequest};
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let store = store(dir.path());
     let audit_path = dir.path().join("audit.log");
     let audit = Audit::open(&audit_path).unwrap();
@@ -861,7 +1037,7 @@ fn assert_cancelled_lines(store: &Backend, land_line: &serde_json::Value, root: 
 async fn a_call_without_a_request_id_gets_one_from_the_server() {
     use scion_proto::v1::PutBlobRequest;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let store = store(dir.path());
     let audit_path = dir.path().join("audit.log");
     let audit = Audit::open(&audit_path).unwrap();
@@ -964,7 +1140,7 @@ async fn a_land_cut_at_its_deadline_gets_exactly_one_answer() {
     use scion_proto::v1::LandRequest;
     use std::time::Duration;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let store = store(dir.path());
     let audit_path = dir.path().join("audit.log");
     let audit = Audit::open(&audit_path).unwrap();
@@ -1083,7 +1259,7 @@ async fn a_land_dropped_around_its_jobs_start_gets_one_answer() {
     use scion_proto::v1::LandRequest;
     use std::time::Duration;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let store = store(dir.path());
     let audit_path = dir.path().join("audit.log");
     let audit = Audit::open(&audit_path).unwrap();
@@ -1174,7 +1350,7 @@ async fn a_land_dropped_around_its_jobs_start_gets_one_answer() {
 async fn a_land_without_write_access_gets_one_failed_line() {
     use scion_proto::v1::LandRequest;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let store = store(dir.path());
     let audit_path = dir.path().join("audit.log");
     let audit = Audit::open(&audit_path).unwrap();
@@ -1226,7 +1402,7 @@ async fn a_land_without_write_access_gets_one_failed_line() {
 async fn a_land_with_a_bad_changeset_id_records_nothing() {
     use scion_proto::v1::LandRequest;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let store = store(dir.path());
     let audit_path = dir.path().join("audit.log");
     let audit = Audit::open(&audit_path).unwrap();
@@ -1246,10 +1422,44 @@ async fn a_land_with_a_bad_changeset_id_records_nothing() {
 
     // The refusal and its (absent) lines are both before the reply, but
     // the drop's cancelled line - if the code still wrote one - hands
-    // off to a blocking task. Give it a moment, then hold the file to
-    // its promise: nothing about this call is in it.
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // off to a blocking task, so no fixed wait bounds it. A later event
+    // that must land does the bounding: the audit's queue is FIFO, so
+    // once a line queued after the refusal is durable, no line the
+    // refusal owed can still be coming. A create_changeset's intent and
+    // its result are such lines; wait for the result, then hold the
+    // file to its promise: nothing about the refused call is in it.
+    {
+        use scion_proto::v1::CreateChangesetRequest;
+        use tokio_stream::once;
+        let root = store.resolve_ref(REPO, "main").unwrap();
+        let mut after = writer(&url, "t-after").await;
+        after
+            .put_blob(once(scion_proto::v1::PutBlobRequest {
+                repo: REPO.into(),
+                data: b"after\n".to_vec(),
+            }))
+            .await
+            .expect("the later upload lands");
+        let blob = store.blobs().put(b"after\n").unwrap();
+        let (bytes, _id) = changeset(vec![root], "docs/after", blob).encode_with_id();
+        after
+            .create_changeset(CreateChangesetRequest {
+                repo: REPO.into(),
+                changeset: bytes,
+            })
+            .await
+            .expect("the later write lands");
+    }
     let lines = read_lines(&audit_path);
+    // The later event's RESULT line is the durable end of the queue:
+    // once it is in the file, no line the refusal owed can follow it.
+    let answered = lines
+        .iter()
+        .any(|line| line["request_id"] == "t-after" && line["outcome"] != "intent");
+    assert!(
+        answered,
+        "the later event's result never landed: the quiesce proves nothing: {lines:?}"
+    );
     assert!(
         land_lines(&lines, "t-bad").is_empty(),
         "a refused land records nothing: {:?}",
@@ -1265,7 +1475,7 @@ async fn a_land_with_a_bad_changeset_id_records_nothing() {
 async fn a_land_whose_intent_fails_leaves_no_answer_line() {
     use scion_proto::v1::LandRequest;
 
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let store = store(dir.path());
     let audit_path = dir.path().join("audit.log");
     let audit = Audit::open(&audit_path).unwrap();

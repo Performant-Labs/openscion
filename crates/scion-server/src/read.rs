@@ -7,10 +7,12 @@
 #![allow(unreachable_pub)]
 use std::collections::{BTreeMap, BTreeSet, HashMap};
 use std::ops::Bound;
+use std::sync::OnceLock;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
-use scion_core::{
-    BlobId, Changeset, ChangesetId, Entry, FileState, PathElem, RepoPath, Tree, TreeId,
-};
+use scion_core::{BlobId, Changeset, ChangesetId, Entry, FileState, PathElem, RepoPath, TreeId};
 
 use crate::backend::Backend;
 use crate::deadline::Deadline;
@@ -18,7 +20,7 @@ use crate::derived;
 use crate::error::{Error, Result};
 use crate::graph;
 use crate::history::{self, PathHistory};
-use crate::meta::{Meta as _, MetaTx, RepoId};
+use crate::meta::{DERIVED_BATCH, Meta as _, MetaTx, RepoId};
 use crate::similar::{self, Budget, Chunks, MAX_PAIRS, Progress};
 use crate::tree;
 
@@ -113,36 +115,6 @@ pub fn file_blob_at(store: &Backend, root: TreeId, path: &RepoPath) -> Result<Bl
 ///
 /// [`Error::NotFound`] if nothing is at `path`. [`Error::InvalidArgument`] if
 /// `path` is a file.
-pub fn list_dir(
-    store: &Backend,
-    repo: &str,
-    cs: ChangesetId,
-    path: Option<&RepoPath>,
-    deadline: &Deadline,
-) -> Result<Tree> {
-    let root = root_tree(store, repo, cs, deadline)?;
-    list_dir_at(store, root, path)
-}
-
-/// The tree at `path` below the root tree `root`, which a partial reader's
-/// view may name instead of the changeset's real root.
-///
-/// # Errors
-///
-/// As [`list_dir`].
-pub fn list_dir_at(store: &Backend, root: TreeId, path: Option<&RepoPath>) -> Result<Tree> {
-    store.read(|c| {
-        let Some(path) = path else {
-            return c.get_tree(root);
-        };
-        match tree::lookup(c, root, path)? {
-            Some(Entry::Dir(id)) => c.get_tree(id),
-            Some(Entry::File(_)) => Err(Error::InvalidArgument(format!("{path:?} is a file"))),
-            None => Err(Error::NotFound(format!("path {path:?}"))),
-        }
-    })
-}
-
 /// Most entries that a `Log` reply holds. Each entry reads one changeset
 /// while the call holds one read connection.
 pub const MAX_SCAN: usize = 1000;
@@ -197,13 +169,17 @@ pub fn log(
 }
 
 /// Up to `limit` changesets, and at most [`MAX_SCAN`], walking first
-/// parents from `cs`, newest first. With a `path`, only the changesets that
-/// change it (`changes_path`), found in the path history of `cs`
-/// ([`history`]): each entry reads one changeset and at most one history
-/// node per part of the path, however many changesets lie between two
-/// entries. Such a page stops early, after its first entry, once it has read
-/// [`MAX_LOG_NODE_BYTES`] of nodes. If `cs` has no path history yet, this
-/// derives it first, in steps, until `deadline`.
+/// parents from `cs`, newest first. Without a `path`, the page is one
+/// statement: first parents and their bodies, `limit + 1` links deep, so
+/// a full page knows the link to walk on from. With a `path`, only the
+/// changesets that change it (`changes_path`), found in the path history
+/// of `cs` ([`history`]): the walk reads the chain's values in windows of
+/// [`DERIVED_BATCH`] links, one node per part of the path per link it
+/// visits, however many changesets lie between two entries, and the
+/// entries' bodies one statement per [`DERIVED_BATCH`]. Such a page stops
+/// early, after its first entry, once it has read [`MAX_LOG_NODE_BYTES`]
+/// of nodes. If `cs` has no path history yet, this derives it first, in
+/// steps, until `deadline`.
 ///
 /// # Errors
 ///
@@ -223,21 +199,56 @@ pub fn log_page(
     let Some(path) = path else {
         return store.read(|c| {
             let repo = c.repo_id(repo)?;
-            let mut entries = Vec::new();
-            let mut next = Some(cs);
-            let mut budget = limit;
-            // The deadline guards a read that has more to read: while the
-            // walk still holds a cursor. A page whose last entry ended the
-            // walk comes back whole, whatever the clock says.
-            while next.is_some() {
-                if entries.len() % DEADLINE_EVERY == 0 {
-                    deadline.check()?;
-                }
-                let Some(entry) = next_change(c, repo, &mut next, &mut budget)? else {
-                    break;
-                };
-                entries.push(entry);
+            // One statement for the page: first parents and their bodies
+            // ride one round trip, `limit + 1` links deep, so a full page
+            // still knows the link to walk on from. The deadline refuses
+            // a page whose time is up before its one read; a page that
+            // comes back whole is whole, whatever the clock says after.
+            deadline.check()?;
+            // `limit` is at most MAX_SCAN, far from any wrap.
+            #[allow(
+                clippy::cast_possible_wrap,
+                clippy::cast_sign_loss,
+                clippy::cast_possible_truncation
+            )]
+            let hops = usize::try_from(limit as i64 + 1).unwrap_or(limit + 1);
+            #[allow(clippy::cast_possible_wrap)]
+            let rows = c.first_parent_page(repo, cs, hops as i64)?;
+            // The page statement returns at most `hops + 1` rows: a full
+            // page is one with more rows than the page's `limit`, and a
+            // short one ended the walk - at a root, or refused as the
+            // corruption a tampered link is, by the statement itself.
+            let more = rows.len() > hops;
+            let keep = rows.len().min(limit);
+            // The statement returns one row past a full page, and a history
+            // of k*limit + 1 ends on that very row: its last page comes
+            // back with `limit + 1` rows, the page's own `limit` and the
+            // root as the row it looked ahead to. The root is a real
+            // entry; the page stops short of it because the page is full,
+            // not because the walk is over. The statement's own probe has
+            // proved the row ends the walk, or refused it as corruption.
+            let tail = if !more && rows.len() > keep {
+                Some(rows[keep].0)
+            } else {
+                None
+            };
+            let mut entries = Vec::with_capacity(keep);
+            for (id, _, body) in rows.into_iter().take(keep) {
+                entries.push((id, decode_entry(id, &body)?));
             }
+            // A page short of its `limit + 1` links ended the walk: the
+            // last entry has no parent. A full one has more to read, and
+            // the cursor rides the last entry's own first parent. A full
+            // page whose lookahead row ends the history continues on that
+            // row, and the next page serves it and ends.
+            let next = if more {
+                entries
+                    .last()
+                    .and_then(|(_, cs)| cs.parents().first().copied())
+                    .or(Some(cs))
+            } else {
+                tail
+            };
             Ok(LogPage { entries, next })
         });
     };
@@ -247,47 +258,143 @@ pub fn log_page(
     // changeset, a node and a value of this version never change and are
     // never removed, and a node is stored in the transaction of the value
     // that names it.
-    store.read(|c| {
+    store.read(|c| path_page(c, repo, cs, path, limit, deadline))
+}
+
+/// The walk of a path log page, on one read connection: the chain of path
+/// histories in windows of [`DERIVED_BATCH`] links, one statement per
+/// window; every link, also where no value is stored, so a missing value
+/// is the corruption it is, not a gap to skip. It visits only the links
+/// whose lookup it needs, and reads a node per part of the path per link
+/// it visits, however many changesets lie between two entries; only the
+/// values and the entries' bodies ride in batches. An entry deeper than
+/// the window holds costs its body at once, to walk on from its parent.
+///
+/// # Errors
+///
+/// [`Error::Corrupt`] if a link has no value or a body does not decode,
+/// [`Error::NotFound`] if an entry's changeset is not the repo's,
+/// [`Error::DeadlineExceeded`] once `deadline` has passed, or
+/// [`Error::Cancelled`] once the call has gone.
+fn path_page(
+    c: &mut dyn MetaTx,
+    repo: RepoId,
+    cs: ChangesetId,
+    path: &RepoPath,
+    limit: usize,
+    deadline: &Deadline,
+) -> Result<LogPage> {
+    {
         let mut nodes = history::Nodes::default();
-        let mut entries = Vec::new();
-        let mut next = Some(cs);
-        while let Some(from) = next.filter(|_| entries.len() < limit) {
-            if entries.len() % DEADLINE_EVERY == 0 {
-                deadline.check()?;
-            }
-            if !entries.is_empty() && nodes.bytes() >= MAX_LOG_NODE_BYTES {
+        // The walk follows the first-parent chain of path histories in
+        // windows of [`DERIVED_BATCH`] links, one statement per window:
+        // every link, also where no value is stored, so a missing value
+        // is the corruption it is, not a gap to skip. It visits only the
+        // links whose lookup it needs, and reads a node per part of the
+        // path, as before; only the values and the entries' bodies ride
+        // in batches. An entry deeper than the window holds costs its
+        // body at once, to walk on from its parent.
+        let mut chain = history::chain_values(c, cs, DERIVED_BATCH + 1)?;
+        let mut pos = 0usize;
+        let mut found: Vec<ChangesetId> = Vec::new();
+        let mut jumped: HashMap<ChangesetId, Changeset> = HashMap::new();
+        let next;
+        loop {
+            if found.len() >= limit {
+                // The page is full: the cursor rides the next link, as
+                // the parent of the last entry.
+                next = chain.get(pos).map(|(id, _)| *id).or(Some(cs));
                 break;
             }
-            // Each changeset on the first-parent history of `cs` has a path
-            // history, so `from` has one.
-            let Some(id) = history::newest_change(c, &mut nodes, from, path)? else {
+            if found.len().is_multiple_of(DEADLINE_EVERY) {
+                deadline.check()?;
+            }
+            if !found.is_empty() && nodes.bytes() >= MAX_LOG_NODE_BYTES {
+                next = chain.get(pos).map(|(id, _)| *id).or(Some(cs));
+                break;
+            }
+            let Some((at, value)) = chain.get(pos) else {
                 next = None;
                 break;
             };
-            let changeset = c.get_changeset(repo, id)?;
-            next = changeset.parents().first().copied();
-            entries.push((id, changeset));
+            let Some(root) = value else {
+                return Err(Error::Corrupt(format!("path history: no value for {at}")));
+            };
+            // Each changeset on the first-parent history of `cs` has a
+            // path history, so `at` has one.
+            let Some(id) = history::newest_change_at(c, &mut nodes, *root, path)? else {
+                next = None;
+                break;
+            };
+            found.push(id);
+            // The walk goes on at the parent of the entry it found. In
+            // the window, that is the link at its side. Past the window,
+            // a fresh window starts where the walk goes on: at the entry's
+            // own parent, which costs the entry's body at once.
+            let hit = chain[pos..].iter().position(|(seen, _)| *seen == id);
+            let (from, resume) = if let Some(off) = hit {
+                pos += off + 1;
+                if pos < chain.len() {
+                    continue;
+                }
+                if chain.len() < DERIVED_BATCH + 1 {
+                    // The chain ended: the entry is the root.
+                    next = None;
+                    break;
+                }
+                (chain.last().map_or(cs, |(id, _)| *id), 1)
+            } else {
+                let cs = c.get_changeset(repo, id)?;
+                let parent = cs.parents().first().copied();
+                jumped.insert(id, cs);
+                if let Some(parent) = parent {
+                    (parent, 0)
+                } else {
+                    next = None;
+                    break;
+                }
+            };
+            chain = history::chain_values(c, from, DERIVED_BATCH + 1)?;
+            pos = resume;
         }
+        // The bodies of the entries, in the order the walk found them.
+        let mut bodies: HashMap<ChangesetId, Changeset> = HashMap::with_capacity(found.len());
+        let mut page: Vec<ChangesetId> = Vec::with_capacity(found.len());
+        for id in &found {
+            match jumped.remove(id) {
+                Some(cs) => {
+                    bodies.insert(*id, cs);
+                }
+                None => page.push(*id),
+            }
+        }
+        for chunk in page.chunks(DERIVED_BATCH) {
+            for (id, cs) in chunk.iter().zip(c.get_changeset_many(repo, chunk)?) {
+                bodies.insert(*id, cs);
+            }
+        }
+        let entries = found
+            .iter()
+            .map(|id| {
+                let cs = bodies.remove(id).expect("the batch answered every id");
+                (*id, cs)
+            })
+            .collect();
         Ok(LogPage { entries, next })
-    })
+    }
 }
 
-/// Walks first parents from `next`, newest first: the entries of a `Log`
-/// reply without a path. Checks at most `budget` changesets, and leaves
-/// `next` at the first one it did not check.
-pub(crate) fn next_change(
-    c: &mut dyn MetaTx,
-    repo: RepoId,
-    next: &mut Option<ChangesetId>,
-    budget: &mut usize,
-) -> Result<Option<(ChangesetId, Changeset)>> {
-    let Some(id) = next.filter(|_| *budget > 0) else {
-        return Ok(None);
-    };
-    *budget -= 1;
-    let changeset = c.get_changeset(repo, id)?;
-    *next = changeset.parents().first().copied();
-    Ok(Some((id, changeset)))
+/// Decodes a changeset body from a page row, and checks it against the id
+/// the row names, as [`crate::meta::MetaTx::get_changeset`] checks one.
+fn decode_entry(id: ChangesetId, body: &[u8]) -> Result<Changeset> {
+    let (cs, actual) = Changeset::decode_with_id(body)
+        .map_err(|e| Error::Corrupt(format!("changeset {id}: {e}")))?;
+    if actual != id {
+        return Err(Error::Corrupt(format!(
+            "changeset {id} does not match its ID"
+        )));
+    }
+    Ok(cs)
 }
 
 /// Whether a changeset changes `path`: the file itself, or anything below it
@@ -363,17 +470,45 @@ pub const MAX_DIFF_ENTRIES: usize = 1000;
 /// is the same on every call, so every call finds the same renames. Past
 /// it, the search reads no more files, and the reply says so
 /// ([`DiffPage::renames_incomplete`]). Exact renames (step 1) cost no file
-/// reads, so they run for any diff of up to [`MAX_RENAME_ENTRIES`] entries.
+/// reads, so they run for any diff of up to the rename entry bound.
 pub const MAX_RENAME_CHUNKS: usize = 4 << 20;
 
-/// Most entries the rename pass of one `Diff` call walks below its path.
-/// It holds them in memory, at about 150 bytes each (`DiffEntry` is 128 on
-/// the stack, plus the bytes of the path), so a diff of
-/// [`MAX_RENAME_ENTRIES`] entries costs the call about 150 MB. Past it, the
-/// call finds no renames and the reply says so
+/// Most RAM the rename pass of one `Diff` call holds for the entries it
+/// walks below its path. An entry costs about 160 bytes (`DiffEntry` is
+/// 128 on the stack, plus the bytes of the path), so the bound walks about
+/// 400,000 entries - still far past git's default rename limit. Past it,
+/// the call finds no renames and the reply says so
 /// ([`DiffPage::renames_incomplete`]), as git warns when it skips inexact
-/// rename detection.
-pub const MAX_RENAME_ENTRIES: usize = 1_000_000;
+/// rename detection. The floor counts the share for the diffs that run at
+/// once (`service::MAX_DIFFS`).
+pub const MAX_RENAME_BYTES: usize = 64 << 20;
+
+/// The entry cost the byte bound is spelled in, and the count limit it
+/// gives the walk: an a-priori bound that keeps the walk's hold under the
+/// bytes.
+const BYTES_PER_RENAME_ENTRY: usize = 160;
+
+#[cfg(any(test, feature = "test-hooks"))]
+static MAX_RENAME_BYTES_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The byte bound this run enforces: the test's small bound, or the
+/// server's.
+fn max_rename_bytes() -> usize {
+    #[cfg(any(test, feature = "test-hooks"))]
+    {
+        let small = MAX_RENAME_BYTES_OVERRIDE.load(std::sync::atomic::Ordering::Relaxed);
+        if small > 0 {
+            return small;
+        }
+    }
+    MAX_RENAME_BYTES
+}
+
+/// Most entries the rename pass walks: the byte bound in entries.
+fn max_rename_entries() -> usize {
+    max_rename_bytes() / BYTES_PER_RENAME_ENTRY
+}
 
 /// A path whose file differs between two snapshots.
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -434,7 +569,7 @@ pub struct DiffPage {
 /// delete and an add. If the page has an added or deleted file, the call
 /// walks the whole diff below `path`, unless the page is all of it. Exact
 /// renames (same content, by blob ID) cost no file reads, so a diff of up
-/// to [`MAX_RENAME_ENTRIES`] entries gets them, whatever its size. The
+/// to the rename entry bound gets them, whatever its size. The
 /// inexact search runs only under git's pair limit ([`similar::MAX_PAIRS`])
 /// and stops at [`MAX_RENAME_CHUNKS`]. When the walk was past its entry
 /// bound, or the inexact search did not run or did not end, the page says
@@ -459,9 +594,356 @@ pub fn diff(
         new,
         path,
         after,
-        MAX_RENAME_ENTRIES,
+        max_rename_entries(),
         deadline,
     )
+}
+
+/// The rename maps of the paged diffs: one entry per diff its pages
+/// share. The first page that can hold renames runs the one bounded
+/// search and stores the map here; the pages after it answer from the
+/// entry, so a paged diff costs one search, whatever its page count,
+/// and every page gives an entry the same rename.
+///
+/// The key carries the roots the walk actually used, the path scope,
+/// and the rename-entry bound. A caller whose view roots the walk (a
+/// partial reader, if a diff ever serves one) walks different trees
+/// from a whole reader, so its key differs and it never answers from a
+/// map a whole reader filled: a map holds only the paths its own walk
+/// saw. The bound rides the key because it alone changes what the
+/// search finds.
+///
+/// The cache is bounded by bytes, not by diffs: one map costs at most
+/// its walk's bounded entry list (a map's renames pair into the same
+/// paths the walk held, at a smaller per-entry cost), so the cap holds
+/// the maps of many diffs, and an entry that no page has
+/// asked for within a call deadline's length (`RENAME_CACHE_TTL`:
+/// a client that stops at page 3 never comes back) ages out. Past the
+/// cap the oldest entries go first. A miss is always correct: the
+/// search is deterministic, so an evicted entry only costs the next
+/// page its own search, and it answers the same renames.
+///
+/// The map's size is the `scion_diff_rename_cache_bytes` gauge.
+#[derive(Clone, PartialEq, Eq, Hash)]
+struct RenameKey {
+    /// The old side's root tree, as the walk used it: a view's derived
+    /// root for a caller with a filtered view, the real root otherwise.
+    old: TreeId,
+    new: TreeId,
+    /// The diff's path scope.
+    path: Option<RepoPath>,
+    /// The entries the rename search may walk: it alone changes what
+    /// the search finds.
+    rename_entries: usize,
+}
+
+/// A stored rename map: the map shared with its readers, whether
+/// renames may be missing, its cost in bytes against the cap, and its
+/// place in the age order. The map is shared, so a page answers from
+/// the entry without a copy, whatever its size.
+struct CachedRenames {
+    map: std::sync::Arc<HashMap<RepoPath, Rename>>,
+    incomplete: bool,
+    /// The entry's whole cost against the cap: the map's bytes plus the
+    /// entry's own overhead (`entry_bytes`).
+    bytes: usize,
+    /// The entry's stamp: the last time a page asked for it, and the
+    /// sequence number that breaks ties between stamps of the same
+    /// instant. The age order is keyed by it.
+    stamp: (Instant, u64),
+}
+
+/// How long a stored map serves pages: one call deadline's length. A
+/// paged read's pages all land inside one call's deadline; a map that
+/// no page has asked for in that long is a paged read that stopped.
+const RENAME_CACHE_TTL: Duration = Duration::from_secs(600);
+
+/// The bytes the stored maps may hold. A map holds one rename per
+/// paired add and delete of its walk's bounded entry list, and each
+/// stored rename's two paths cost less than the walk's cost for those
+/// two entries (`map_bytes` against the walk's per-entry
+/// `2 * path + 160`), so one map never exceeds the walk's own byte
+/// bound (`MAX_RENAME_BYTES`); this cap bounds their sum over the
+/// diffs the process cached.
+fn rename_cache_max_bytes() -> usize {
+    #[cfg(any(test, feature = "test-hooks"))]
+    {
+        let small = RENAME_CACHE_MAX_BYTES_OVERRIDE.load(Ordering::Relaxed);
+        if small != 0 {
+            return small;
+        }
+    }
+    RENAME_CACHE_MAX_BYTES
+}
+
+pub(crate) const RENAME_CACHE_MAX_BYTES: usize = 512 << 20;
+
+#[cfg(any(test, feature = "test-hooks"))]
+static RENAME_CACHE_MAX_BYTES_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The cache: the entries, the age order that walks them old end
+/// first, and the bytes they all cost. One mutex guards the three, so
+/// a page's cache work never scales with the number of entries: every
+/// path is a hash hit plus one order step.
+struct RenameCache {
+    entries: HashMap<RenameKey, CachedRenames>,
+    /// The entries keyed by their stamps, oldest first. The expiry and
+    /// the trim pop from the front; a refresh removes the old stamp and
+    /// inserts the new one.
+    order: std::collections::BTreeMap<(Instant, u64), RenameKey>,
+    /// The bytes every entry costs, overhead included: the trim's
+    /// number, and the gauge's.
+    total: usize,
+}
+
+static RENAME_CACHE: std::sync::LazyLock<Mutex<RenameCache>> = std::sync::LazyLock::new(|| {
+    Mutex::new(RenameCache {
+        entries: HashMap::new(),
+        order: std::collections::BTreeMap::new(),
+        total: 0,
+    })
+});
+
+static RENAME_CACHE_BYTES: AtomicU64 = AtomicU64::new(0);
+
+/// The fixed part of one entry's cost against the cap: the key twice
+/// (the map holds one, the age order the other), the entry struct, the
+/// shared map's Arc block (strong and weak counts) and table handle,
+/// and the hash table's per-entry control share. The key's and the
+/// paths' heap bytes ride on top, per entry at insert (`entry_bytes`).
+const RENAME_CACHE_ENTRY_OVERHEAD: usize = 2 * size_of::<RenameKey>()
+    + size_of::<CachedRenames>()
+    + 2 * size_of::<usize>()
+    + size_of::<HashMap<RepoPath, Rename>>()
+    + 8;
+
+static RENAME_CACHE_METRICS: OnceLock<std::sync::Arc<crate::metrics::Metrics>> = OnceLock::new();
+
+/// Gives the cache the server's metrics registry, once, before the
+/// server serves: the gauge of the bytes the stored maps hold.
+pub(crate) fn set_rename_cache_metrics(metrics: std::sync::Arc<crate::metrics::Metrics>) {
+    let _ = RENAME_CACHE_METRICS.set(metrics);
+}
+
+fn rename_cache_lock() -> MutexGuard<'static, RenameCache> {
+    RENAME_CACHE
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
+/// One entry's whole cost against the cap: the map's bytes plus the
+/// entry's own overhead. The paths' heap bytes are the part
+/// `size_of` cannot see; they count twice, once per key the cache
+/// holds.
+fn entry_bytes(key: &RenameKey, map_bytes: usize) -> usize {
+    let path_heap = key
+        .path
+        .as_ref()
+        .map_or(0, |path| path.as_bytes().len() + size_of::<Vec<u8>>());
+    RENAME_CACHE_ENTRY_OVERHEAD + 2 * path_heap + map_bytes
+}
+
+/// A map's bytes: its paths twice (the entry's path and the other
+/// half's), the similarity, and the table's share.
+fn map_bytes(map: &HashMap<RepoPath, Rename>) -> usize {
+    map.iter()
+        .map(|(path, rename)| 2 * (path.as_bytes().len() + rename.path.as_bytes().len()) + 8 + 48)
+        .sum()
+}
+
+/// Tells the gauge the bytes the cache costs, when the registry is
+/// set. The total is kept, not summed: no path walks the entries.
+fn publish_cache_bytes(cache: &RenameCache) {
+    let bytes = cache.total as u64;
+    RENAME_CACHE_BYTES.store(bytes, Ordering::Relaxed);
+    if let Some(metrics) = RENAME_CACHE_METRICS.get() {
+        metrics.set_diff_rename_cache_bytes(bytes);
+    }
+}
+
+/// Drops the entries that no page asked for within the TTL, unless
+/// `all`, which drops everything (the tests' reset). The sweep runs
+/// when the cache is called - a server whose diffs all ended holds its
+/// last maps until the next diff or the cap's trim (SHORTCUT: no
+/// timer, so an idle server may hold up to `RENAME_CACHE_MAX_BYTES` of
+/// ended diffs' maps for their TTL's length; the upgrade is a sweep on
+/// the runtime's own interval).
+fn evict_expired(cache: &mut RenameCache, all: bool) {
+    if all {
+        cache.entries.clear();
+        cache.order.clear();
+        cache.total = 0;
+        return;
+    }
+    let now = Instant::now();
+    // The order's front is the oldest stamp: one pop per expired entry,
+    // no pass over the entries that stay.
+    while let Some((stamp, key)) = cache.order.pop_first() {
+        if now.duration_since(stamp.0) < RENAME_CACHE_TTL {
+            cache.order.insert(stamp, key);
+            break;
+        }
+        if let Some(cached) = cache.entries.remove(&key) {
+            cache.total = cache.total.saturating_sub(cached.bytes);
+        }
+    }
+}
+
+/// Drops the oldest entries until the cache fits the cap. The order's
+/// front is the oldest: one pop per dropped entry, no scan, no sum.
+fn trim_to_cap(cache: &mut RenameCache) {
+    while cache.total > rename_cache_max_bytes() {
+        let Some((_, key)) = cache.order.pop_first() else {
+            break;
+        };
+        if let Some(cached) = cache.entries.remove(&key) {
+            cache.total = cache.total.saturating_sub(cached.bytes);
+        }
+    }
+}
+
+/// The map for `key`, refreshing its stamp, or `None` when the cache
+/// holds none: the page then runs its own search. The map hands out
+/// shared, so a page never copies one under the lock.
+fn cached_renames(key: &RenameKey) -> Option<(std::sync::Arc<HashMap<RepoPath, Rename>>, bool)> {
+    let mut cache = rename_cache_lock();
+    evict_expired(&mut cache, false);
+    // The entry moves to the young end: the order forgets the old
+    // stamp and takes the new one, so a trim drops another entry
+    // first. The stamp is read out first, so the map borrow ends
+    // before the order moves.
+    let moved = cache.entries.get_mut(key).map(|cached| {
+        let old_stamp = cached.stamp;
+        let stamp = (Instant::now(), next_cache_seq());
+        cached.stamp = stamp;
+        (old_stamp, stamp)
+    });
+    let answer = match moved {
+        Some((old_stamp, stamp)) => {
+            cache.order.remove(&old_stamp);
+            cache.order.insert(stamp, key.clone());
+            let cached = &cache.entries[key];
+            Some((std::sync::Arc::clone(&cached.map), cached.incomplete))
+        }
+        None => None,
+    };
+    // The gauge follows every path: a miss that evicted nothing still
+    // says what the cache holds now.
+    publish_cache_bytes(&cache);
+    answer
+}
+
+/// The sequence number that breaks ties between stamps of the same
+/// instant.
+fn next_cache_seq() -> u64 {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    SEQ.fetch_add(1, Ordering::Relaxed)
+}
+
+/// Stores a whole diff's map, keeping the cache under its cap.
+fn store_renames(key: RenameKey, map: HashMap<RepoPath, Rename>, incomplete: bool) {
+    let mut cache = rename_cache_lock();
+    evict_expired(&mut cache, false);
+    // The entry costs its map and itself: an empty map holds its place
+    // against the cap, so a caller that opens many paged diffs and
+    // stops at the first page cannot hold entries past the cap's bound.
+    let bytes = entry_bytes(&key, map_bytes(&map));
+    let stamp = (Instant::now(), next_cache_seq());
+    let dropped = cache.entries.insert(
+        key.clone(),
+        CachedRenames {
+            bytes,
+            map: std::sync::Arc::new(map),
+            incomplete,
+            stamp,
+        },
+    );
+    if let Some(old) = dropped {
+        cache.order.remove(&old.stamp);
+        cache.total = cache.total.saturating_sub(old.bytes);
+    }
+    cache.total += bytes;
+    cache.order.insert(stamp, key);
+    trim_to_cap(&mut cache);
+    publish_cache_bytes(&cache);
+}
+
+/// Forgets one diff's map: the diff ended within the page that asks,
+/// so no page will ask for its map again.
+fn forget_renames(key: &RenameKey) {
+    let mut cache = rename_cache_lock();
+    if let Some(cached) = cache.entries.remove(key) {
+        cache.order.remove(&cached.stamp);
+        cache.total = cache.total.saturating_sub(cached.bytes);
+        publish_cache_bytes(&cache);
+    }
+}
+
+/// Holds a small rename byte bound for the tests that pin it: a diff
+/// whose rename vector passes it says renames may be missing, and the
+/// bound returns when the guard drops.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn test_set_rename_byte_bound(bytes: usize) -> impl Drop {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            MAX_RENAME_BYTES_OVERRIDE.store(0, std::sync::atomic::Ordering::Relaxed);
+        }
+    }
+    MAX_RENAME_BYTES_OVERRIDE.store(bytes, std::sync::atomic::Ordering::Relaxed);
+    Reset
+}
+
+/// The tests' reset of the cache: every map goes and the cap returns
+/// to the server's, so a page after it runs its own search and no
+/// test's small cap reaches another test's maps.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn test_clear_rename_cache() {
+    let mut maps = rename_cache_lock();
+    evict_expired(&mut maps, true);
+    RENAME_CACHE_MAX_BYTES_OVERRIDE.store(0, Ordering::Relaxed);
+    publish_cache_bytes(&maps);
+}
+
+/// Holds a small byte cap for the tests that pin the trim: the next
+/// stored map past it evicts the oldest. The guard puts the server's
+/// cap back.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn test_set_rename_cache_cap_for_tests(bytes: usize) -> impl Drop {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            RENAME_CACHE_MAX_BYTES_OVERRIDE.store(0, Ordering::Relaxed);
+        }
+    }
+    RENAME_CACHE_MAX_BYTES_OVERRIDE.store(bytes, Ordering::Relaxed);
+    Reset
+}
+
+/// The tests read the cache's size: the entries and the bytes, as the
+/// gauge would print them.
+#[cfg(any(test, feature = "test-hooks"))]
+#[must_use]
+pub fn test_rename_cache_size() -> (usize, u64) {
+    let cache = rename_cache_lock();
+    (cache.entries.len(), cache.total as u64)
+}
+
+/// The gauge, as a reader outside the mutex sees it: the kept total
+/// must equal it after every path.
+#[cfg(any(test, feature = "test-hooks"))]
+#[must_use]
+pub fn test_rename_cache_gauge() -> u64 {
+    RENAME_CACHE_BYTES.load(Ordering::Relaxed)
+}
+
+/// The fixed part of one entry's cost against the cap, for the test
+/// that pins the formula to the types.
+#[cfg(any(test, feature = "test-hooks"))]
+#[must_use]
+pub fn test_rename_cache_entry_overhead() -> usize {
+    RENAME_CACHE_ENTRY_OVERHEAD
 }
 
 /// [`diff`], with the entries that the rename pass may walk bounded by
@@ -485,6 +967,12 @@ pub fn diff_with(
         root_tree(store, repo, old, deadline)?,
         root_tree(store, repo, new, deadline)?,
     );
+    let key = RenameKey {
+        old: roots.0,
+        new: roots.1,
+        path: path.cloned(),
+        rename_entries,
+    };
     let mut entries = diff_walk(store, roots, path, after, MAX_DIFF_ENTRIES)?;
     // The walk finds one entry more than a page, to know whether more follow.
     let next_after = if entries.len() > MAX_DIFF_ENTRIES {
@@ -496,27 +984,61 @@ pub fn diff_with(
     let mut renames_incomplete = false;
     if entries.iter().any(|e| e.old.is_none() || e.new.is_none()) {
         // The renames are among the adds and deletes of the whole diff, not
-        // of one page, so a page gives each entry the same rename. Exact
-        // renames cost no file reads, so the walk has no bound but the
-        // memory of holding the entries: up to [`MAX_RENAME_ENTRIES`] of
-        // them, the bound of one call.
-        let all = if after.is_none() && next_after.is_none() {
-            entries.clone()
-        } else {
-            diff_walk(store, roots, path, None, rename_entries)?
-        };
-        if all.len() > rename_entries {
-            tracing::debug!(
-                entries = all.len(),
-                "a diff with too many entries to find renames"
-            );
-            renames_incomplete = true;
-        } else {
-            let (renames, incomplete) = renames(store, &all)?;
+        // of one page, so a page gives each entry the same rename. The
+        // paged diffs share one search through the rename cache, so a
+        // diff costs one search, whatever its page count.
+        //
+        // A diff that ends in this page (no `after`, no page after) is
+        // one call: its search serves it alone, and the cache holds
+        // nothing for it - nor the stale map of a paged read that ended
+        // before it, which this page forgets.
+        if let Some((renames, incomplete)) = cached_renames(&key) {
             renames_incomplete = incomplete;
             for entry in &mut entries {
                 entry.rename = renames.get(&entry.path).cloned();
             }
+        } else {
+            // The renames are among the adds and deletes of the whole
+            // diff, not of one page. Exact renames cost no file reads,
+            // so the walk has no bound but the memory of holding the
+            // entries: up to the rename entry bound, the bound of one
+            // call.
+            let all = if after.is_none() && next_after.is_none() {
+                entries.clone()
+            } else {
+                diff_walk(store, roots, path, None, rename_entries)?
+            };
+            let all_bytes = all
+                .iter()
+                .map(|entry| 2 * entry.path.as_bytes().len() + BYTES_PER_RENAME_ENTRY)
+                .sum::<usize>();
+            if all.len() > rename_entries || all_bytes > max_rename_bytes() {
+                tracing::debug!(
+                    entries = all.len(),
+                    bytes = all_bytes,
+                    "a diff with too many entries to find renames"
+                );
+                renames_incomplete = true;
+            } else {
+                let (renames, incomplete) = renames(store, &all)?;
+                renames_incomplete = incomplete;
+                for entry in &mut entries {
+                    entry.rename = renames.get(&entry.path).cloned();
+                }
+                // A diff whose pages go on stores its map for the pages
+                // after this one, its incompleteness with it: the
+                // search is deterministic, so a page that answers from
+                // a stored incomplete map says the same
+                // renames_incomplete the searching page did, and the
+                // heaviest diffs (the ones past the search's budget)
+                // still cost one search, not one a page.
+                if next_after.is_some() {
+                    store_renames(key.clone(), renames, incomplete);
+                }
+            }
+        }
+        if next_after.is_none() {
+            forget_renames(&key);
         }
     }
     Ok(DiffPage {

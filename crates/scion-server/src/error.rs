@@ -51,6 +51,12 @@ pub enum Error {
     /// Stored data does not match its ID or format.
     #[error("corrupt data: {0}")]
     Corrupt(String),
+    /// A server-side state that is not the caller's data and not a
+    /// recoverable wait: a worker thread that died, an internal guard
+    /// that could not hold. The message goes to the log; the reply is
+    /// fixed.
+    #[error("internal error: {0}")]
+    Internal(String),
     /// A storage engine failed. The class says how the caller may go on;
     /// the engine's own error is the source, for the log. Which engine the
     /// server embeds, and its error's own type, are not part of the API: a
@@ -97,9 +103,9 @@ pub enum Error {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum StorageClass {
-    /// The engine's write lock stayed busy past `busy_timeout`, or the
-    /// connection to it was cut: the transaction rolled back and wrote
-    /// nothing, so the same work may run again.
+    /// The engine's write lock stayed busy past the writers' lock clock,
+    /// or the connection to it was cut: the transaction rolled back and
+    /// wrote nothing, so the same work may run again.
     Busy,
     /// The engine is out of space.
     DiskFull,
@@ -214,6 +220,27 @@ impl std::fmt::Display for Storage {
     }
 }
 
+/// The classified storage errors the binary's tests build to pin the
+/// audit line's class labels. Production compiles no constructor: the
+/// only Storage values a release build sees come from the engine.
+#[cfg(any(test, feature = "test-hooks"))]
+impl Storage {
+    /// A busy-class storage error.
+    pub fn busy_for_test(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::busy(source)
+    }
+
+    /// A disk-full-class storage error.
+    pub fn disk_full_for_test(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::disk_full(source)
+    }
+
+    /// An internal-class storage error.
+    pub fn internal_for_test(source: impl std::error::Error + Send + Sync + 'static) -> Self {
+        Self::internal(source)
+    }
+}
+
 impl std::error::Error for Storage {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         Some(self.source.as_ref())
@@ -232,25 +259,6 @@ impl Error {
             self,
             Error::Storage(storage) if storage.class() == StorageClass::Busy
         )
-    }
-}
-
-/// Classifies a SQLite engine error, once, where it is built: a busy
-/// database is not a database failure (the transaction rolled back and
-/// wrote nothing), a full one is the server's own shortage, and the rest
-/// keep the engine's error as the source. The test seams export it, so
-/// the integration tests convert the way the crate does.
-// The test seam re-exports this (test_support.error), and
-// unreachable_pub does not see through a re-export.
-#[allow(unreachable_pub)]
-#[must_use]
-pub fn from_sqlite(e: rusqlite::Error) -> Error {
-    if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DatabaseBusy) {
-        Error::Storage(Storage::busy(e))
-    } else if e.sqlite_error_code() == Some(rusqlite::ErrorCode::DiskFull) {
-        Error::Storage(Storage::disk_full(e))
-    } else {
-        Error::Storage(Storage::internal(e))
     }
 }
 
@@ -291,8 +299,7 @@ impl Error {
             // The pool of read connections is drained: a retry after it
             // refills may succeed.
             Error::Unavailable(_) => Status::unavailable(self.to_string()),
-            // The engine's class decides, wherever the metadata lives:
-            // on SQLite or on Postgres, the caller reads the same code
+            // The engine's class decides: the caller reads the same code
             // for the same shortage.
             Error::Storage(storage) => match storage.class() {
                 // The engine's write lock stayed busy, or the connection
@@ -342,10 +349,22 @@ impl Error {
                 tracing::error!(error = %e, "the disk is read-only");
                 Status::unavailable("the disk is read-only; retry later")
             }
-            Error::Corrupt(_) | Error::Git(_) | Error::Io(_) => {
-                // Details stay in the server log, not in the reply. The
-                // log line carries the whole source chain, so a wrapped
-                // cause reaches the log even though the reply does not.
+            // Damaged stored data is data loss, not a server bug: the
+            // caller reads a code that names the class. A Git error and
+            // any other I/O error stay internal - a failing device or a
+            // tool failure is the server's own state, not the stored
+            // bytes. Details stay in the server log, not in the reply. The
+            // log line carries the whole source chain, so a wrapped
+            // cause reaches the log even though the reply does not.
+            Error::Corrupt(_) => {
+                tracing::error!(error = %causes(self), "damaged stored data");
+                Status::data_loss("damaged data")
+            }
+            Error::Git(_) | Error::Io(_) => {
+                tracing::error!(error = %causes(self), "internal error");
+                Status::internal("internal error")
+            }
+            Error::Internal(_) => {
                 tracing::error!(error = %causes(self), "internal error");
                 Status::internal("internal error")
             }
@@ -361,75 +380,36 @@ impl From<Error> for Status {
 
 #[cfg(test)]
 mod tests {
-    use rusqlite::ffi;
     use tonic::Code;
 
     use super::*;
 
-    /// A SQLite error of a chosen engine code.
-    fn db(code: std::ffi::c_int) -> Error {
-        from_sqlite(rusqlite::Error::SqliteFailure(ffi::Error::new(code), None))
-    }
-
-    /// A busy store answers `unavailable`, so the client retries: the
-    /// transaction rolled back and wrote nothing.
-    #[test]
-    fn a_busy_store_is_unavailable_with_the_fixed_reply() {
-        let status = Status::from(db(ffi::SQLITE_BUSY));
-        assert_eq!(status.code(), Code::Unavailable);
-        assert_eq!(status.message(), "the database is busy; retry");
-        assert!(db(ffi::SQLITE_BUSY).is_busy());
-    }
-
-    /// An out-of-space store answers `resource_exhausted` with the fixed
-    /// reply, the same shortage as the file path's.
-    #[test]
-    fn an_out_of_space_store_is_resource_exhausted_with_the_fixed_reply() {
-        let status = Status::from(db(ffi::SQLITE_FULL));
-        assert_eq!(status.code(), Code::ResourceExhausted);
-        assert_eq!(
-            status.message(),
-            "the server is out of disk space; retry later"
-        );
-        assert!(!db(ffi::SQLITE_FULL).is_busy());
-    }
-
-    /// The engine refusing the work for its own reasons stays internal,
-    /// and its detail stays in the server log, not in the reply.
-    #[test]
-    fn a_store_failure_is_internal_with_the_fixed_reply() {
-        let status = Status::from(db(ffi::SQLITE_CORRUPT));
-        assert_eq!(status.code(), Code::Internal);
-        assert_eq!(status.message(), "internal error");
-    }
-
-    /// The engine's own error stays reachable through `source()`, for the
-    /// log and for the tests that name the cause: the error's source is
-    /// the [`Storage`], and the storage's source is the engine's error.
-    #[test]
-    fn the_engine_error_stays_reachable_through_source() {
-        let e = db(ffi::SQLITE_CORRUPT);
-        let Error::Storage(storage) = &e else {
-            panic!("{e:?}")
-        };
-        assert_eq!(storage.class(), StorageClass::Internal);
-        let source = std::error::Error::source(&e).expect("the storage is the source");
-        let storage = source.downcast_ref::<Storage>().expect("it is the storage");
-        let source = std::error::Error::source(storage).expect("the engine error is the source");
-        let cause = source
-            .downcast_ref::<rusqlite::Error>()
-            .expect("it is the engine's own error");
-        assert_eq!(
-            cause.sqlite_error_code(),
-            Some(rusqlite::ErrorCode::DatabaseCorrupt)
-        );
-    }
-
     /// A cancelled call maps to its own code, not a deadline's.
+
     #[test]
     fn a_cancelled_call_answers_cancelled_not_deadline_exceeded() {
         let err = Error::Cancelled("its call has gone".to_owned());
         assert_eq!(Status::from(err).code(), Code::Cancelled);
+    }
+
+    /// Damaged stored data answers `DATA_LOSS`: the caller reads the
+    /// class of the failure, not a server bug. A Git failure and any
+    /// other I/O error stay `INTERNAL`: the server's own state, not the
+    /// stored bytes. The reply's message is fixed either way; the
+    /// details stay in the log.
+    #[test]
+    fn damaged_data_answers_data_loss_and_git_and_io_stay_internal() {
+        let corrupt = Status::from(Error::Corrupt("the tree does not decode".to_owned()));
+        assert_eq!(corrupt.code(), Code::DataLoss);
+        assert_eq!(corrupt.message(), "damaged data");
+        let git = Status::from(Error::Git(Git::message(
+            "the import cap is spent".to_owned(),
+        )));
+        assert_eq!(git.code(), Code::Internal);
+        assert_eq!(git.message(), "internal error");
+        let io = Status::from(Error::Io(std::io::Error::from_raw_os_error(5)));
+        assert_eq!(io.code(), Code::Internal);
+        assert_eq!(io.message(), "internal error");
     }
 
     /// Every error that wraps another returns it from `source()`: the
@@ -438,8 +418,8 @@ mod tests {
     /// source, by design.
     #[test]
     fn every_error_that_wraps_another_returns_it_through_source() {
-        // The storage: the chain is Error → Storage → the engine's error.
-        let e = db(ffi::SQLITE_CORRUPT);
+        // The storage: the chain is Error → Storage → the database's error.
+        let e = Error::Storage(Storage::busy(std::io::Error::other("the database is gone")));
         let source = std::error::Error::source(&e).expect("the storage is the source");
         assert!(source.source().is_some(), "the engine error is the source");
         // The apply error: the changeset apply error is the source.
@@ -470,6 +450,79 @@ mod tests {
     fn a_drained_reader_pool_is_unavailable() {
         let err = Error::Unavailable("no Postgres reader free".to_owned());
         assert_eq!(Status::from(err).code(), Code::Unavailable);
+    }
+
+    /// A busy store answers the retryable code with a fixed message, and
+    /// `is_busy` names it: a retry loop may run the work again, and the
+    /// reply carries no cause - no SQL, no path, no database text.
+    #[test]
+    fn a_busy_store_is_unavailable_with_a_fixed_reply_and_is_busy_names_it() {
+        let e = Error::Storage(Storage::busy(std::io::Error::other(
+            "could not serialize access due to concurrent update",
+        )));
+        assert!(e.is_busy(), "a busy storage must answer is_busy");
+        let status = Status::from(e);
+        assert_eq!(status.code(), Code::Unavailable);
+        assert_eq!(status.message(), "the database is busy; retry");
+        // The other two classes are not busy: a retry loop must not spin
+        // on a full disk or a backend bug.
+        let e = Error::Storage(Storage::disk_full(std::io::Error::other("no space")));
+        assert!(!e.is_busy(), "a full disk is not busy");
+        let e = Error::Storage(Storage::internal(std::io::Error::other(
+            "the backend broke",
+        )));
+        assert!(!e.is_busy(), "a backend bug is not busy");
+        // The classes map as their docs say: a full disk is exhausted,
+        // a backend bug is internal, each with a fixed reply.
+        let status = Status::from(Error::Storage(Storage::disk_full(std::io::Error::other(
+            "no space left on the volume at /var/scion",
+        ))));
+        assert_eq!(status.code(), Code::ResourceExhausted);
+        assert_eq!(
+            status.message(),
+            "the server is out of disk space; retry later"
+        );
+        let status = Status::from(Error::Storage(Storage::internal(std::io::Error::other(
+            "the connection is broken",
+        ))));
+        assert_eq!(status.code(), Code::Internal);
+        assert_eq!(status.message(), "internal error");
+        // A remount left the disk read-only: the retryable code, the
+        // fixed reply, no path.
+        let eio_ro = std::io::Error::from_raw_os_error(30);
+        assert_eq!(eio_ro.kind(), std::io::ErrorKind::ReadOnlyFilesystem);
+        let status = Status::from(Error::Io(eio_ro));
+        assert_eq!(status.code(), Code::Unavailable, "{status:?}");
+        assert_eq!(status.message(), "the disk is read-only; retry later");
+        // The class names themselves, as Display carries them into the
+        // log lines.
+        assert_eq!(
+            Error::Storage(Storage::busy(std::io::Error::other("x"))).to_string(),
+            "the database is busy"
+        );
+        assert_eq!(
+            Error::Storage(Storage::disk_full(std::io::Error::other("x"))).to_string(),
+            "the database is out of space"
+        );
+        assert_eq!(
+            Error::Storage(Storage::internal(std::io::Error::other("x"))).to_string(),
+            "the database failed"
+        );
+        // A git failure displays its own message behind the variant's
+        // git: mark (the log reads it; the reply's fixed text never
+        // carries it).
+        assert_eq!(
+            Error::Git(Git::message("the import cap is spent".to_owned())).to_string(),
+            "git: the import cap is spent"
+        );
+        assert_eq!(
+            Error::Git(Git::cause(
+                "cannot open the object database".to_owned(),
+                std::io::Error::other("not a repository"),
+            ))
+            .to_string(),
+            "git: cannot open the object database"
+        );
     }
 
     #[test]

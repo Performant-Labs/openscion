@@ -1,6 +1,6 @@
 # Roadmap
 
-The order of the work, as the owner decided it (D7). Each milestone has
+The order of the work, as the owner decided it. Each milestone has
 the work that ends it; a milestone is done when its gate passes on every
 supported platform, and nothing shortcuts one. Planned work the roadmap
 does not name is tracked in
@@ -16,7 +16,7 @@ immutable GitHub release, nothing published anywhere else.
 
 Make the project safe to install anywhere it claims to work.
 
-- A clean install and the [quick start](../README.md#try-it) pass on
+- A clean install and the [quick start](../README.md#quick-start) pass on
   every supported platform (Linux and macOS), under umask 002 and umask
   022: done, [#317](https://github.com/bnsd55/openscion/issues/317)
   landed the release smoke, and its CI job runs on every push, in a
@@ -31,16 +31,29 @@ Make the project safe to install anywhere it claims to work.
   land-model cost the arm64 run exposes; and the admin-audit seed's
   server.lock, which can lag its drop by a tick when the spawned CLI
   opens at once (the seed now waits for the real lock-free condition,
-  #559). Nothing watches the full suite on a schedule — only the
-  nightly soak and the nightly version matrix run on a clock; the
-  suite runs per push and per pull request. The earlier suspected
+  #559); and the power suite's post-cut reopen on Postgres, whose
+  reason is now known: the reopen raced the cut server's store lock -
+  on Postgres the advisory lock of the killed server's session
+  outlives the SIGKILL until the database ends that backend, and the
+  reopen refused with "another server holds this store" (run
+  40134699394 hid it behind a truncated panic; main's run 40178327848
+  printed it through the reason-visible harness of
+  [#627](https://github.com/bnsd55/openscion/pull/627)). Fixed: the
+  reopen, and every restart-after-a-kill-or-cut of the power suite,
+  takes the bounded wait of start_after_kill - the real condition, the
+  holder refusal only, 10 s at most - so the killed server's lock is
+  waited for, not raced. The full suite runs on a clock now: the
+  nightly ci.yml run (03:00, in its own concurrency group since #614)
+  exercises it, and scripts/nightly-streak.sh counts those runs. The earlier suspected
   flake, scn's `failed printing to stdout: Broken pipe` in the release
   smoke, is confirmed fixed: [#341](https://github.com/bnsd55/openscion/pull/341)
   landed the fix, and none of the 57 CI runs on `main` from its merge
   to 2026-10-21 shows a `Broken pipe` in the release smoke.
 - [Ubuntu's umask 002 and user private groups trip the group-writable
-  checks](https://github.com/bnsd55/openscion/issues/302): open, the
-  last item of this gate.
+  checks](https://github.com/bnsd55/openscion/issues/302): closed by
+  choice - the rule stays fail-closed, the refusal names the chmod
+  that fixes the directory, and the runbook shows how to make the
+  directory so the rule never fires.
 
 ## v0.2.0 - compatibility and recovery
 
@@ -81,9 +94,7 @@ Make the pieces trustworthy together, and the data safe to lose.
 - The fault and recovery matrix: disk full, EIO, a Postgres restart,
   mismatched restores: [#238](https://github.com/bnsd55/openscion/issues/238)
   closed with a row per case in [faults](faults.md), each naming its
-  test. The Postgres rows reopen: until #412 their evidence ran on
-  SQLite, and the Postgres fault cells are best effort until their
-  scheduled runs carry them.
+  test.
 
 ## v0.3.0 - a single-node operational beta
 
@@ -115,19 +126,17 @@ Prove the one-machine server under real load.
 
 Say exactly what v1.0 will support.
 
-- One active `scion-server` is the production topology. SQLite holds
-  metadata: it is the only production backend of this gate. A named
-  Postgres major holds metadata too, but Postgres is experimental —
-  tested in CI, not relied on for data-safety evidence — and its
-  promotion to production moves after v0.5's durability evidence. One
-  blob store holds content. Cache tiers may sit in front.
+- One active `scion-server` is the production topology. Postgres
+  holds metadata: a named Postgres major is the only production
+  backend of this gate. One blob store holds content. Cache tiers may
+  sit in front.
 - The server host, its administrators and the data directories are
   trusted. Network peers, tokens and principals are not.
 - A shared data directory, a server data directory on a network
   filesystem, `--insecure-listen`, an untrusted local account and
   `scn mount` on a multi-user host are outside the production profile.
   The mount v1 ships is read-only: the writable mount is a build
-  feature, off in release builds, and out until v1.0.0 passes (D24).
+  feature, off in release builds, and out until v1.0.0 passes.
 - `docs/threat-model.md` names the assets, attackers, trust boundaries
   and security invariants. Each invariant names its test.
 - `docs/support.md` defines severity, backports and end of support. The
@@ -171,18 +180,19 @@ Freeze the surfaces users need, not the implementation.
 - Tickets and snapshots follow the N and N-1 mixed-version window.
 - The version matrix runs the supported client, server, cache, daemon
   and store pairs.
-- A store written by every tagged release opens and upgrades. Rollback
-  restores the pre-upgrade backup.
+- A store written by the newest 8 tagged releases opens and upgrades
+  (an older tag is named in a warning, not built). Rollback restores the
+  pre-upgrade backup.
 - A full repository exports to a versioned logical archive. CI verifies
   and restores the archive.
-- Postgres 17 is promoted to production (D23) when all of it holds:
+- Postgres 17 is promoted to production when all of it holds:
   the contract test ([#560](https://github.com/bnsd55/openscion/issues/560))
   passes on Postgres 17, the real Postgres fault rows pass, backup and
   restore pass on Postgres 17, and the release-candidate trial runs on
-  Postgres 17 as well as on SQLite. The durability evidence of v0.5 is
+  Postgres 17. The durability evidence of v0.5 is
   the floor this stands on. The per-requirement gap list with the
   evidence behind each verdict is `docs/pg17-qualification.md`.
-- No crate publishes to crates.io at v1.0 (D12). A narrow client crate
+- No crate publishes to crates.io at v1.0. A narrow client crate
   may publish when a real outside consumer exists. The server, tier and
   CLI internals stay private, and a machine check watches the facade
   that a later publish would freeze.
@@ -233,18 +243,10 @@ Make releases repeatable without one person's machine or account.
 - The unsigned release payload rebuilds byte for byte.
 - Each artifact has a checksum, an SPDX or CycloneDX SBOM and
   verifiable provenance. From this release, the binaries and SBOMs get
-  GitHub artifact attestations (D18). The recorded release workflow is
-  assessed against SLSA Build L3, as [docs/slsa.md](slsa.md)
-  records.
-- Production code has at least 80 percent statement coverage, measured
-  with a pinned tool, with the exclusions checked in (D15).
+  GitHub artifact attestations, as [docs/slsa.md](slsa.md) records.
 - Required tests have no hidden retry. The scheduled full suite passes
   30 consecutive runs, with no open flaky-test issue.
-- The project holds the OpenSSF Best Practices silver badge.
-- `GOVERNANCE.md` names the roles and decision rules. Protected
-  branches need an independent human review and all required checks.
-- Two maintainers can accept a change, handle a private report and cut
-  a release without one person's account, machine or private key.
+- Protected branches need all required checks.
 
 ## v0.9.0 - release candidate
 
@@ -278,8 +280,8 @@ Cut the tested release. Add no new surface.
 - `README.md`, `SECURITY.md`, `docs/stability.md`,
   `docs/compatibility.md`, `docs/operations.md` and
   `docs/RELEASING.md` state the supported deployment, support window
-  and 1.x promises. The supported deployment names SQLite and Postgres
-  17 (D23): one server each, per the production topology.
+  and 1.x promises. The supported deployment names Postgres 17: one
+  server, per the production topology.
 - The release notes link the gate evidence.
 
 ## Out until v1.0.0 passes
@@ -289,14 +291,14 @@ before v1.0.0 passes.
 
 - [A horizontally scalable backend](https://github.com/bnsd55/openscion/issues/47):
   more than one server process sharing data, per region and per node.
-  v1.0 promises one active server and no automatic failover (D11).
+  v1.0 promises one active server and no automatic failover.
 - [History and writes for a principal with folder read
   rules](https://github.com/bnsd55/openscion/issues/183).
 - Blame as derived data.
 - The writable `scn` mount: v1's mount is read-only, and the overlay
   write and `commit --from-mount` are a build feature, off in release
   builds, that returns only after a handle-walking rewrite passes the
-  hostile tests (D24).
+  hostile tests.
 - A virtual checkout safe from other local users: the server trusts
   every local account that can read its data directory, so this is a
   different storage and virtual-checkout design, not a hardening of

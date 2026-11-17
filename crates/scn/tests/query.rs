@@ -6,7 +6,7 @@ use std::collections::{BTreeMap, HashMap};
 use std::fs;
 use std::os::unix::fs::{PermissionsExt, symlink};
 use std::path::Path;
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, GitOid, IdentityTime, RepoPath};
 use scion_proto::runtime::listen::Limits;
@@ -14,7 +14,7 @@ use scion_server::Backend;
 use scion_server::test_support::meta::Meta as _;
 use scion_server::test_support::meta::MetaTx as _;
 use scion_server::test_support::read::MAX_DIFF_ENTRIES;
-use scion_server::test_support::{service, store::Store, tree};
+use scion_server::test_support::{service, tree};
 use scion_server::{ImportOptions, import_git};
 use serde_json::Value;
 use std::sync::Arc;
@@ -96,6 +96,7 @@ impl Server {
                 land_stale_secs: 1 << 40,
                 tls: None,
                 metrics: Arc::default(),
+                reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
             },
             None,
             std::future::pending(),
@@ -137,29 +138,27 @@ impl Server {
 /// Every commit of the git repository, mapped to the changeset it was
 /// imported as, in hex.
 fn changesets(store: &Backend, dir: &Path) -> HashMap<String, String> {
+    let imported = store
+        .read(|c| {
+            let repo = c.repo_id(REPO)?;
+            c.imported_commits(repo)
+        })
+        .unwrap();
+    let oid_of = |commit: &str| -> String {
+        let oid: Vec<u8> = (0..commit.len())
+            .step_by(2)
+            .map(|i| u8::from_str_radix(&commit[i..i + 2], 16).unwrap())
+            .collect();
+        imported
+            .iter()
+            .find(|(k, _)| k.as_bytes() == oid.as_slice())
+            .unwrap()
+            .1
+            .to_string()
+    };
     git(dir, &["rev-list", "--all"])
         .lines()
-        .map(|commit| {
-            let oid: Vec<u8> = (0..commit.len())
-                .step_by(2)
-                .map(|i| u8::from_str_radix(&commit[i..i + 2], 16).unwrap())
-                .collect();
-            let id = store
-                .read(|c| {
-                    let cs: Vec<u8> = c
-                        .sqlite()
-                        .unwrap()
-                        .query_row(
-                            "SELECT cs FROM git_import WHERE git_oid = ?1",
-                            [&oid],
-                            |row| row.get(0),
-                        )
-                        .map_err(scion_server::test_support::error::from_sqlite)?;
-                    Ok(ChangesetId::try_from(cs.as_slice()).unwrap())
-                })
-                .unwrap();
-            (commit.to_owned(), id.to_string())
-        })
+        .map(|commit| (commit.to_owned(), oid_of(commit)))
         .collect()
 }
 
@@ -188,14 +187,6 @@ fn name_status(diff: &Value) -> Vec<String> {
 
 #[test]
 fn merge_base_is_ancestor_and_diff_match_git() {
-    if Backend::test_is_postgres() {
-        // SHORTCUT: this ceiling is the skip itself; Postgres import
-        // provenance (the git_import rows) is unread by these tests, so the
-        // git side of the comparison has no Postgres run. Upgrade path: a
-        // backend-agnostic git_import read on MetaTx, then drop the skip.
-        eprintln!("skip on postgres: the test reads the data directory's git_import rows");
-        return;
-    }
     merge_base_is_ancestor_and_diff_match_git_inner();
 }
 
@@ -389,8 +380,8 @@ fn two_changesets_lens(
 
 #[test]
 fn ls_shows_the_size_of_every_entry_that_carries_one() {
-    let data = tempfile::tempdir().unwrap();
-    let store = scion_server::test_support::backend::from_store(Store::open(data.path()).unwrap());
+    let data = scion_server::test_support::private_tempdir();
+    let store = Backend::open_test(data.path()).unwrap();
     let read = b"one two three"; // 13 bytes
     let link = b"a.md"; // 4 bytes
     let empty = b"";
@@ -499,6 +490,13 @@ fn diff_continues_past_one_reply() {
         };
         assert_eq!(entry["new"]["kind"], kind, "{path:?}");
         assert_eq!(entry["new"]["id"], id.as_str(), "{path:?}");
+        // A file state names a blob, not a length: the reply carries no
+        // size, so the entry prints none.
+        assert!(
+            entry["new"].get("size").is_none(),
+            "{path:?}: {}",
+            entry["new"]
+        );
     }
     let below = server.json(&["diff", &old.to_string(), &new.to_string(), "--path", "d3"]);
     assert_eq!(
@@ -584,4 +582,231 @@ fn ls_show_and_log_read_whole_replies() {
     assert!(show.contains("f00000.bin"), "{show:?}");
     let log = server.text(&["log", &head.to_string(), "--limit", "1"]);
     assert!(log.contains(&head.to_string()[..12]), "{log:?}");
+}
+
+/// `is-ancestor` answers both ways and its exit code carries the
+/// answer: a parent is an ancestor of its child and answers 0; the
+/// same pair asked the other way is not and answers 1. A fold in the
+/// command that passes the server's answer through unchanged would
+/// make one side lie, and each side's assert catches its own lie.
+#[test]
+fn is_ancestor_answers_both_ways() {
+    let git_dir = tempfile::tempdir().unwrap();
+    let dir = git_dir.path();
+    git(dir, &["init", "-q", "-b", "main"]);
+    commit(dir, "root", &[("a.txt", Some("a"))]);
+    let parent = git(dir, &["rev-parse", "HEAD"]);
+    commit(dir, "child", &[("a.txt", Some("b"))]);
+    let child = git(dir, &["rev-parse", "HEAD"]);
+
+    let opts = ImportOptions {
+        rev: "HEAD".into(),
+        target_ref: "main".into(),
+        verify_sample: 0,
+    };
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
+    import_git(&store, REPO, dir, &opts).unwrap();
+    let ids = changesets(&store, dir);
+    let server = Server::start(data, store);
+
+    // The parent is an ancestor of the child: exit 0.
+    assert_eq!(
+        server
+            .scn(&["is-ancestor", &ids[&parent], &ids[&child]])
+            .status
+            .code(),
+        Some(0),
+        "the parent is an ancestor of the child"
+    );
+    // The child is not an ancestor of the parent: exit 1, and the same
+    // pair asked through the git command agrees.
+    let (git_yes, _) = git_status(dir, &["merge-base", "--is-ancestor", &child, &parent]);
+    assert!(
+        !git_yes,
+        "git agrees the child is not the parent's ancestor"
+    );
+    assert_eq!(
+        server
+            .scn(&["is-ancestor", &ids[&child], &ids[&parent]])
+            .status
+            .code(),
+        Some(1),
+        "the child is not an ancestor of the parent"
+    );
+}
+
+/// `scn diff --json` names every path's change: the added ones `A`, the
+/// deleted ones `D`, the changed ones `M`, against git's own
+/// `--name-status` on the same two revisions. A fold that shrinks the
+/// status flags would drop one of the three letters.
+#[test]
+fn diff_names_added_changed_and_deleted_paths() {
+    let git_dir = tempfile::tempdir().unwrap();
+    let dir = git_dir.path();
+    git(dir, &["init", "-q", "-b", "main"]);
+    commit(
+        dir,
+        "root",
+        &[("kept.txt", Some("old")), ("gone.txt", Some("bye"))],
+    );
+    commit(
+        dir,
+        "change",
+        &[
+            ("added.txt", Some("new")),
+            ("kept.txt", Some("updated")),
+            ("gone.txt", None),
+        ],
+    );
+    let old = git(dir, &["rev-parse", "HEAD~1"]);
+    let new = git(dir, &["rev-parse", "HEAD"]);
+    let opts = ImportOptions {
+        rev: "HEAD".into(),
+        target_ref: "main".into(),
+        verify_sample: 0,
+    };
+
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
+    import_git(&store, REPO, dir, &opts).unwrap();
+    let ids = changesets(&store, dir);
+    let server = Server::start(data, store);
+
+    let git_diff = git(dir, &["diff", "--name-status", &old, &new]);
+    let mut expected: Vec<&str> = git_diff.lines().collect();
+    expected.sort_unstable();
+    assert_eq!(
+        name_status(&server.json(&["diff", &ids[&old], &ids[&new]])),
+        expected,
+        "the added, deleted and changed paths match git's"
+    );
+}
+
+/// The diff's text outgrows the stdout writer's 8 KiB buffer, and the
+/// reader of its stdout pipe is gone before the child writes a byte:
+/// its read end is dropped the moment the child is spawned, so the
+/// write that carries the first buffered 8 KiB meets the closed pipe,
+/// and the command ends quietly. A fold that stops seeing the closed
+/// pipe fails the command loudly instead.
+#[test]
+fn the_diffs_text_ends_quietly_when_the_reader_leaves() {
+    let git_dir = tempfile::tempdir().unwrap();
+    let dir = git_dir.path();
+    git(dir, &["init", "-q", "-b", "main"]);
+    // 900 changed paths: about 9.9 KiB of diff text, past the writer's
+    // 8 KiB buffer, so the closed pipe is met by a write, not the last
+    // flush.
+    let before: Vec<(&str, Option<&str>)> = (0..900)
+        .map(|n| (format!("f{n:03}.txt").leak() as &str, Some("old")))
+        .collect();
+    commit(dir, "root", &before);
+    let old = git(dir, &["rev-parse", "HEAD"]);
+    let after: Vec<(&str, Option<&str>)> = (0..900)
+        .map(|n| (format!("f{n:03}.txt").leak() as &str, Some("new")))
+        .collect();
+    commit(dir, "change", &after);
+    let new = git(dir, &["rev-parse", "HEAD"]);
+    let opts = ImportOptions {
+        rev: "HEAD".into(),
+        target_ref: "main".into(),
+        verify_sample: 0,
+    };
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
+    import_git(&store, REPO, dir, &opts).unwrap();
+    let ids = changesets(&store, dir);
+    let server = Server::start(data, store);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_scn"))
+        .args([
+            "--server",
+            &server.url,
+            "--repo",
+            REPO,
+            "diff",
+            &ids[&old],
+            &ids[&new],
+        ])
+        .env("SCION_TOKEN", TOKEN)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The read end closes here, before the child's first write reaches
+    // the pipe: no byte is read first, so no write can succeed by
+    // arriving early. Every write meets the closed pipe.
+    drop(child.stdout.take().unwrap());
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "status: {}", out.status);
+    assert!(
+        out.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
+fn the_diffs_flush_ends_quietly_when_the_reader_leaves() {
+    let git_dir = tempfile::tempdir().unwrap();
+    let dir = git_dir.path();
+    git(dir, &["init", "-q", "-b", "main"]);
+    // Three changed paths: about 40 bytes of diff text, all held in
+    // the stdout writer's 8 KiB buffer, so the flush is the only write.
+    // The read end is dropped before the child writes, so the flush
+    // meets the closed pipe and the command ends quietly. A fold that
+    // stops seeing the closed pipe fails the command loudly instead.
+    commit(
+        dir,
+        "root",
+        &[("kept.txt", Some("old")), ("gone.txt", Some("bye"))],
+    );
+    let old = git(dir, &["rev-parse", "HEAD"]);
+    commit(
+        dir,
+        "change",
+        &[
+            ("kept.txt", Some("new")),
+            ("gone.txt", None),
+            ("added.txt", Some("hi")),
+        ],
+    );
+    let new = git(dir, &["rev-parse", "HEAD"]);
+    let opts = ImportOptions {
+        rev: "HEAD".into(),
+        target_ref: "main".into(),
+        verify_sample: 0,
+    };
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
+    import_git(&store, REPO, dir, &opts).unwrap();
+    let ids = changesets(&store, dir);
+    let server = Server::start(data, store);
+
+    let mut child = Command::new(env!("CARGO_BIN_EXE_scn"))
+        .args([
+            "--server",
+            &server.url,
+            "--repo",
+            REPO,
+            "diff",
+            &ids[&old],
+            &ids[&new],
+        ])
+        .env("SCION_TOKEN", TOKEN)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .unwrap();
+    // The read end closes here, before the child's first write reaches
+    // the pipe: the flush is the only write, and it meets the closed
+    // pipe at any pace.
+    drop(child.stdout.take().unwrap());
+    let out = child.wait_with_output().unwrap();
+    assert_eq!(out.status.code(), Some(0), "status: {}", out.status);
+    assert!(
+        out.stderr.is_empty(),
+        "stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
 }

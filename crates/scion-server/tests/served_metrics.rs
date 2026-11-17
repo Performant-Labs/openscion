@@ -50,7 +50,7 @@ async fn served() -> (
     ScionClient<InterceptedService<tonic::transport::Channel, Bearer>>,
     scion_core::ChangesetId,
 ) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let store = {
         let path = dir.path().to_path_buf();
         tokio::task::spawn_blocking(move || Backend::open_test(&path).unwrap())
@@ -98,6 +98,7 @@ async fn served() -> (
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::clone(&metrics),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         Some(Arc::new(Keys::generate())),
         async {
@@ -150,6 +151,11 @@ async fn a_served_server_renders_the_operating_metrics() {
     // The free-space poll runs before its first sleep.
     let text = metrics.render();
     assert!(text.contains("scion_data_free_bytes "), "{text}");
+    assert!(text.contains("scion_data_free_inodes "), "{text}");
+    assert!(
+        text.contains("scion_data_free_sample_age_seconds "),
+        "{text}"
+    );
     // On Postgres, the changeset's write transaction waited for the
     // collector's key, and the wait is in the histogram.
     // On Postgres, a write transaction waits for the collector's key,
@@ -176,24 +182,22 @@ async fn a_served_server_renders_the_operating_metrics() {
         .into(),
     )
     .expect("changeset fits the format");
-    if Backend::test_is_postgres() {
-        let (bytes, _id) = cs.encode_with_id();
-        let _ = scion
-            .create_changeset(CreateChangesetRequest {
-                repo: REPO.into(),
-                changeset: bytes,
-            })
-            .await
-            .expect("the token may create a changeset");
-        // The seed's writes waited too, so the count is at least the
-        // changeset's own one wait.
-        let text = metrics.render();
-        let count = text
-            .lines()
-            .find(|line| line.starts_with("scion_pg_collector_key_wait_seconds_count "))
-            .and_then(|line| line.rsplit(' ').next())
-            .and_then(|n| n.parse::<u64>().ok())
-            .unwrap_or(0);
-        assert!(count >= 1, "{text}");
-    }
+    let (bytes, _id) = cs.encode_with_id();
+    let _ = scion
+        .create_changeset(CreateChangesetRequest {
+            repo: REPO.into(),
+            changeset: bytes,
+        })
+        .await
+        .expect("the token may create a changeset");
+    // The seed's writes waited too, so the count is at least the
+    // changeset's own one wait.
+    let text = metrics.render();
+    let count = text
+        .lines()
+        .find(|line| line.starts_with("scion_pg_collector_key_wait_seconds_count "))
+        .and_then(|line| line.rsplit(' ').next())
+        .and_then(|n| n.parse::<u64>().ok())
+        .unwrap_or(0);
+    assert!(count >= 1, "{text}");
 }

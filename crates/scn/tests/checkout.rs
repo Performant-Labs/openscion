@@ -28,10 +28,9 @@ use scion_proto::v1::{
     ResolveRefRequest, ResolveRefResponse,
 };
 use scion_server::Backend;
-use scion_server::test_support::error::from_sqlite;
 use scion_server::test_support::meta::Meta as _;
 use scion_server::test_support::meta::MetaTx as _;
-use scion_server::test_support::{service, store::Store, tree};
+use scion_server::test_support::{service, tree};
 use scion_server::{ImportOptions, import_git};
 use std::sync::Arc;
 use tempfile::TempDir;
@@ -68,16 +67,6 @@ fn git(dir: &Path, args: &[&str]) {
         "git {args:?}: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-}
-
-/// A scalar row from the store's SQLite file, through the store's error
-/// type: the helper the upgrade tests read schema versions and counts
-/// with.
-fn sqlite_scalar<T: rusqlite::types::FromSql>(
-    c: &rusqlite::Connection,
-    sql: &str,
-) -> scion_server::Result<T> {
-    c.query_row(sql, [], |row| row.get(0)).map_err(from_sqlite)
 }
 
 /// A git repository with one commit that has every entry kind: regular and
@@ -147,6 +136,7 @@ impl Server {
                 land_stale_secs: 1 << 40,
                 tls: None,
                 metrics: Arc::default(),
+                reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
             },
             tickets,
             std::future::pending(),
@@ -174,6 +164,15 @@ impl Server {
     fn scn(&self, args: &[&str]) -> Output {
         scn(&self.url, REPO, args)
     }
+
+    /// Runs `scn` against this server with extra environment.
+    fn scn_with_env(&self, env: &[(&str, &str)], args: &[&str]) -> Output {
+        let mut command = scn_command(&self.url, REPO, args);
+        for (name, value) in env {
+            command.env(name, value);
+        }
+        command.output().unwrap()
+    }
 }
 
 /// Runs `scn` against the server at `url`.
@@ -189,6 +188,20 @@ fn scn_command(url: &str, repo: &str, args: &[&str]) -> Command {
         .args(args)
         .env("SCION_TOKEN", TOKEN);
     command
+}
+
+/// A SIGINT-stopped checkout dies by the signal (the default action is
+/// restored and the signal raised), which a shell reports as 128 plus
+/// the signal's number, and leaves the destination as it was.
+fn assert_signal_death_and_untouched(out: &std::process::Output, dest: &Path) {
+    use std::os::unix::process::ExitStatusExt as _;
+    assert_eq!(out.status.signal(), Some(2), "{}", stderr(out));
+    assert!(
+        stderr(out).contains("interrupted by SIGINT"),
+        "{}",
+        stderr(out)
+    );
+    assert_untouched(dest);
 }
 
 /// Asserts that a failed checkout left `dest` the empty directory it was,
@@ -312,14 +325,15 @@ fn checkout_matches_git_checkout_byte_for_byte() {
     );
 
     // The object reads need the token too.
-    let out = server.scn(&[
-        "--token",
-        "wrong",
-        "checkout",
-        "main",
-        "--into",
-        text(&tmp.path().join("denied")),
-    ]);
+    let out = server.scn_with_env(
+        &[("SCION_TOKEN", "wrong")],
+        &[
+            "checkout",
+            "main",
+            "--into",
+            text(&tmp.path().join("denied")),
+        ],
+    );
     assert!(!out.status.success());
     assert!(stderr(&out).contains("wrong token"), "{}", stderr(&out));
 
@@ -444,6 +458,156 @@ fn store_changesets(store: &Backend, cases: &[Files]) -> Vec<ChangesetId> {
                 .collect()
         })
         .unwrap()
+}
+
+/// A tree a hostile server sends may name an entry `.`, `..`, hold a NUL,
+/// or carry a `/` in its name: the format holds raw bytes. The checkout
+/// must refuse the tree before anything is written, and name the path it
+/// refused.
+#[test]
+fn a_tree_with_a_dot_nul_or_slash_name_is_refused_before_anything_is_written() {
+    let blob = |data: &[u8]| Object {
+        kind: ObjectKind::Blob.into(),
+        id: BlobId::of(data).as_bytes().to_vec(),
+        data: data.to_vec(),
+    };
+    let (one, two) = (blob(b"one\n"), blob(b"two\n"));
+    let file = |object: &Object| {
+        Entry::File(FileEntry::new(
+            FileState::Regular {
+                content: BlobId::try_from(object.id.as_slice()).unwrap(),
+                executable: false,
+            },
+            object.data.len() as u64,
+        ))
+    };
+    // Two entries whose names are one and two bytes: each hostile case
+    // patches one of these names byte for byte, so the entry order and
+    // the rest of the encoding stay canonical.
+    let honest = Tree::new(
+        [
+            (PathElem::new("a").unwrap(), file(&one)),
+            (PathElem::new("ok").unwrap(), file(&two)),
+        ]
+        .into(),
+    )
+    .unwrap()
+    .encode();
+    // The hostile name replaces a name of the same length, and the tree's
+    // ID is the hash of its own bytes, so the tree self-verifies: only
+    // the name check can refuse it.
+    for (from, to) in [
+        (&b"a"[..], &b"."[..]),
+        (&b"a"[..], &b"/"[..]),
+        (&b"ok"[..], &b".."[..]),
+        (&b"ok"[..], &b".\0"[..]),
+    ] {
+        let at = honest
+            .windows(from.len())
+            .position(|part| part == from)
+            .unwrap();
+        let mut hostile = honest.clone();
+        hostile[at..at + from.len()].copy_from_slice(to);
+        // The tree ID hashes its own bytes under the tree domain: the same
+        // hash decode_with_id checks, so the hostile tree self-verifies and
+        // only the name check can refuse it.
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"scion\0tree\0v1\0");
+        hash.update(&hostile);
+        let id = TreeId::try_from(hash.finalize().as_bytes().as_slice()).unwrap();
+        let object = Object {
+            kind: ObjectKind::Tree.into(),
+            id: id.as_bytes().to_vec(),
+            data: hostile,
+        };
+        // The blobs the entries name, so a build that lets the tree
+        // decode reaches the write and fails it there, where the refusal
+        // must not be.
+        let mut objects = HashMap::new();
+        for served in [one.clone(), two.clone(), object] {
+            objects.insert(served.id.clone(), served);
+        }
+        let liar = Liar {
+            root: id,
+            objects,
+            // The entries are in path order, so a build that lets the
+            // tree decode gets its blobs and reaches the write.
+            in_path_order: vec![one.id.clone(), two.id.clone()],
+            repo: Mutex::new("in-order".to_owned()),
+        };
+        // Its own runtime, like `start_liar`: the scn call blocks this
+        // thread on a subprocess, and a server on a runtime that never
+        // gets polled would not answer it.
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let url = {
+            let listener = runtime
+                .block_on(tokio::net::TcpListener::bind("127.0.0.1:0"))
+                .unwrap();
+            let url = format!("http://{}", listener.local_addr().unwrap());
+            runtime.spawn(
+                tonic::transport::Server::builder()
+                    .add_service(ObjectsServer::new(liar))
+                    .serve_with_incoming(TcpListenerStream::new(listener)),
+            );
+            url
+        };
+        let dir = tempfile::tempdir().unwrap();
+        let dest = dir.path().join("dest");
+        fs::create_dir(&dest).unwrap();
+        // The repo name is the Liar's "in-order" misbehavior: a build
+        // that lets the hostile tree decode gets its blobs in path order
+        // and reaches the write, where the refusal must not be.
+        let out = scn(
+            &url,
+            "in-order",
+            &["checkout", ANY_CHANGESET, "--into", text(&dest)],
+        );
+        assert!(!out.status.success(), "{to:?}: {}", stderr(&out));
+        assert!(stderr(&out).contains("bad path"), "{}", stderr(&out));
+        assert_untouched(&dest);
+        // The danger of `..` is a write outside the destination: the
+        // temp dir holds the destination and nothing else.
+        let mut strays: Vec<String> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        strays.retain(|name| name != "dest");
+        assert!(strays.is_empty(), "{strays:?}");
+    }
+}
+
+/// A checkout stalled on its fetch stops on SIGINT with the shell's
+/// contract: 128 plus the signal number, the message naming the signal,
+/// and the destination untouched - so a shell that runs `scn` stops too,
+/// and a stopped checkout never reads as a success.
+#[test]
+fn a_stopped_checkout_reports_the_signal_and_writes_nothing() {
+    let (_runtime, url) = start_liar(0);
+    let tmp = tempfile::tempdir().unwrap();
+    let dest = tmp.path().join("dest");
+    fs::create_dir(&dest).unwrap();
+    let child = scn_command(
+        &url,
+        "stall",
+        &["checkout", ANY_CHANGESET, "--into", text(&dest)],
+    )
+    .stdout(std::process::Stdio::null())
+    .stderr(std::process::Stdio::piped())
+    .spawn()
+    .unwrap();
+    // The checkout is parked in its fetch, waiting for the reply that
+    // never comes; the signal reaches it there.
+    std::thread::sleep(std::time::Duration::from_millis(1500));
+    // `kill` by name: `--` keeps a pid that starts with a digit a pid.
+    std::process::Command::new("kill")
+        .args(["-INT", "--", &child.id().to_string()])
+        .status()
+        .unwrap();
+    let out = child.wait_with_output().unwrap();
+    assert_signal_death_and_untouched(&out, &dest);
 }
 
 #[test]
@@ -738,6 +902,13 @@ impl Objects for Liar {
         request: Request<GetObjectsRequest>,
     ) -> Result<Response<Replies>, Status> {
         let GetObjectsRequest { refs, .. } = request.into_inner();
+        // The call itself fails: the retry guard in fetch sees errors of
+        // the initial call, not of the stream's middle.
+        match self.repo.lock().unwrap().as_str() {
+            "rpc-error" => return Err(Status::internal("lost the disk")),
+            "denied" => return Err(Status::permission_denied("no view of r")),
+            _ => {}
+        }
         let mut honest: Vec<Object> = refs.iter().map(|r| self.objects[&r.id].clone()).collect();
         let replies: Vec<Result<Object, Status>> = if refs[0].kind == i32::from(ObjectKind::Tree) {
             // A tree reply that ends in the middle of its second part. A
@@ -866,6 +1037,10 @@ fn a_misbehaving_server_is_caught_and_nothing_is_written() {
     let tmp = tempfile::tempdir().unwrap();
 
     for (misbehavior, expected) in [
+        // The call itself fails, and the error surfaces as it is: a
+        // non-expiry error is not an expired ticket to retry on.
+        ("rpc-error", "lost the disk"),
+        ("denied", "no view of r"),
         ("extra", "not asked for"),
         ("duplicate", "not asked for"),
         ("wrong-kind", "not asked for"),
@@ -1084,146 +1259,4 @@ fn an_expired_ticket_is_minted_again_once() {
     assert_eq!(fs::read(dest.join("a")).unwrap(), b"x\n");
     // One mint for the checkout, one for the refresh: no more.
     assert_eq!(mints.load(Ordering::SeqCst), 2);
-}
-
-/// The body of a schema-6 tree: entries carry no byte lengths, so this
-/// build cannot decode it.
-fn old_tree(entries: &[(&str, BlobId, bool)]) -> Vec<u8> {
-    const TAG_REGULAR: u8 = 1;
-    let mut w = vec![1u8];
-    w.extend_from_slice(&u32::try_from(entries.len()).unwrap().to_be_bytes());
-    for (name, blob, exec) in entries {
-        w.extend_from_slice(&u32::try_from(name.len()).unwrap().to_be_bytes());
-        w.extend_from_slice(name.as_bytes());
-        w.push(TAG_REGULAR);
-        w.extend_from_slice(blob.as_bytes());
-        w.push(u8::from(*exec));
-    }
-    w
-}
-
-/// Back to schema 6 from this build's schema: the derived rows, the view
-/// memo of #121 and the review tables of schema 10 go, so the upgrade
-/// replays 8, 9 and 10.
-const TO_SCHEMA_6: &str = "DELETE FROM derived; DROP TABLE IF EXISTS view_trees; \
-    DROP TABLE IF EXISTS review_comments; DROP TABLE IF EXISTS review_threads; \
-    DROP TABLE IF EXISTS proposal_reviews; DROP TABLE IF EXISTS proposal_heads; \
-    DROP TABLE IF EXISTS proposals; PRAGMA user_version = 6;";
-
-/// A data directory that the previous release (schema 6) wrote: its trees
-/// carry no byte lengths. Opening it on this build upgrades the database,
-/// drops the old trees, and re-derives them from the blob store, so the
-/// checkout works and fsck is clean.
-#[test]
-fn a_schema_6_data_dir_upgrades_and_checks_out() {
-    let data = tempfile::tempdir().unwrap();
-    // The changeset and blob bytes are the bytes the old release wrote
-    // too: #172 changed trees only.
-    let store = Store::open(data.path()).unwrap();
-    let hello = store.blobs().put(b"hello").unwrap();
-    let world = store.blobs().put(b"hello world").unwrap();
-    let author = IdentityTime::new(
-        b"Ada".to_vec(),
-        b"ada@example.com".to_vec(),
-        1_700_000_000,
-        0,
-    )
-    .expect("identity fits the format");
-    let changeset = |parent: Option<ChangesetId>, content: BlobId| {
-        Changeset::new(
-            parent.into_iter().collect(),
-            author.clone(),
-            None,
-            b"upgrade\n".to_vec(),
-            [(
-                RepoPath::new("a").unwrap(),
-                Some(FileState::Regular {
-                    content,
-                    executable: false,
-                }),
-            )]
-            .into_iter()
-            .collect(),
-        )
-        .expect("changeset fits the format")
-    };
-    let mut lens: std::collections::HashMap<BlobId, u64> =
-        [(hello, 5u64), (world, 11)].into_iter().collect();
-    let (root, child) = store
-        .write(|c| {
-            let repo = c.create_repo(REPO)?;
-            let mut missing = |b| {
-                lens.remove(&b)
-                    .ok_or_else(|| scion_server::Error::NotFound(format!("blob {b}")))
-            };
-            let root = tree::store_changeset(c, repo, &changeset(None, hello), &mut missing)?.0;
-            let child =
-                tree::store_changeset(c, repo, &changeset(Some(root), world), &mut missing)?.0;
-            assert!(c.cas_ref(repo, "main", None, child)?);
-            Ok((root, child))
-        })
-        .unwrap();
-    drop(store);
-
-    // Back to the disk state of the release before #177: schema 6, and
-    // tree bodies whose entries carry no byte lengths.
-    let olds = [
-        (root, old_tree(&[("a", hello, false)])),
-        (child, old_tree(&[("a", world, false)])),
-    ];
-    {
-        let c = rusqlite::Connection::open(data.path().join("scion.db")).unwrap();
-        for (cs, body) in olds {
-            let id: Vec<u8> = c
-                .query_row(
-                    "SELECT value FROM derived WHERE kind = 'root_tree' AND cs = ?1",
-                    [cs.as_bytes().to_vec()],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert_eq!(id.len(), 32, "the changeset has a root tree row");
-            c.execute("UPDATE trees SET body = ?1 WHERE id = ?2", [body, id])
-                .unwrap();
-        }
-        // The view memo of #121 and the review tables of schema 10 did not
-        // exist in schema 6: drop the tables that this build's first open
-        // made, so the upgrade replays 8, 9 and 10.
-        c.execute_batch(TO_SCHEMA_6).unwrap();
-    }
-
-    // This build upgrades the directory on open.
-    let store = Store::open(data.path()).unwrap();
-    let version: u32 = store
-        .read(|c| sqlite_scalar(c, "PRAGMA user_version"))
-        .unwrap();
-    assert_eq!(version, 10);
-    let trees: i64 = store
-        .read(|c| sqlite_scalar(c, "SELECT count() FROM trees"))
-        .unwrap();
-    assert_eq!(trees, 0, "the old trees are gone");
-    let report = scion_server::fsck::run(
-        &scion_server::test_support::backend::from_store(store.clone()),
-        1,
-        &mut |_| {},
-    )
-    .unwrap();
-    assert!(report.problems.is_empty(), "{:?}", report.problems);
-
-    // A checkout of the upgraded directory re-derives the trees. The db
-    // path outlives `data`, which `Server::start` takes.
-    let db_path = data.path().join("scion.db");
-    let server = Server::start(
-        data,
-        scion_server::test_support::backend::from_store(store.clone()),
-    );
-    let tmp = tempfile::tempdir().unwrap();
-    let dest = tmp.path().join("dest");
-    let out = server.scn(&["checkout", "main", "--into", text(&dest)]);
-    assert!(out.status.success(), "{}", stderr(&out));
-    assert_eq!(fs::read(dest.join("a")).unwrap(), b"hello world");
-    let c = rusqlite::Connection::open(&db_path).unwrap();
-    let trees: i64 = c
-        .query_row("SELECT count() FROM trees", [], |row| row.get(0))
-        .unwrap();
-    assert_eq!(trees, 2, "the checkout re-derived and stored the trees");
 }

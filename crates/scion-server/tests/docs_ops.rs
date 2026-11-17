@@ -10,15 +10,25 @@
 use std::path::Path;
 use std::process::Command;
 
+#[path = "docs_common/mod.rs"]
+mod docs_common;
+
 /// The scion-server subcommands the guide's commands may use.
-const SUBCOMMANDS: [&str; 7] = [
+const SUBCOMMANDS: [&str; 14] = [
     "serve",
+    "preflight",
     "hash-token",
     "ticket-key",
     "import",
+    "create-repo",
+    "create-ref",
     "fsck",
     "gc",
     "derive",
+    "migrate",
+    "export",
+    "verify",
+    "restore",
 ];
 
 /// The logical command lines of the guide's shell blocks: a block's
@@ -403,8 +413,7 @@ fn every_alert_response_anchor_resolves() {
     );
 }
 
-/// Every heading of the guide, as GitHub slugs it: lowercased, spaces
-/// and dots to dashes, other punctuation dropped.
+/// Every heading of the guide, as GitHub slugs it (`docs_common::github_slug`).
 fn headings(doc: &str) -> Vec<String> {
     let mut out = Vec::new();
     for line in doc.lines() {
@@ -412,20 +421,21 @@ fn headings(doc: &str) -> Vec<String> {
             continue;
         };
         let heading = heading.trim_start_matches('#').trim();
-        let mut slug = String::new();
-        for c in heading.chars() {
-            if c.is_ascii_alphanumeric() {
-                slug.extend(c.to_lowercase());
-            } else if c == ' ' || c == '.' {
-                slug.push('-');
-            }
-        }
-        while slug.ends_with('-') {
-            slug.pop();
-        }
-        out.push(slug);
+        out.push(docs_common::github_slug(heading));
     }
     out
+}
+
+/// An alert anchor that names a heading with a hyphen in it resolves:
+/// GitHub keeps the hyphen, so the check's slug rule must too.
+#[test]
+fn an_alert_anchor_resolves_a_hyphenated_heading() {
+    let doc = "### A stuck free-space sample\n\nEach free-space sample.\n";
+    let slugs = headings(doc);
+    assert!(
+        slugs.iter().any(|h| h == "a-stuck-free-space-sample"),
+        "the hyphenated heading's GitHub slug is missing from {slugs:?}"
+    );
 }
 
 /// The command-line extractor: continuations join, other tools pass,
@@ -435,20 +445,21 @@ fn sh_commands_and_flags_parse() {
     let commands = sh_commands(
         "before\n\
          \x60\x60\x60sh\n\
-         ./scion-server --data /srv serve \\\n\
-         \x20 --token <TOKEN>\n\
+         SCION_TOKEN=<TOKEN> ./scion-server --data /srv serve \\\n\
+         \x20 --ticket-key /srv/keys/ticket.key\n\
          cp -R /srv /backups\n\
-         TOK=$(./scion-server hash-token --token=<S>)\n\
+         TOK=$(./scion-server hash-token --token-file=<S>)\n\
          \x60\x60\x60\n",
     );
     assert_eq!(commands.len(), 3, "{commands:?}");
     assert_eq!(
-        commands[0], "./scion-server --data /srv serve --token <TOKEN>",
+        commands[0],
+        "SCION_TOKEN=<TOKEN> ./scion-server --data /srv serve --ticket-key /srv/keys/ticket.key",
         "{commands:?}"
     );
     assert_eq!(
         used_flags_at(&commands[0]),
-        vec![(1, "--data".to_string()), (4, "--token".to_string())]
+        vec![(2, "--data".to_string()), (5, "--ticket-key".to_string())]
     );
     assert!(
         used_flags_at(&commands[1]).is_empty(),
@@ -456,6 +467,6 @@ fn sh_commands_and_flags_parse() {
     );
     assert_eq!(
         used_flags_at(&commands[2]),
-        vec![(2, "--token".to_string())]
+        vec![(2, "--token-file".to_string())]
     );
 }

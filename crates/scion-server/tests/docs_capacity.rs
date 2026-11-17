@@ -1,6 +1,6 @@
 //! The capacity table of docs/operations.md (issue #387) cannot drift
 //! from the envelope's shape: every cell of the grid (3 writers x 3
-//! readers x 2 backends) is a row, numbers parse or the percentile
+//! readers) is a row, numbers parse or the percentile
 //! group is all `-` together (no half-filled cell publishes), the
 //! caption states the edges, and
 //! the footer names a commit that exists in this checkout's git - so a
@@ -11,8 +11,10 @@ use std::process::Command;
 
 const DOC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../../docs/operations.md");
 
-/// The grid's axes, in the order the table lists them.
-const BACKENDS: [&str; 2] = ["sqlite", "postgres"];
+/// The grid's axes, in the order the table lists them. One backend:
+/// the store is Postgres, and a table with any other backend's rows
+/// fails here.
+const BACKENDS: [&str; 1] = ["postgres"];
 const WRITERS: [u32; 3] = [2, 50, 200];
 const READERS: [u32; 3] = [0, 5, 20];
 
@@ -130,9 +132,9 @@ fn every_cell_of_the_grid_has_a_row_in_order() {
 #[test]
 fn numeric_columns_parse_and_dashes_say_what_failed() {
     let doc = std::fs::read_to_string(Path::new(DOC)).expect("docs/operations.md exists");
-    // Column indexes in the row: 3 land p99, 4 checkout p50, 5 checkout
-    // p99, 6 timeouts, 7 errors, 9 landed, 10 blob growth, 11 database
-    // growth.
+    // Column indexes in the row: 3 land p99, 4 push p99, 5 checkout
+    // p50, 6 checkout p99, 7 timeouts, 8 errors, 10 landed, 11 lands
+    // per second, 12 blob growth, 13 database growth.
     for row in table_rows(capacity_section(&doc)) {
         check_row(&row);
     }
@@ -145,19 +147,19 @@ fn check_row(row: &[String]) {
     if all_dash {
         return; // the skeleton: no run has filled this cell yet
     }
-    let timeouts: u64 = row[6]
+    let timeouts: u64 = row[7]
         .parse()
         .unwrap_or_else(|_| panic!("timeouts does not parse: {row:?}"));
-    let errors: u64 = row[7]
+    let errors: u64 = row[8]
         .parse()
         .unwrap_or_else(|_| panic!("errors does not parse: {row:?}"));
-    // The percentile group (land p99, checkout p50, checkout p99)
-    // stands together or parses together: a bench that died names
-    // none of them, a live one names all three, and a cell with no
-    // readers (r=0) names the land p99 and dashes both checkout
-    // columns. A dash in one and a number in another is otherwise a
-    // broken row, not a measurement.
-    let group = &row[3..6];
+    // The percentile group (land p99, push p99, checkout p50, checkout
+    // p99) stands together or parses together: a bench that died names
+    // none of them, a live one names all four, and a cell with no
+    // readers (r=0) names the land p99 and the push p99 and dashes
+    // both checkout columns. A dash in one and a number in another is
+    // otherwise a broken row, not a measurement.
+    let group = &row[3..7];
     let dashes = group.iter().filter(|c| c.as_str() == "-").count();
     match dashes {
         0 => {
@@ -167,25 +169,31 @@ fn check_row(row: &[String]) {
             }
         }
         // A no-reader cell: the writers ran, the readers never did.
-        2 if row[3] != "-" && row[4] == "-" && row[5] == "-" => {
-            row[3]
-                .parse::<f64>()
-                .unwrap_or_else(|_| panic!("the land p99 does not parse: {row:?}"));
+        2 if row[3] != "-" && row[4] != "-" && row[5] == "-" && row[6] == "-" => {
+            for cell in &row[3..5] {
+                cell.parse::<f64>()
+                    .unwrap_or_else(|_| panic!("the land and push p99 do not parse: {row:?}"));
+            }
         }
-        3 if errors + timeouts > 0 => {}
+        4 if errors + timeouts > 0 => {}
         _ => panic!("a half-reported percentile group must not publish: {row:?}"),
     }
     // The counters and the resources are always numbers: the run
     // knows them whatever the bench did.
-    for cell in &row[6..10] {
+    for cell in &row[7..11] {
         cell.parse::<f64>()
             .unwrap_or_else(|_| panic!("a number does not parse: {cell:?} in {row:?}"));
     }
-    // The growth columns parse as numbers, or say why they do not:
-    // a "-" in the database column is SQLite (it has no separate
-    // database), and a "-" in a growth column is a cell whose counter
-    // grew by no lands at all.
-    for (cell, what) in row[10..].iter().zip(["blob growth", "database growth"]) {
+    // The throughput column parses as a number, or a "-" where the
+    // bench named no report. The growth columns parse as numbers, or
+    // say why they do not: a "-" in a growth column is a
+    // cell whose counter grew by no lands at all.
+    if row[11] != "-" {
+        row[11]
+            .parse::<f64>()
+            .unwrap_or_else(|_| panic!("lands per second does not parse: {row:?}"));
+    }
+    for (cell, what) in row[12..].iter().zip(["blob growth", "database growth"]) {
         if cell != "-" {
             cell.parse::<f64>()
                 .unwrap_or_else(|_| panic!("{what} does not parse: {cell:?} in {row:?}"));
@@ -194,47 +202,59 @@ fn check_row(row: &[String]) {
 }
 
 /// The row shapes the rule must accept and refuse, as fixture rows in
-/// the table's own shape: a filled no-reader row, a dead bench's row,
-/// and the half-filled row that must never publish.
+/// the table's own shape: a filled row, a no-reader row, a dead bench's
+/// row, and the half-filled row that must never publish.
 #[test]
 fn a_no_reader_row_names_the_land_and_dashes_the_reads() {
-    let shapes: [(&[&str], bool); 6] = [
+    let shapes: [(&[&str], bool); 5] = [
         // (cells after the cell name, does the rule accept it?)
         (
-            &["63.1", "70", "115", "0", "0", "30376", "2000", "1106", "-"],
+            &[
+                "63.1", "91.4", "70", "115", "0", "0", "30376", "2000", "11.4", "1402",
+            ],
             true,
-        ), // a live sqlite cell
+        ), // a live cell: both growth columns
         (
-            &["63.1", "-", "-", "0", "0", "30376", "2000", "1106", "-"],
+            &[
+                "63.1", "91.4", "-", "-", "0", "0", "30376", "2000", "155.4", "1106", "-",
+            ],
             true,
         ), // r=0: no readers ran
         (
-            &["-", "-", "-", "0", "2", "30376", "1800", "990", "-"],
+            &[
+                "-", "-", "-", "-", "0", "2", "30376", "1800", "-", "990", "-",
+            ],
             true,
         ), // the bench died; the lands it got through still divide
         (
-            &["63.1", "-", "115", "0", "0", "30376", "2000", "1106", "-"],
+            &[
+                "63.1", "91.4", "-", "115", "0", "0", "30376", "2000", "155.4", "1106", "-",
+            ],
             false,
         ), // half-filled: never
         (
             &[
-                "63.1", "70", "115", "0", "0", "30376", "2000", "1106", "1402",
-            ],
-            true,
-        ), // a live postgres cell: both growth columns
-        (
-            &[
-                "63.1", "70", "115", "0", "0", "30376", "2000", "nonsense", "-",
+                "63.1", "91.4", "70", "115", "0", "0", "30376", "2000", "11.4", "nonsense", "-",
             ],
             false,
         ), // a growth column that is neither number nor "-": never
     ];
     for (cells, accepts) in shapes {
-        let mut row: Vec<String> = vec!["sqlite".into(), "2".into(), "0".into()];
+        let mut row: Vec<String> = vec!["postgres".into(), "2".into(), "0".into()];
         row.extend(cells.iter().map(ToString::to_string));
         let checked = std::panic::catch_unwind(|| check_row(&row));
         assert_eq!(checked.is_ok(), accepts, "the rule disagrees about {row:?}");
     }
+}
+
+#[test]
+fn the_caption_pins_the_filesystem_row() {
+    let doc = std::fs::read_to_string(Path::new(DOC)).expect("docs/operations.md exists");
+    let section = capacity_section(&doc);
+    assert!(
+        section.contains("| Filesystem | the filesystem the run measured"),
+        "the caption omits the filesystem row the machine.txt artifact fills"
+    );
 }
 
 #[test]
@@ -269,7 +289,9 @@ fn the_footer_names_a_commit_that_exists() {
         panic!("the capacity table has numbers but the footer names no commit");
     };
     // A shallow checkout (a PR's) may not carry the object; the
-    // capacity run's clone is full, and there the commit must resolve.
+    // capacity run's clone is full, and the docs-tests job checks out
+    // with a full history too, so the check below runs there instead
+    // of skipping on a shallow clone.
     let shallow = match Command::new("git")
         .args(["rev-parse", "--is-shallow-repository"])
         .current_dir(repo_dir())
@@ -281,11 +303,19 @@ fn the_footer_names_a_commit_that_exists() {
     if shallow != "false" {
         return;
     }
+    // The commit must exist AND be reachable from origin/main: a
+    // commit of a side branch exists in a full clone (refs/pull keeps
+    // it) but is not a commit of main, and the table claims to
+    // measure main's code. The bench's full checkout carries
+    // origin/main, so the claim is checkable where the table is made.
     let ok = Command::new("git")
-        .args(["cat-file", "-e", &format!("{hex}^{{commit}}")])
+        .args(["merge-base", "--is-ancestor", hex, "origin/main"])
         .current_dir(repo_dir())
         .status()
         .expect("git runs")
         .success();
-    assert!(ok, "the commit the capacity table names does not exist");
+    assert!(
+        ok,
+        "the commit the capacity table names is not an ancestor of origin/main"
+    );
 }

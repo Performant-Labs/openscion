@@ -84,6 +84,39 @@ groups:
           response: >-
             Writes fail soon (docs/operations.md#disk-full); restore
             from a backup (section 3) when fsck reports damage.
+      - alert: FreeSpaceSampleStuck
+        expr: scion_data_free_sample_age_seconds > 90
+        for: 5m
+        labels:
+          severity: high
+        annotations:
+          response: >-
+            The free-space poll's statvfs has not answered for three poll
+            periods (docs/operations.md#a-stuck-free-space-sample): the
+            disk and inode alerts are reading stale numbers. Check the
+            filesystem that holds the data directory (a lost network
+            mount, a suspended device) and restore it; the free values
+            resume when a sample lands.
+      - alert: InodesLow
+        expr: scion_data_free_inodes < 100000
+        for: 15m
+        labels:
+          severity: high
+        annotations:
+          response: >-
+            The filesystem that holds the data directory is under 10% of
+            the inode headroom one blob per inode needs
+            (docs/operations.md#the-inode-budget). Stop creating repos
+            and give the store more inodes before new blobs fail.
+      - alert: InodesCritical
+        expr: scion_data_free_inodes < 10000
+        for: 5m
+        labels:
+          severity: critical
+        annotations:
+          response: >-
+            New blobs fail soon (docs/operations.md#the-inode-budget).
+            Stop writes and move stores or grow the filesystem now.
       - alert: BlobSyncSlow
         expr: >-
           sum(rate(scion_blob_sync_seconds_sum[10m]))
@@ -192,6 +225,52 @@ groups:
             check CacheDown and the tier's memory caps (--max-bytes,
             --snapshot-bytes), and raise or restart it
             (docs/operations.md#tier-miss-rate).
+  - name: store
+    rules:
+      - alert: BlobCount70
+        expr: scion_blob_ceiling_share > 0.70
+        for: 15m
+        labels:
+          severity: medium
+        annotations:
+          response: >-
+            The store holds 70% of the 1,000,000 blobs
+            docs/support.md supports. fsck stays fast for now; watch
+            the trend (docs/operations.md section 6).
+      - alert: BlobCount85
+        expr: scion_blob_ceiling_share > 0.85
+        for: 15m
+        labels:
+          severity: high
+        annotations:
+          response: >-
+            The store holds 85% of the supported blob count. Give new
+            repos a second store before the walks grow; there is no
+            tool to move existing repos between stores yet
+            (docs/operations.md section 6).
+      - alert: BlobCount100
+        expr: scion_blob_ceiling_share > 1.0
+        for: 15m
+        labels:
+          severity: critical
+        annotations:
+          response: >-
+            The store holds more blobs than docs/support.md supports.
+            The walk is seconds today and grows past them; give new
+            repos a second store now (docs/operations.md section 6).
+      - alert: AuditReopenFailing
+        expr: scion_audit_reopen_failing == 1
+        for: 15m
+        labels:
+          severity: high
+        annotations:
+          response: >-
+            A SIGHUP's reopen of the audit file was refused and no later
+            signal has succeeded: the rotation silently stopped and the
+            renamed file grows. Fix what the reopen's error names (a
+            symlink at the path, an unwritable directory, a full disk)
+            and signal again (docs/operations.md section 5, the audit
+            log's rotation).
   - name: gc
     rules:
       - alert: GcStale

@@ -15,9 +15,9 @@ use std::collections::BTreeSet;
 use scion_core::{BlobId, Changeset, ChangesetId, RepoPath};
 
 use crate::backend::Backend;
-use crate::db;
 use crate::deadline::Deadline;
 use crate::error::{Error, Result};
+use crate::meta as db;
 use crate::meta::Meta as _;
 use crate::meta::{MetaTx, RepoId};
 use crate::store::{BlobStatus, Upload};
@@ -64,7 +64,9 @@ impl Park {
 
     /// Parks the caller while the park file of `id` exists. The ceiling
     /// bounds a park nobody lifts: it fails the holder, not the store.
-    fn park(&self, id: &BlobId) {
+    pub(crate) fn park(&self, id: impl std::fmt::Display) {
+        // A path-shaped id names a flat file: the separator comes out.
+        let id = id.to_string().replace('/', "_");
         let root = self
             .root
             .lock()
@@ -90,6 +92,13 @@ impl Park {
 /// [`create_changeset`], keyed by the changeset's first put's blob.
 #[cfg(test)]
 pub(crate) static PARK_CREATE: Park = Park {
+    root: std::sync::Mutex::new(None),
+};
+
+/// The park inside the tree build ([`crate::tree::apply`]), at the end
+/// of a put's path: a test holds the caller between two paths' checks.
+#[cfg(test)]
+pub(crate) static PARK_APPLY: Park = Park {
     root: std::sync::Mutex::new(None),
 };
 
@@ -149,13 +158,36 @@ pub fn create_changeset(
     // while the park file of its first put's blob exists.
     #[cfg(test)]
     if let Some((_, blob)) = db::puts(&cs).next() {
-        PARK_CREATE.park(&blob);
+        PARK_CREATE.park(blob);
     }
     // See `tree::store_changeset`. The write's flush covers these steps.
-    tree::fill_root_tree(store, repo_id, parent)?;
+    // The fill stops at the call's deadline, as the land's does: a call
+    // that gave up leaves the committed steps, and the next create or
+    // land resumes from them instead of running to the end.
+    tree::fill_root_tree_by(store, repo_id, parent, deadline)?;
+    // The reads the write transaction would run, run here first, on a
+    // reader: the derived values of the parents and the changeset, the
+    // stored trees on the changed paths, and the history node the build
+    // reads first. Every row is committed - the parent's own transaction
+    // wrote it - and content-addressed or written once at its own
+    // changeset's settle, so a pre-transaction answer cannot be stale; a
+    // miss re-reads in the transaction. The generation rides no pre-read:
+    // the transaction reads the generation itself (the insert's own
+    // read), so the pre-read carries none.
+    let pre = store.read(|c| tree::pre_read(c, repo_id, &cs))?;
     store.write(|c| {
-        let repo_id = check_parent(c, repo, parent)?;
-        if c.has_changeset(repo_id, id)? {
+        // The rules re-checked inside the transaction, one statement for
+        // the repo and both membership questions: the parent's, and the
+        // retry's (a stored changeset of the same id).
+        let Some((repo_id, membership)) = c.repo_and_membership(repo, &[parent, id])? else {
+            return Err(Error::NotFound(format!("repo {repo:?}")));
+        };
+        if !membership[0] {
+            return Err(Error::InvalidArgument(format!(
+                "parent {parent} is not in repo {repo:?}"
+            )));
+        }
+        if membership[1] {
             // A retry. Its tree was checked and recorded the first time.
             return Ok(id);
         }
@@ -175,7 +207,15 @@ pub fn create_changeset(
                 return Err(bad_blob(blob, path, "is not stored", repo));
             }
         }
-        tree::store_changeset(c, repo_id, &cs, &mut tree::lens_from(&lens)).map(|(id, _)| id)
+        tree::store_changeset_within(
+            c,
+            repo_id,
+            &cs,
+            &mut tree::lens_from(&lens),
+            deadline,
+            Some(pre),
+        )
+        .map(|(id, _)| id)
     })
 }
 
@@ -207,7 +247,7 @@ pub fn put_blob(store: &Backend, repo: RepoId, upload: Upload) -> Result<BlobId>
     // The test seam of the collector race: the caller parks here, after
     // the read answered and before the row question is settled.
     #[cfg(test)]
-    PARK_PUT.park(&id);
+    PARK_PUT.park(id);
     store.blobs().put_upload(upload, member)?;
     // The upsert runs even when the read said the row is there: the
     // collector's prune may have taken the row between the read and
@@ -328,7 +368,7 @@ fn check_blobs(
         let problem = match blobs.keep(blob)? {
             BlobStatus::Valid => {
                 #[cfg(test)]
-                PARK_CHECK.park(&blob);
+                PARK_CHECK.park(blob);
                 lens.insert(blob, store.blobs().size(blob)? as u64);
                 continue;
             }
@@ -344,7 +384,7 @@ fn check_blobs(
 #[cfg(test)]
 mod tests {
     use crate::backend::Backend;
-    use crate::store::Store;
+    use crate::pg::damage;
     use std::collections::BTreeMap;
 
     use scion_core::{FileState, GitOid, IdentityTime};
@@ -376,8 +416,8 @@ mod tests {
 
     /// A store with repo `main` and an empty root changeset in it.
     fn store_with_root() -> (tempfile::TempDir, Backend, ChangesetId) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
         let root = store
             .write(|c| {
                 let repo = c.create_repo("main")?;
@@ -444,6 +484,7 @@ mod tests {
     #[test]
     fn an_upload_keeps_a_stored_copy_only_for_a_blob_of_its_repo() {
         use std::os::unix::fs::MetadataExt as _;
+        let _slot = damage::slot();
         let (_dir, store, _root) = store_with_root();
         let (main, other) = (repo(&store, "main"), repo(&store, "other"));
         let inode = |id| {
@@ -464,6 +505,7 @@ mod tests {
 
     #[test]
     fn an_upload_shares_one_full_flush_with_its_row() {
+        let _slot = damage::slot();
         let (_dir, store, _root) = store_with_root();
         let main = repo(&store, "main");
         let before = store.blobs().full_flushes();
@@ -480,6 +522,7 @@ mod tests {
 
     #[test]
     fn a_blob_of_another_repo_is_refused_before_it_is_read() {
+        let _slot = damage::slot();
         let (_dir, store, root) = store_with_root();
         let secret = upload(&store, repo(&store, "other"), b"secret");
         let never = BlobId::of(b"stored nowhere");
@@ -502,6 +545,7 @@ mod tests {
 
     #[test]
     fn a_blob_of_another_repo_fails_the_changeset_before_any_blob_is_read() {
+        let _slot = damage::slot();
         let (_dir, store, root) = store_with_root();
         let theirs = upload(&store, repo(&store, "other"), b"theirs");
         let mine = upload(&store, repo(&store, "main"), b"mine");
@@ -515,6 +559,7 @@ mod tests {
 
     #[test]
     fn a_gitlink_names_no_blob_whatever_its_bytes() {
+        let _slot = damage::slot();
         let (_dir, store, root) = store_with_root();
         let theirs = upload(&store, repo(&store, "other"), b"theirs");
         let module = FileState::Gitlink {
@@ -540,6 +585,7 @@ mod tests {
 
     #[test]
     fn a_changeset_makes_its_blobs_durable_before_it_commits() {
+        let _slot = damage::slot();
         let (_dir, store, root) = store_with_root();
         // Backendd by an upload that never synced.
         let mut upload = store.blobs().batch();
@@ -549,16 +595,19 @@ mod tests {
 
         let before = store.blobs().full_flushes();
         create_changeset(&store, "main", &child(root, &[("f", blob)]), &later()).unwrap();
-        // One flush for the blob before the commit, and one for the commit
-        // where a plain fsync leaves it in the drive cache.
-        assert_eq!(
-            store.blobs().full_flushes() - before,
-            1 + u64::from(FSYNC_LEAVES_DRIVE_CACHE)
-        );
+        // One flush for the blob before the commit, and one for the
+        // commit where a plain fsync leaves it in the drive cache.
+        //
+        // The one flush before the commit is already a full flush where
+        // the drive cache needs it: pg.rs's flush calls blobs.full_flush()
+        // under FSYNC_LEAVES_DRIVE_CACHE, and the commit's own durability
+        // is Postgres's (synchronous_commit=on, checked at open).
+        assert_eq!(store.blobs().full_flushes() - before, 1);
     }
 
     #[test]
     fn a_parent_without_a_root_tree_is_derived_in_steps_before_the_write() {
+        let _slot = damage::slot();
         let (_dir, store, root) = store_with_root();
         // Changesets without root trees, as after a version bump of the kind.
         let tip = store
@@ -576,7 +625,61 @@ mod tests {
     }
 
     #[test]
+    fn a_create_whose_deadline_expires_stops_at_the_fills_deadline() {
+        let _slot = damage::slot();
+        let (_dir, store, root) = store_with_root();
+        // Changesets without root trees, as after a version bump of the kind.
+        let tip = store
+            .write(|c| {
+                let repo = c.repo_id("main")?;
+                (0..4).try_fold(root, |tip, _| {
+                    c.insert_changeset(repo, &changeset(vec![tip]))
+                })
+            })
+            .unwrap();
+        let blob = upload(&store, repo(&store, "main"), b"fill\n");
+        let bytes = child(tip, &[("f", blob)]);
+        let commits = store.commits();
+        // The create parks between its file check and the fill; the test
+        // expires the deadline while it sits there, so the fill's own
+        // check is the first to see it.
+        let hooks = crate::test_support::private_tempdir();
+        PARK_CREATE.arm(hooks.path());
+        std::fs::write(hooks.path().join(format!("park-{blob}")), b"").unwrap();
+        let deadline = later();
+        let held = deadline.clone();
+        let writer = store.clone();
+        let created = std::thread::spawn(move || create_changeset(&writer, "main", &bytes, &held));
+        let give_up = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        while !hooks.path().join(format!("parked-{blob}")).exists() {
+            assert!(
+                std::time::Instant::now() < give_up,
+                "the create never parked before its fill"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(5));
+        }
+        deadline.test_expire();
+        std::fs::remove_file(hooks.path().join(format!("park-{blob}"))).unwrap();
+        let answer = created.join().expect("the create's thread answers");
+        PARK_CREATE.lift();
+        assert!(
+            matches!(answer, Err(crate::Error::DeadlineExceeded(_))),
+            "the fill's deadline stops the create: {answer:?}"
+        );
+        assert_eq!(
+            store.commits(),
+            commits,
+            "the fill ran past its deadline and did its work anyway"
+        );
+        // The retry create lands: the fill's steps resume under a fresh
+        // deadline, then the write commits.
+        create_changeset(&store, "main", &child(tip, &[("f", blob)]), &later()).unwrap();
+        assert_eq!(store.commits() - commits, crate::derived::steps(5) + 1);
+    }
+
+    #[test]
     fn a_blob_that_many_paths_name_is_read_once() {
+        let _slot = damage::slot();
         let (_dir, store, root) = store_with_root();
         let blob = upload(&store, repo(&store, "main"), b"same");
         let paths: Vec<String> = (0..100).map(|i| format!("f{i}")).collect();
@@ -588,6 +691,7 @@ mod tests {
 
     #[test]
     fn a_missing_repo_or_parent_fails_before_any_blob_is_read() {
+        let _slot = damage::slot();
         let (_dir, store, root) = store_with_root();
         let blob = store.blobs().put(b"new").unwrap();
         let before = store.blobs().verifies();
@@ -606,6 +710,7 @@ mod tests {
 
     #[test]
     fn the_error_names_the_first_path_whose_blob_is_missing() {
+        let _slot = damage::slot();
         let (_dir, store, root) = store_with_root();
         // Path order is the reverse of blob ID order.
         let (x, y) = (BlobId::of(b"x"), BlobId::of(b"y"));

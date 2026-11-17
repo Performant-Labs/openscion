@@ -82,7 +82,7 @@ fn regular(content: BlobId) -> FileState {
 /// A store whose repo has a root changeset with `README`, on `main` and
 /// on `dev`.
 fn store() -> (tempfile::TempDir, Backend, ChangesetId) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let store = Backend::open_test(dir.path()).unwrap();
     let blob = store.blobs().put(b"# hello\n").unwrap();
     let root = store
@@ -161,6 +161,7 @@ async fn serve(store: &Backend, dir: &std::path::Path) -> (Stop, String) {
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::new(Metrics::default()),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         Some(Arc::new(scion_server::Keys::generate())),
         async {

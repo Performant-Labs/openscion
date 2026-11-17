@@ -22,13 +22,9 @@ use scion_proto::v1::BlameRequest;
 use scion_proto::v1::LogRequest;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_server::Metrics;
-use scion_server::test_support::backend::from_store;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::test_support::tree;
-use scion_server::{
-    Backend,
-    test_support::{service, store::Store},
-};
+use scion_server::{Backend, test_support::service};
 use tonic::codec::Streaming;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -46,8 +42,8 @@ fn chain(
     count: usize,
     name_len: usize,
 ) -> (tempfile::TempDir, Backend, Vec<scion_core::ChangesetId>) {
-    let dir = tempfile::tempdir().unwrap();
-    let store = from_store(Store::open(dir.path()).unwrap());
+    let dir = scion_server::test_support::private_tempdir();
+    let store = Backend::open_test(dir.path()).unwrap();
     let ids = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -100,6 +96,7 @@ async fn serve(store: Backend, dir: &std::path::Path, limits: Limits) -> String 
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::new(Metrics::default()),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         None,
         std::future::pending(),
@@ -182,6 +179,29 @@ impl<'a> MakeWriter<'a> for Captured {
     }
 }
 
+/// A wall-clock watchdog the paused-clock tests cannot stop: the test
+/// disarms it when the close lands, and if the close never lands the
+/// watchdog ends the run with its own message, instead of the hang a
+/// never-closing connection would be on the paused clock.
+fn close_watchdog(seconds: u64) -> std::sync::mpsc::Sender<()> {
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+    std::thread::spawn(move || {
+        // Only a real timeout may end the run: Disconnected (the test
+        // dropped the sender - a panic, an assert, an early return)
+        // means the run already ended, and the watchdog has nothing to
+        // add. Both other outcomes end silently.
+        if let Err(std::sync::mpsc::RecvTimeoutError::Timeout) =
+            rx.recv_timeout(std::time::Duration::from_secs(seconds))
+        {
+            eprintln!(
+                "the stalled connection was never closed within {seconds} s: the stall cap never fired"
+            );
+            std::process::exit(101);
+        }
+    });
+    tx
+}
+
 /// the reply's producer stops at its stall, and the stalled bytes go on the
 /// connection's count. Past `--max-stalled-bytes` the connection closes, so
 /// the stalled stream ends with the transport error. The clock is paused
@@ -220,8 +240,12 @@ async fn a_stalled_log_reply_is_counted_and_closes_the_connection() {
     // The count is over the cap: the connection's read side failed, and
     // hyper closed the connection, so the stalled stream ends with the
     // transport error. A clean end would mean the reply flowed, and
-    // nothing was counted.
+    // nothing was counted. The watchdog bounds the wait in wall time the
+    // paused clock cannot stop: a connection that never closes fails the
+    // run with its own message instead of hanging the job.
+    let watchdog = close_watchdog(60);
     let end = reply.message().await;
+    let _ = watchdog.send(());
     assert!(end.is_err(), "the stalled reply was not cut off: {end:?}");
 
     // The close notice names the connection's peer, so the runbook's
@@ -446,8 +470,12 @@ async fn a_stalled_blame_reply_is_counted_and_closes_the_connection() {
     // The count is over the cap: the connection's read side failed, and
     // hyper closed the connection, so the stalled stream ends with the
     // transport error. A clean end would mean the reply flowed, and
-    // nothing was counted.
+    // nothing was counted. The watchdog bounds the wait in wall time the
+    // paused clock cannot stop: a connection that never closes fails the
+    // run with its own message instead of hanging the job.
+    let watchdog = close_watchdog(60);
     let end = reply.message().await;
+    let _ = watchdog.send(());
     assert!(end.is_err(), "the stalled reply was not cut off: {end:?}");
 
     // The close notice names the connection's peer, so the runbook's

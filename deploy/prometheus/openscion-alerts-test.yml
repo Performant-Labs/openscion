@@ -242,6 +242,108 @@ tests:
         alertname: DiskFull
         exp_alerts: []
 
+  # A10b FreeSpaceSampleStuck: an age above 90 s fires after its 5m
+  # for; an age below does not.
+  - interval: 1m
+    input_series:
+      - series: "scion_data_free_sample_age_seconds"
+        values: "100+0x20"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: FreeSpaceSampleStuck
+        exp_alerts:
+          - exp_labels:
+              severity: high
+            exp_annotations:
+              response: >-
+                The free-space poll's statvfs has not answered for three poll
+                periods (docs/operations.md#a-stuck-free-space-sample): the
+                disk and inode alerts are reading stale numbers. Check the
+                filesystem that holds the data directory (a lost network
+                mount, a suspended device) and restore it; the free values
+                resume when a sample lands.
+  - interval: 1m
+    input_series:
+      - series: "scion_data_free_sample_age_seconds"
+        values: "60+0x20"
+    alert_rule_test:
+      - eval_time: 6m
+        alertname: FreeSpaceSampleStuck
+        exp_alerts: []
+
+  # A10b's boot case: the series exists before any sample lands, and a
+  # rising age from boot (the first stat never answered) fires the
+  # same alert once it crosses the threshold and holds.
+  - interval: 1m
+    input_series:
+      - series: "scion_data_free_sample_age_seconds"
+        values: "0+30x20"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: FreeSpaceSampleStuck
+        exp_alerts:
+          - exp_labels:
+              severity: high
+            exp_annotations:
+              response: >-
+                The free-space poll's statvfs has not answered for three poll
+                periods (docs/operations.md#a-stuck-free-space-sample): the
+                disk and inode alerts are reading stale numbers. Check the
+                filesystem that holds the data directory (a lost network
+                mount, a suspended device) and restore it; the free values
+                resume when a sample lands.
+
+  # A11 InodesLow: under 100,000 fires after its 15m for; just above
+  # 100,000 does not.
+  - interval: 1m
+    input_series:
+      - series: "scion_data_free_inodes"
+        values: "90000+0x20"
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: InodesLow
+        exp_alerts:
+          - exp_labels:
+              severity: high
+            exp_annotations:
+              response: >-
+                The filesystem that holds the data directory is under 10% of
+                the inode headroom one blob per inode needs
+                (docs/operations.md#the-inode-budget). Stop creating repos
+                and give the store more inodes before new blobs fail.
+  - interval: 1m
+    input_series:
+      - series: "scion_data_free_inodes"
+        values: "110000+0x20"
+    alert_rule_test:
+      - eval_time: 16m
+        alertname: InodesLow
+        exp_alerts: []
+
+  # A12 InodesCritical: under 10,000 fires; just above does not.
+  - interval: 1m
+    input_series:
+      - series: "scion_data_free_inodes"
+        values: "9000+0x20"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: InodesCritical
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              response: >-
+                New blobs fail soon (docs/operations.md#the-inode-budget).
+                Stop writes and move stores or grow the filesystem now.
+  - interval: 1m
+    input_series:
+      - series: "scion_data_free_inodes"
+        values: "11000+0x20"
+    alert_rule_test:
+      - eval_time: 10m
+        alertname: InodesCritical
+        exp_alerts: []
+
   # A10 BlobSyncSlow: a mean fsync of exactly 2 s must not fire; 5 s
   # must.
   - interval: 1m
@@ -537,3 +639,117 @@ tests:
                 During a key rotation, check the tiers carry both
                 public keys before the old one is dropped
                 (docs/operations.md section 2).
+  # S1 BlobCount70: the share crosses 0.70 at 5m, fires after 15m more.
+  - interval: 1m
+    input_series:
+      - series: 'scion_blob_ceiling_share'
+        values: "0.69 0.69 0.69 0.69 0.69 0.70 0.71 0.71 0.71 0.71 0.71 0.71 0.71 0.71 0.71 0.71 0.71 0.71 0.71 0.71 0.71"
+    alert_rule_test:
+      - eval_time: 19m
+        alertname: BlobCount70
+        exp_alerts: []
+      - eval_time: 21m
+        alertname: BlobCount70
+        exp_alerts:
+          - exp_labels:
+              severity: medium
+            exp_annotations:
+              response: >-
+                The store holds 70% of the 1,000,000 blobs
+                docs/support.md supports. fsck stays fast for now;
+                watch the trend (docs/operations.md section 6).
+
+  # S2 BlobCount85: the share crosses 0.85 at 5m, fires after 15m more.
+  - interval: 1m
+    input_series:
+      - series: 'scion_blob_ceiling_share'
+        values: "0.84 0.84 0.84 0.84 0.84 0.85 0.86 0.86 0.86 0.86 0.86 0.86 0.86 0.86 0.86 0.86 0.86 0.86 0.86 0.86 0.86"
+    alert_rule_test:
+      - eval_time: 19m
+        alertname: BlobCount85
+        exp_alerts: []
+      - eval_time: 21m
+        alertname: BlobCount85
+        exp_alerts:
+          - exp_labels:
+              severity: high
+            exp_annotations:
+              response: >-
+                The store holds 85% of the supported blob count. Give
+                new repos a second store before the walks grow; there
+                is no tool to move existing repos between stores yet
+                (docs/operations.md section 6).
+
+  # S3 BlobCount100: the share crosses 1.0 at 5m, fires after 15m more.
+  - interval: 1m
+    input_series:
+      - series: 'scion_blob_ceiling_share'
+        values: "0.99 0.99 0.99 0.99 0.99 1.00 1.01 1.01 1.01 1.01 1.01 1.01 1.01 1.01 1.01 1.01 1.01 1.01 1.01 1.01 1.01"
+    alert_rule_test:
+      - eval_time: 19m
+        alertname: BlobCount100
+        exp_alerts: []
+      - eval_time: 21m
+        alertname: BlobCount100
+        exp_alerts:
+          - exp_labels:
+              severity: critical
+            exp_annotations:
+              response: >-
+                The store holds more blobs than docs/support.md
+                supports. The walk is seconds today and grows past
+                them; give new repos a second store now
+                (docs/operations.md section 6).
+
+  # A4 AuditReopenFailing: a month of successful rotations, then the
+  # gauge flips to 1 at 20m and stays - fires after 15m more. The case
+  # that catches a ratio-of-totals rule: the counters alone would never
+  # fire after earlier successes.
+  - interval: 1m
+    input_series:
+      - series: 'scion_audit_reopens_failed_total'
+        values: "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+      - series: 'scion_audit_reopen_failing'
+        values: "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1 1"
+    alert_rule_test:
+      - eval_time: 22m
+        alertname: AuditReopenFailing
+        exp_alerts: []
+      - eval_time: 38m
+        alertname: AuditReopenFailing
+        exp_alerts:
+          - exp_labels:
+              severity: high
+            exp_annotations:
+              response: >-
+                A SIGHUP's reopen of the audit file was refused and no
+                later signal has succeeded: the rotation silently
+                stopped and the renamed file grows. Fix what the
+                reopen's error names (a symlink at the path, an
+                unwritable directory, a full disk) and signal again
+                (docs/operations.md section 5, the audit log's
+                rotation).
+
+  # A5 AuditReopenFailing: a failure at 5m that the next signal fixed
+  # at 8m - the gauge flips back to 0, the alert never fires.
+  - interval: 1m
+    input_series:
+      - series: 'scion_audit_reopen_failing'
+        values: "0 0 0 0 0 1 1 1 0 0 0 0 0 0 0 0 0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 8m
+        alertname: AuditReopenFailing
+        exp_alerts: []
+      - eval_time: 21m
+        alertname: AuditReopenFailing
+        exp_alerts: []
+
+  # A6 AuditReopenFailing: no failure at all - never fires.
+  - interval: 1m
+    input_series:
+      - series: 'scion_audit_reopen_failing'
+        values: "0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0"
+    alert_rule_test:
+      - eval_time: 21m
+        alertname: AuditReopenFailing
+        exp_alerts: []

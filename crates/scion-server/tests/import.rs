@@ -16,14 +16,13 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use gix::ObjectId;
-use rusqlite::{Connection, params};
 use scion_core::{
     BlobId, Changeset, ChangesetId, Entry, FileEntry, FileState, GitOid, IdentityTime, PathElem,
     RepoPath,
 };
 use scion_server::test_support::auth::Caller;
 use scion_server::test_support::deadline::Deadline;
-use scion_server::test_support::import::{BUSY_TRIES, CHECKS};
+use scion_server::test_support::import::{BUSY_TRIES, CHECKS, ROLLED_CHECKS, TX_CHECKS};
 use scion_server::test_support::land::{LandRequest, LandState, Lands};
 use scion_server::test_support::meta::{Meta as _, MetaTx as _, RefState};
 use scion_server::test_support::{read, tree, write};
@@ -45,7 +44,7 @@ struct Git(TempDir);
 
 impl Git {
     fn init() -> Self {
-        let git = Self(tempfile::tempdir().unwrap());
+        let git = Self(scion_server::test_support::private_tempdir());
         git.run(&["init", "-q", "-b", "main"]);
         git
     }
@@ -170,17 +169,6 @@ struct History {
 
 /// Builds a history that covers every entry kind, file and directory swaps,
 /// deletes, a merge, a submodule and a non-UTF-8 message.
-/// Ends the test with one printed line when it runs on Postgres: it
-/// asserts the data directory's own mechanics, which the Postgres backend
-/// does not have. The PR body lists these tests.
-fn skip_on_postgres(why: &str) -> bool {
-    if Backend::test_is_postgres() {
-        eprintln!("skip on postgres: {why}");
-        return true;
-    }
-    false
-}
-
 fn fixture() -> (Git, History) {
     let git = Git::init();
     git.write("README.md", "hello\n");
@@ -254,6 +242,141 @@ fn fixture() -> (Git, History) {
     (git, history)
 }
 
+/// A git commit whose date is git's written form of an unknown offset
+/// (`-0000`) cannot read back as itself: zero parses to `+0000`. The
+/// import must refuse it, not store history that differs from its
+/// source without saying so. `git commit-tree` normalizes `-0000` to
+/// `+0000`; fast-import writes the date header verbatim.
+/// A zone of five digits (`-010000`) is a shape git never writes: the
+/// minutes hold three digits, the length check refuses it, and the
+/// arithmetic after it would accept the same bytes. The refusal must
+/// fire on the shape alone.
+#[test]
+fn a_five_digit_zone_is_refused() {
+    // fast-import refuses the shape itself, so the fixture is a raw
+    // object: the tree of a real commit, and a committer line whose zone
+    // holds three minute digits.
+    let git = Git::init();
+    let mut stream = Vec::new();
+    writeln!(
+        stream,
+        "commit refs/heads/main\ncommitter B <b@x> 1717000000 +0000\ndata 2\nt\nM 100644 inline f\ndata 2\n1\n"
+    )
+    .unwrap();
+    git.run_with(&["fast-import", "--quiet"], &stream);
+    let tree = git.run(&["rev-parse", "main^{tree}"]);
+    let bad_commit = format!(
+        "tree {tree}\nauthor A <a@x> 1717000000 +0000\ncommitter B <b@x> 1717000000 -010000\n\nt\n"
+    );
+    let bad = String::from_utf8(git.raw(
+        &[
+            "hash-object",
+            "-t",
+            "commit",
+            "-w",
+            "--stdin",
+            "--literally",
+        ],
+        bad_commit.as_bytes(),
+    ))
+    .unwrap()
+    .trim_end()
+    .to_owned();
+    git.run(&["update-ref", "refs/heads/main", &bad]);
+    // git really wrote the malformed zone.
+    assert!(
+        git.raw(&["cat-file", "commit", &bad], b"")
+            .windows(7)
+            .any(|w| w == b"-010000"),
+        "the fixture's commit carries the five-digit zone"
+    );
+
+    let dir = scion_server::test_support::private_tempdir();
+    let store = Backend::open_test_shared(dir.path()).unwrap();
+    let err = try_import(&store, &git, &bad).unwrap_err();
+    assert!(
+        err.to_string().contains("is not a date git can write"),
+        "the refusal names the date: {err}"
+    );
+}
+
+#[test]
+fn an_unknown_timezone_date_is_refused() {
+    let git = Git::init();
+    let mut stream = Vec::new();
+    writeln!(
+        stream,
+        "commit refs/heads/main\ncommitter B <b@x> 1717000000 -0000\ndata 2\nt\nM 100644 inline f\ndata 2\n1\n"
+    )
+    .unwrap();
+    git.run_with(&["fast-import", "--quiet"], &stream);
+    let bad = git.run(&["rev-parse", "main"]);
+    // git really wrote the unknown offset.
+    assert!(
+        git.raw(&["cat-file", "commit", &bad], b"")
+            .windows(5)
+            .any(|w| w == b"-0000"),
+        "the fixture's commit carries -0000"
+    );
+
+    let dir = scion_server::test_support::private_tempdir();
+    let store = Backend::open_test_shared(dir.path()).unwrap();
+    let err = try_import(&store, &git, &bad).unwrap_err();
+    let text = err.to_string();
+    assert!(
+        text.contains("is not a date git can write"),
+        "the refusal names the date: {text}"
+    );
+}
+
+/// A negative zero on the author line takes the same refusal: both
+/// identities ride `identity()`.
+#[test]
+fn an_unknown_timezone_on_the_author_line_is_refused() {
+    let git = Git::init();
+    let mut stream = Vec::new();
+    writeln!(
+        stream,
+        "commit refs/heads/main\nauthor A <a@x> 1717000000 -0000\ncommitter B <b@x> 1717000000 +0000\ndata 2\nt\nM 100644 inline f\ndata 2\n1\n"
+    )
+    .unwrap();
+    git.run_with(&["fast-import", "--quiet"], &stream);
+    let bad = git.run(&["rev-parse", "main"]);
+
+    let dir = scion_server::test_support::private_tempdir();
+    let store = Backend::open_test_shared(dir.path()).unwrap();
+    let err = try_import(&store, &git, &bad).unwrap_err();
+    assert!(
+        err.to_string().contains("is not a date git can write"),
+        "the refusal names the date: {err}"
+    );
+}
+
+/// A real zone with a sign imports: `+0000` and `-0530` both read back
+/// as themselves.
+#[test]
+fn a_signed_zone_imports() {
+    let git = Git::init();
+    let mut stream = Vec::new();
+    writeln!(
+        stream,
+        "commit refs/heads/main\nauthor A <a@x> 1717000000 -0530\ncommitter B <b@x> 1717000000 +0000\ndata 2\nt\nM 100644 inline f\ndata 2\n1\n"
+    )
+    .unwrap();
+    git.run_with(&["fast-import", "--quiet"], &stream);
+    let head = git.run(&["rev-parse", "main"]);
+
+    let dir = scion_server::test_support::private_tempdir();
+    let store = Backend::open_test_shared(dir.path()).unwrap();
+    let report = import(&store, &git, &head);
+    let cs = changeset_of(&store, &head);
+    let repo = store.read(|c| c.repo_id("r")).unwrap();
+    let got = store.read(|c| c.get_changeset(repo, cs)).unwrap();
+    // -0530 is -5 h 30 m.
+    assert_eq!(got.author().tz_offset_minutes(), -330);
+    assert_eq!(report.commits, 1);
+}
+
 fn opts(rev: &str) -> ImportOptions {
     ImportOptions {
         rev: rev.to_owned(),
@@ -263,7 +386,7 @@ fn opts(rev: &str) -> ImportOptions {
 }
 
 fn open_store() -> (TempDir, Backend) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let store = Backend::open_test(dir.path()).unwrap();
     (dir, store)
 }
@@ -295,7 +418,16 @@ fn oid(hex: &str) -> ObjectId {
     ObjectId::from_hex(hex.as_bytes()).unwrap()
 }
 
-fn row_counts(c: &Connection) -> Vec<i64> {
+/// The row counts of the test schema's main tables, read through a
+/// client of the schema, so a repeated import that wrote nothing
+/// cannot pass vacuously.
+fn row_counts(dir: &std::path::Path) -> Vec<i64> {
+    let schema = Backend::test_schema(dir);
+    let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    client
+        .batch_execute(&format!("SET search_path TO {schema}"))
+        .unwrap();
     [
         "changesets",
         "changeset_parents",
@@ -307,10 +439,10 @@ fn row_counts(c: &Connection) -> Vec<i64> {
     ]
     .iter()
     .map(|table| {
-        c.query_row(&format!("SELECT count(*) FROM {table}"), [], |row| {
-            row.get(0)
-        })
-        .unwrap()
+        client
+            .query_one(&format!("SELECT count(*) FROM {table}"), &[])
+            .unwrap()
+            .get::<_, i64>(0)
     })
     .collect()
 }
@@ -321,28 +453,25 @@ fn path(p: &str) -> RepoPath {
 
 /// The root directory entry at `name`.
 fn root_entry(store: &Backend, cs: ChangesetId, name: &str) -> Option<Entry> {
-    read::list_dir(
+    let root = read::root_tree(
         store,
         "r",
         cs,
-        None,
         &Deadline::new(Instant::now() + Duration::from_secs(300)),
     )
-    .unwrap()
-    .entries()
-    .get(&PathElem::new(name).unwrap())
-    .copied()
+    .unwrap();
+    store
+        .read(|c| c.get_tree(root))
+        .unwrap()
+        .entries()
+        .get(&PathElem::new(name).unwrap())
+        .copied()
 }
 
 #[test]
 fn import_matches_git_and_repeats_as_a_no_op() {
-    // Asserts the rows of the data directory's database.
-    if skip_on_postgres("asserts the data directory's mechanics") {
-        return;
-    }
-
     let (git, h) = fixture();
-    let (_dir, store) = open_store();
+    let (dir, store) = open_store();
 
     let report = import(&store, &git, "HEAD");
     assert_eq!(
@@ -353,14 +482,11 @@ fn import_matches_git_and_repeats_as_a_no_op() {
     assert_eq!(report.tip, changeset_of(&store, &h.submodule));
     assert_eq!(store.resolve_ref("r", "main").unwrap(), report.tip);
 
-    let before = store.read(|c| Ok(row_counts(c.sqlite().unwrap()))).unwrap();
+    let before = row_counts(dir.path());
     let again = import(&store, &git, "HEAD");
     assert_eq!((again.commits, again.imported, again.verified), (7, 0, 0));
     assert_eq!(again.tip, report.tip);
-    assert_eq!(
-        store.read(|c| Ok(row_counts(c.sqlite().unwrap()))).unwrap(),
-        before
-    );
+    assert_eq!(row_counts(dir.path()), before);
     let main = store
         .read(|c| {
             let repo = c.repo_id("r")?;
@@ -579,38 +705,49 @@ fn a_path_scion_cannot_store_fails_the_import() {
 
 #[test]
 fn verification_catches_a_tree_that_differs_from_git() {
-    // Asserts the rows of the data directory's database.
-    if skip_on_postgres("asserts the data directory's mechanics") {
-        return;
-    }
-
     let (git, h) = fixture();
-    let (_dir, store) = open_store();
+    let (dir, store) = open_store();
     let first = import(&store, &git, &h.root);
 
     // Corrupt the root commit's derived tree: add a file git does not have.
     // The next commit applies its changes on top, so it inherits the file.
-    store
+    // The row's value is rewritten through the test schema's own client,
+    // the way a torn write would leave it.
+    let repo = store.read(|c| c.repo_id("r")).unwrap();
+    let root = store
+        .read(|c| tree::derive_root_tree(c, repo, first.tip, &mut |_| Ok(0)))
+        .unwrap();
+    let extra = BTreeMap::from([(
+        path("extra.txt"),
+        Some(FileState::Regular {
+            content: scion_core::BlobId::of(b""),
+            executable: false,
+        }),
+    )]);
+    // A write, not a read: the apply no longer writes the trees it
+    // builds (#1004) - the settle's one statement does - so the test
+    // stores them the way the settle does, and the database refuses an
+    // INSERT in a read-only transaction.
+    let bad = store
         .write(|c| {
-            let repo = c.repo_id("r")?;
-            let root = tree::derive_root_tree(c, repo, first.tip, &mut |_| Ok(0))?;
-            let extra = BTreeMap::from([(
-                path("extra.txt"),
-                Some(FileState::Regular {
-                    content: scion_core::BlobId::of(b""),
-                    executable: false,
-                }),
-            )]);
-            let bad = tree::apply(c, Some(root), &extra, &mut |_| Ok(0))?;
-            c.sqlite()
-                .unwrap()
-                .execute(
-                    "UPDATE derived SET value = ?1 WHERE kind = 'root_tree' AND cs = ?2",
-                    params![bad.as_bytes(), first.tip.as_bytes()],
-                )
-                .map_err(scion_server::test_support::error::from_sqlite)?;
-            Ok(())
+            let applied = tree::apply(c, Some(root), &extra, &mut |_| Ok(0))?;
+            c.put_settle_rows(&applied.1, &[], repo, &[])?;
+            Ok(applied.0)
         })
+        .unwrap();
+    let schema = Backend::test_schema(dir.path());
+    let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+    let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
+    client
+        .batch_execute(&format!("SET search_path TO {schema}"))
+        .unwrap();
+    let tip = first.tip.as_bytes().to_vec();
+    let bad = bad.as_bytes().to_vec();
+    client
+        .execute(
+            "UPDATE derived SET value = $1 WHERE kind = 'root_tree' AND cs = $2",
+            &[&bad, &tip],
+        )
         .unwrap();
 
     match try_import(&store, &git, &h.swap) {
@@ -624,14 +761,10 @@ fn verification_catches_a_tree_that_differs_from_git() {
         first.tip,
         "a failed import does not move the ref"
     );
-    let rows: i64 = store
-        .read(|c| {
-            c.sqlite()
-                .unwrap()
-                .query_row("SELECT count(*) FROM git_import", [], |r| r.get(0))
-                .map_err(scion_server::test_support::error::from_sqlite)
-        })
-        .unwrap();
+    let rows: i64 = client
+        .query_one("SELECT count(*) FROM git_import", &[])
+        .unwrap()
+        .get(0);
     assert_eq!(rows, 1, "the failed batch rolled back");
 }
 
@@ -826,16 +959,8 @@ fn criss_cross_merges_import_and_the_ref_moves_only_to_descendants() {
 fn server_process(data: &Path, args: &[&str]) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_scion-server"));
     command.arg("--data").arg(data).args(args);
+    command.env("SCION_TOKEN", "t");
     command.env("RUST_LOG", "warn");
-    command
-}
-
-/// `scion-server import` of `rev` into ref `name` of repo `r`.
-fn import_process(data: &Path, git: &Git, rev: &str, name: &str) -> Command {
-    let mut command = server_process(data, &["import", "--repo", "r", "--rev", rev]);
-    command
-        .args(["--ref", name, "--verify", "10"])
-        .arg(git.path());
     command
 }
 
@@ -845,21 +970,14 @@ fn import_process(data: &Path, git: &Git, rev: &str, name: &str) -> Command {
 /// directory still holds the blobs and the backend marker.
 fn import_process_on_postgres(data: &Path, git: &Git, rev: &str, name: &str) -> Command {
     let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
-    let schema = Backend::test_schema(data).unwrap();
+    let schema = Backend::test_schema(data);
     let sep = if url.contains('?') { '&' } else { '?' };
-    // `--postgres-url` is a flag of the root command, so it goes before
-    // the subcommand.
-    let mut command = server_process(
-        data,
-        &[
-            "--postgres-url",
-            &format!("{url}{sep}options=--search_path%3D{schema}"),
-            "import",
-            "--repo",
-            "r",
-            "--rev",
-            rev,
-        ],
+    // The URL rides the environment (no binary takes a secret as a
+    // flag); its options carry this directory's schema.
+    let mut command = server_process(data, &["import", "--repo", "r", "--rev", rev]);
+    command.env(
+        "SCION_POSTGRES_URL",
+        format!("{url}{sep}options=--search_path%3D{schema}"),
     );
     command
         .args(["--ref", name, "--verify", "10"])
@@ -934,127 +1052,10 @@ fn land(
 }
 
 #[test]
-fn an_import_process_shares_the_data_directory_with_lands() {
-    // Asserts the rows of the data directory's database.
-    if skip_on_postgres("asserts the data directory's mechanics") {
-        return;
-    }
-
-    let git = Git::init();
-    let first = git.fast_commits(0, 1);
-    let tip = git.fast_commits(1, 60);
-    // The server's store and lands; the imports run as other processes.
-    let (dir, store) = open_store();
-    let lands = Lands::default();
-    let data = dir.path();
-    assert_success(&import_process(data, &git, &first, "main").output().unwrap());
-    let start = main_ref(&store).target;
-
-    // A land whose base is not on main builds main's path index at the
-    // start, and leaves main alone.
-    let repo = store.read(|c| c.repo_id("r")).unwrap();
-    let side = Changeset::new(vec![], identity(), None, b"side".to_vec(), BTreeMap::new())
-        .expect("changeset fits the format");
-    let side = store.write(|c| c.insert_changeset(repo, &side)).unwrap();
-    let out = land(&store, &lands, create(&store, side, "s.txt"));
-    assert_eq!(out.state, LandState::Rejected, "{}", out.detail);
-    assert_eq!(main_ref(&store).target, start);
-
-    // The other process moves main forward. The next plan reads the new
-    // head, so the index sees the imported changes.
-    assert_success(&import_process(data, &git, &tip, "main").output().unwrap());
-    let imported = changeset_of(&store, &tip);
-    assert_eq!(main_ref(&store).target, imported);
-    let out = land(&store, &lands, create(&store, start, "g/f5"));
-    assert_eq!(out.state, LandState::Conflict, "{}", out.detail);
-    assert_eq!(out.conflict_paths, [path("g/f5")]);
-    let out = land(&store, &lands, create(&store, start, "mine.txt"));
-    assert_eq!(out.state, LandState::Landed, "{}", out.detail);
-    let mine = out.result.unwrap();
-    let parents = read::get_changeset(&store, "r", mine)
-        .unwrap()
-        .parents()
-        .to_vec();
-    assert_eq!(parents, [imported]);
-
-    // Agents land on main while another process imports more commits into
-    // another ref.
-    let more = git.fast_commits(60, 400);
-    let import = common::spawn_guard::across_spawn(|| {
-        import_process(data, &git, &more, "git/main")
-            .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn()
-    })
-    .unwrap();
-    let done = AtomicBool::new(false);
-    let landed: Vec<ChangesetId> = thread::scope(|scope| {
-        let agents: Vec<_> = (0..4)
-            .map(|agent| {
-                let (store, lands, done) = (&store, &lands, &done);
-                scope.spawn(move || {
-                    let mut landed = Vec::new();
-                    let started = std::time::Instant::now();
-                    while !done.load(Ordering::Relaxed) || landed.is_empty() {
-                        assert!(
-                            started.elapsed() < Duration::from_secs(120),
-                            "an agent's lands never landed"
-                        );
-                        let head = main_ref(store).target;
-                        let cs = create(store, head, &format!("agent{agent}/{}", landed.len()));
-                        let out = land(store, lands, cs);
-                        assert_eq!(out.state, LandState::Landed, "{}", out.detail);
-                        landed.push(out.result.unwrap());
-                    }
-                    landed
-                })
-            })
-            .collect();
-        let out = import.wait_with_output().unwrap();
-        done.store(true, Ordering::Relaxed);
-        assert_success(&out);
-        agents.into_iter().flat_map(|a| a.join().unwrap()).collect()
-    });
-
-    // Every commit is imported, and the other ref points at the tip.
-    let rows: i64 = store
-        .read(|c| {
-            c.sqlite()
-                .unwrap()
-                .query_row("SELECT count(*) FROM git_import", [], |row| row.get(0))
-                .map_err(scion_server::test_support::error::from_sqlite)
-        })
-        .unwrap();
-    assert_eq!(rows, 400);
-    assert_eq!(
-        store.resolve_ref("r", "git/main").unwrap(),
-        changeset_of(&store, &more)
-    );
-    // Main's first-parent history above `mine` is the lands, each once. A
-    // fast machine lands more than one log page (`read::MAX_SCAN`), so walk
-    // the parents.
-    let mut history = Vec::new();
-    let mut at = main_ref(&store).target;
-    while at != mine {
-        assert!(history.len() < landed.len(), "main does not reach {mine}");
-        history.push(at);
-        at = read::get_changeset(&store, "r", at).unwrap().parents()[0];
-    }
-    let mut want = landed;
-    want.sort();
-    history.sort();
-    assert_eq!(history, want);
-}
-
-#[test]
 fn an_import_process_shares_the_postgres_database_with_lands() {
-    // The SQLite twin above asserts the data directory's own mechanics, so
-    // it skips here. This one runs only on Postgres, where the database
-    // sorts its writers out and an import takes no server lock: another
-    // process imports while this test's lands write the same schema.
-    if !Backend::test_is_postgres() {
-        return;
-    }
+    // The database sorts its writers out and an import takes no server
+    // lock: another process imports while this test's lands write the
+    // same schema.
     let git = Git::init();
     let first = git.fast_commits(0, 1);
     let tip = git.fast_commits(1, 60);
@@ -1169,30 +1170,48 @@ fn an_import_process_shares_the_postgres_database_with_lands() {
 
 #[test]
 fn a_second_server_process_is_refused() {
-    if skip_on_postgres("runs the data directory's server, which locks its database") {
-        return;
-    }
     let (dir, _server) = open_store();
-    // On Postgres the second server carries the URL itself: the database
-    // is what is taken, and the refusal comes at its open.
-    let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap_or_default();
-    let extra: &[&str] = if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
-        &["--postgres-url", url.as_str()]
-    } else {
-        &[]
-    };
-    let mut args = vec!["serve", "--token", "t", "--listen", "127.0.0.1:0"];
-    args.extend_from_slice(extra);
-    let out =
-        common::spawn_guard::across_spawn(|| server_process(dir.path(), &args).output()).unwrap();
-    assert!(!out.status.success());
-    let stderr = String::from_utf8_lossy(&out.stderr);
-    let said = if extra.is_empty() {
-        stderr.contains("in use by another server")
-    } else {
-        stderr.contains("another server holds this store")
-    };
-    assert!(said, "{stderr}");
+    // The second server carries the URL itself: the database is what is
+    // taken, and the refusal comes at its open.
+    let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+    let schema = Backend::test_schema(dir.path());
+    let sep = if url.contains('?') { '&' } else { '?' };
+    let url = format!("{url}{sep}options=--search_path%3D{schema}");
+    let args: Vec<&str> = ["serve", "--listen", "127.0.0.1:0"].to_vec();
+    let out = common::spawn_guard::across_spawn(|| {
+        // A serve child held past a bounded wait is killed, not waited
+        // on forever: the refusal exits by itself, and a server that
+        // ever serves fails here instead of hanging the cell.
+        let mut child = server_process(dir.path(), &args)
+            .env("SCION_POSTGRES_URL", &url)
+            .stdout(Stdio::null())
+            .stderr(Stdio::piped())
+            .spawn()
+            .unwrap();
+        let started = std::time::Instant::now();
+        loop {
+            if let Some(status) = child.try_wait().unwrap() {
+                let stderr = child.stderr.take().map_or_else(String::new, |mut s| {
+                    use std::io::Read as _;
+                    let mut text = String::new();
+                    s.read_to_string(&mut text).unwrap_or(0);
+                    text
+                });
+                break (status, stderr);
+            }
+            assert!(
+                started.elapsed() < std::time::Duration::from_secs(30),
+                "the second server neither refused nor served within 30 s"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(10));
+        }
+    });
+    let (status, stderr) = out;
+    assert!(!status.success());
+    assert!(
+        stderr.contains("another server holds this store"),
+        "{stderr}"
+    );
 }
 
 /// Creates the import's repo up front, so the import's first write is a
@@ -1201,89 +1220,46 @@ fn make_repo(store: &Backend) {
     store.write(|c| c.create_repo("r")).unwrap();
 }
 
-/// A store that shares its data directory, so an import keeps its write
-/// transactions short and yields between them.
-fn open_shared_store() -> (tempfile::TempDir, Backend) {
-    let dir = tempfile::tempdir().unwrap();
-    let store = Backend::open_test_shared(dir.path()).unwrap();
-    (dir, store)
-}
-
-/// Takes the store's write lock with another connection and keeps it until
-/// the import's batch has hit the busy database once: the hold starts at a
-/// counted batch boundary, and releases only when a batch retried, so the
-/// batch that began inside the hold provably waited out the lock. Its
-/// writes are idempotent, so the retry is safe. The thread ends on its own;
-/// it commits when the hold is over.
-fn hold_until_a_retry(store: &Backend, dir: &Path, before: u64) {
-    let (held_tx, held_rx) = mpsc::channel();
-    let db = Connection::open(dir.join("scion.db")).unwrap();
-    let watcher = store.clone();
-    thread::spawn(move || {
-        // The lock may be held by a batch of the import; wait for it, then
-        // hold it.
-        db.busy_timeout(Duration::from_secs(30)).unwrap();
-        db.execute_batch("BEGIN IMMEDIATE").unwrap();
-        held_tx.send(()).unwrap();
-        // The import's first write under this hold fails as busy and the
-        // batch retries; the hold ends when that retry is counted.
-        let deadline = Instant::now() + Duration::from_secs(30);
-        while watcher.busy_retries() <= before {
-            assert!(
-                Instant::now() < deadline,
-                "the import never hit the busy lock"
-            );
-            thread::sleep(Duration::from_millis(5));
-        }
-        db.execute_batch("COMMIT").unwrap();
-    });
-    held_rx
-        .recv_timeout(Duration::from_secs(30))
-        .expect("the hold never took the write lock");
-}
-
 #[test]
-fn an_import_batch_waits_out_a_busy_write_lock() {
-    if skip_on_postgres("simulates the data directory's busy write lock") {
-        return;
-    }
+fn the_plan_verifies_every_root_and_merge_and_samples_the_rest() {
     let git = Git::init();
-    let rev = git.fast_commits(0, 3000);
-    let (dir, store) = open_shared_store();
-    // A busy lock fails fast, so the retry is deterministic: the holder
-    // keeps the lock until a batch retried, and the batch runs again whole.
-    store.set_busy_timeout(Duration::from_millis(100));
-    let store = Arc::new(store);
-    let before = store.busy_retries();
-    // The hold starts at a counted batch boundary: the hook runs after the
-    // first batch's commit has ended and returns only once the hold has the
-    // write lock, so the next batch begins inside the hold. A batch is safe
-    // to run again whole.
-    let holds = dir.path().to_path_buf();
-    let hooked = Arc::clone(&store);
-    store.set_after_batch(Some(Box::new(move |batch_no| {
-        if batch_no == 0 {
-            hold_until_a_retry(&hooked, &holds, before);
-        }
-    })));
-    let report = try_import(&store, &git, &rev).unwrap();
-    store.set_after_batch(None);
-    assert_eq!((report.commits, report.imported), (3000, 3000));
-    // The batch that began inside the hold waited out the lock: its try hit
-    // the busy database, and a retry ran it again whole.
-    assert!(
-        store.busy_retries() > before,
-        "no batch ever hit the busy lock"
-    );
+    git.write("one.txt", "one\n");
+    git.commit("root");
+    git.write("two.txt", "two\n");
+    git.commit("one");
+    git.run(&["checkout", "-q", "-b", "side"]);
+    git.write("side.txt", "side\n");
+    git.commit("side");
+    git.run(&["checkout", "-q", "main"]);
+    git.write("three.txt", "three\n");
+    git.commit("two");
+    git.run(&["merge", "-q", "--no-ff", "side", "-m", "merge side"]);
+    let rev = git.head();
+
+    let (_dir, store) = open_store();
+    let report = import_git(
+        &store,
+        "r",
+        git.path(),
+        &ImportOptions {
+            rev: rev.clone(),
+            target_ref: "main".to_owned(),
+            verify_sample: 1,
+        },
+    )
+    .unwrap();
+    // Five commits: a root, a merge and three single-parent commits. The
+    // plan always verifies the root and the merge and samples the rest,
+    // so a sample of one verifies three commits. A merge that fell out of
+    // the always-verify set (or a root that joined the sample) changes
+    // the count.
+    assert_eq!(report.commits, 5);
+    assert_eq!(report.imported, 5);
+    assert_eq!(report.verified, 3);
 }
 
 #[test]
 fn an_import_that_stays_busy_fails_with_the_busy_error() {
-    // Asserts the rows of the data directory's database.
-    if skip_on_postgres("simulates the data directory's busy write lock") {
-        return;
-    }
-
     let git = Git::init();
     let rev = git.fast_commits(0, 60);
     let (_dir, store) = open_store();
@@ -1294,30 +1270,28 @@ fn an_import_that_stays_busy_fails_with_the_busy_error() {
     let error = try_import(&store, &git, &rev).unwrap_err();
     assert!(error.is_busy(), "{error:?}");
     // Nothing was written: the ref is not there, and no changeset is.
-    let refs: i64 = store
-        .read(|c| {
-            c.sqlite()
-                .unwrap()
-                .query_row("SELECT count(*) FROM refs", [], |row| row.get(0))
-                .map_err(scion_server::test_support::error::from_sqlite)
-        })
-        .unwrap();
-    assert_eq!(refs, 0);
-    let cs: i64 = store
-        .read(|c| {
-            c.sqlite()
-                .unwrap()
-                .query_row("SELECT count(*) FROM changesets", [], |row| row.get(0))
-                .map_err(scion_server::test_support::error::from_sqlite)
-        })
-        .unwrap();
-    assert_eq!(cs, 0);
+    // The reads are through the metadata traits, so the same assert runs
+    // on both backends.
+    let repo_id = store.read(|c| c.repo_id("r")).unwrap();
+    assert!(
+        store
+            .read(|c| c.get_ref(repo_id, "main"))
+            .unwrap()
+            .is_none(),
+        "no ref row"
+    );
+    assert!(
+        store
+            .read(|c| c.imported_commits(repo_id))
+            .unwrap()
+            .is_empty(),
+        "no changeset row"
+    );
 }
 
-/// The Postgres hold of a batch boundary: a client of the test schema
-/// takes the changesets table and keeps it until the import's batch has
-/// hit the busy database once, as `hold_until_a_retry` holds the data
-/// directory's write lock on SQLite. The hold starts at a counted batch
+/// The hold of a batch boundary: a client of the test schema takes the
+/// changesets table and keeps it until the import's batch has hit the
+/// busy database once. The hold starts at a counted batch boundary
 /// boundary, and releases only when a batch retried, so the batch that
 /// began inside the hold provably waited out the lock. Its writes are
 /// idempotent, so the retry is safe. The thread ends on its own; it
@@ -1330,13 +1304,7 @@ fn hold_until_a_retry_pg(
 ) {
     let (held_tx, held_rx) = mpsc::channel();
     let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
-    let Some(schema) = Backend::test_schema(dir) else {
-        failures
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .push("no test schema for the hold".to_owned());
-        return;
-    };
+    let schema = Backend::test_schema(dir);
     let watcher = Arc::clone(store);
     let failures = Arc::clone(failures);
     thread::spawn(move || {
@@ -1385,9 +1353,6 @@ fn hold_until_a_retry_pg(
 
 #[test]
 fn an_import_batch_waits_out_a_busy_write_lock_on_postgres() {
-    if !Backend::test_is_postgres() {
-        return;
-    }
     let git = Git::init();
     let rev = git.fast_commits(0, 3000);
     let (dir, store) = open_store();
@@ -1470,9 +1435,6 @@ fn an_import_that_loses_disk_space_fails_and_is_not_retried() {
 
 #[test]
 fn a_rolled_back_import_batch_verifies_again_when_it_reruns() {
-    if skip_on_postgres("counts the import's verification passes, a SQLite test hook") {
-        return;
-    }
     let git = Git::init();
     let rev = git.fast_commits(0, 40);
     // A clean import of the same history checks every commit once; its walk
@@ -1482,6 +1444,8 @@ fn a_rolled_back_import_batch_verifies_again_when_it_reruns() {
     let clean_report = try_import(&clean, &git, &rev).unwrap();
     let one_pass = CHECKS.get();
     CHECKS.with(|checks| checks.set(0));
+    TX_CHECKS.with(|checks| checks.set(0));
+    ROLLED_CHECKS.with(|checks| checks.set(0));
     // The retried import's batch runs whole, checks every commit, and its
     // commit fails as busy. The retry runs the batch again, and the checker
     // reset makes it verify from scratch: every committed changeset was
@@ -1492,11 +1456,27 @@ fn a_rolled_back_import_batch_verifies_again_when_it_reruns() {
     let report = try_import(&store, &git, &rev).unwrap();
     assert_eq!((report.commits, report.imported), (40, 40));
     assert_eq!(report.verified, clean_report.verified);
+    // The plan splits into transactions on the budget (1 s of wall
+    // clock), so which batch holds the injected failure depends on the
+    // machine's speed. The exact total does not: one pass over every
+    // pair, plus the failed batch's own checks again - the count since
+    // the checker reset is exactly that batch's checks, re-run whole by
+    // the retry. Batches whose commits persisted checked once and are
+    // not re-run; a retry that re-verified only part of the failed
+    // batch, or that re-ran a committed one, lands outside.
     let walks = CHECKS.get();
+    let retried = ROLLED_CHECKS.get();
+    // The failed batch had checks, and the reset makes the retry pay
+    // them again: a retry that re-verified nothing ran on the rolled
+    // back transaction's cache, not from scratch.
+    assert!(
+        retried > 0,
+        "the rolled-back batch had checks to run again: {retried}"
+    );
     assert_eq!(
         walks,
-        2 * one_pass,
-        "the checks of the rolled-back batch ran again"
+        one_pass + retried,
+        "the rolled-back batch's checks ran again whole: {walks} = {one_pass} + {retried}"
     );
 }
 

@@ -20,9 +20,11 @@
 //!
 //! Two queries read it, each one node per path part:
 //!
-//! - `Log` with a path (`newest_change`): the newest change of a path
-//!   from a changeset is `last` at the path in that changeset's tree. The
-//!   change before it is `last` in the tree of that change's first parent.
+//! - The log pages with a path, and a blame: the newest change of a
+//!   path from a changeset is `last` at the path in that changeset's
+//!   tree. The change before it is `last` in the tree of that change's
+//!   first parent. Both walk the chain of path histories in windows, one
+//!   statement per [`crate::meta::DERIVED_BATCH`] links.
 //! - The conflict check of a land on an old base (`touched_after`).
 //!   Generations strictly increase along first parents, so on that history
 //!   a path changed after the base exactly when a generation in its entry is
@@ -36,7 +38,7 @@ use scion_core::{Changeset, ChangesetId, FileState, PathElem, RepoPath};
 
 use crate::backend::Backend;
 use crate::deadline::Deadline;
-use crate::derived::{self, Kind};
+use crate::derived::Kind;
 use crate::error::{Error, Result};
 use crate::meta::MetaTx;
 use crate::tree;
@@ -85,13 +87,22 @@ thread_local! {
     /// Nodes read on this thread. Tests use it to bound the reads of a
     /// query.
     pub(crate) static NODE_READS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
-    /// Bytes stored in `history_nodes` on this thread. Tests use it to
-    /// bound the cost of a change.
+    /// Bytes of history nodes stored on this thread. The flush counts
+    /// them once, from the chunks it writes; a deferring write path
+    /// counts nothing when it buffers.
     pub(crate) static NODE_BYTES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     /// The byte cap of one check's row cache. Tests lower it, so that
     /// they reach it.
     pub(crate) static CHECK_NODE_BYTES_CAP: std::cell::Cell<usize> =
         const { std::cell::Cell::new(usize::MAX) };
+}
+
+/// Counts the bytes of history nodes one flush chunk writes. The
+/// flush calls it in test builds only, once per chunk, from the bytes
+/// it already holds; a production flush reports to no one.
+#[cfg(test)]
+pub(crate) fn note_flushed_node_bytes(bytes: usize) {
+    NODE_BYTES.with(|n| n.set(n.get() + bytes));
 }
 
 /// The byte cap of one check's row cache: the same bound a log page's
@@ -370,15 +381,15 @@ impl Edit {
                 .next_back()
                 .or_else(|| index.iter().next())
                 .map(|(first, _)| first.clone())
-                .ok_or_else(|| Error::Corrupt("history: no edited chunk".into()))?;
+                .ok_or_else(|| Error::Internal("history: no edited chunk".into()))?;
             return match self.chunks.get_mut(&first) {
                 Some(entries) => Ok(entries),
-                None => Err(Error::Corrupt("history: no edited chunk".into())),
+                None => Err(Error::Internal("history: no edited chunk".into())),
             };
         }
         self.leaf
             .as_mut()
-            .ok_or_else(|| Error::Corrupt("history: no level".into()))
+            .ok_or_else(|| Error::Internal("history: no level".into()))
     }
 }
 
@@ -516,25 +527,54 @@ fn lookup(c: &mut dyn MetaTx, nodes: &mut Nodes, root: NodeId, path: &RepoPath) 
     Ok(hit)
 }
 
-/// The newest changeset at or below `from`, on its first-parent history,
-/// that changes `path`: the file, or anything below it if it is a
-/// directory. This is the rule of [`crate::read::changes_path`]. `from` has
-/// a value of [`PathHistory`]. Reads at most one node per part of `path`,
-/// and none that `nodes` holds.
+/// The newest changeset the history `root` names for `path`, given the
+/// value already in hand: the walk of a log page or a blame starts from
+/// the values a chain fetch brought, so the values cost no statement of
+/// their own. Reads at most one node per part of `path`, and none that
+/// `nodes` holds.
 ///
 /// # Errors
 ///
-/// [`Error::Corrupt`] if `from` has no value, or a node is missing.
-pub(crate) fn newest_change(
+/// [`Error::Corrupt`] if a node is missing.
+pub(crate) fn newest_change_at(
     c: &mut dyn MetaTx,
     nodes: &mut Nodes,
-    from: ChangesetId,
+    root: NodeId,
     path: &RepoPath,
 ) -> Result<Option<ChangesetId>> {
-    let root = derived::load::<PathHistory>(c, from)?
-        .ok_or_else(|| Error::Corrupt(format!("path history: no value for {from}")))?;
     let hit = lookup(c, nodes, root, path)?;
     Ok(hit.last.map(|last| last.id))
+}
+
+/// The first-parent chain of path-history values that starts at `start`:
+/// up to `limit` links, newest first, each with its value or `None` where
+/// no value is stored. One statement per window. A value that does not
+/// decode is corruption, as [`derived::load`] would report.
+pub(crate) fn chain_values(
+    c: &mut dyn MetaTx,
+    start: ChangesetId,
+    limit: usize,
+) -> Result<Vec<(ChangesetId, Option<NodeId>)>> {
+    // A window is at most the page's MAX_SCAN, far from any wrap.
+    #[allow(clippy::cast_possible_wrap)]
+    let limit = limit as i64;
+    c.get_derived_chain_links(PathHistory::NAME, PathHistory::VERSION, start, limit)?
+        .into_iter()
+        .map(|(cs, value)| {
+            let value = value
+                .map(|bytes| {
+                    PathHistory::decode(&bytes).ok_or_else(|| {
+                        Error::Corrupt(format!(
+                            "derived {} v{} for {cs}",
+                            PathHistory::NAME,
+                            PathHistory::VERSION
+                        ))
+                    })
+                })
+                .transpose();
+            Ok((cs, value?))
+        })
+        .collect()
 }
 
 /// The paths of `paths` that a changeset newer than `base_gen` touched, on
@@ -618,22 +658,13 @@ fn level_root(c: &mut dyn MetaTx, index: BTreeMap<PathElem, NodeId>, cut: &Cut) 
     index_node(c, &index, cut)
 }
 
-/// Stores one row of kind `kind`. Safe to repeat. Counts the bytes that
-/// actually landed in the table, so that a test can bound the cost of a
-/// change: a row whose bytes are already there is stored again for free.
+/// Stores one row of kind `kind`. Safe to repeat.
 fn put_row(c: &mut dyn MetaTx, kind: u8, payload: &[u8]) -> Result<NodeId> {
     let mut body = Vec::with_capacity(payload.len() + 1);
     body.push(kind);
     body.extend(payload);
     let id = NodeId::of(&body);
-    #[cfg(test)]
-    let len = body.len();
-    #[cfg_attr(not(test), allow(unused_variables))]
-    let (_, stored) = c.put_history_node(id, body)?;
-    #[cfg(test)]
-    if stored {
-        NODE_BYTES.with(|n| n.set(n.get() + len));
-    }
+    c.put_history_node(id, body)?;
     Ok(id)
 }
 
@@ -806,16 +837,16 @@ fn take<'a>(bytes: &mut &'a [u8], n: usize) -> Option<&'a [u8]> {
 
 #[cfg(test)]
 mod tests {
-    use crate::db;
+    use crate::pg::CHANGESET_READS;
     use scion_core::{BlobId, FileState, IdentityTime};
 
     use super::*;
     use crate::backend::Backend;
-    use crate::db::testing;
+    use crate::derived;
     use crate::meta::Meta as _;
     use crate::meta::RepoId;
+    use crate::meta::testing;
     use crate::read;
-    use crate::store::Store;
     use crate::write;
 
     fn path(p: &str) -> RepoPath {
@@ -824,6 +855,83 @@ mod tests {
 
     fn later() -> Deadline {
         Deadline::new(std::time::Instant::now() + std::time::Duration::from_secs(600))
+    }
+
+    /// A file put at a directory above the path is a touch: the chain
+    /// makes a/b/c at the base, then replaces the directory a/b with
+    /// the FILE a/b - a/b/c deleted, a/b put, one changeset - well
+    /// after the base. The lookup of a/b/c stops at the file: its hit
+    /// is only the put at the directory above it, never a change of
+    /// a/b/c itself. The land path's conflict check for old bases reads
+    /// exactly this. The mutant that fires only at `above == base_gen`
+    /// never sees a `base_gen` + 5 and reports nothing.
+    #[test]
+    fn a_file_put_at_a_directory_above_touched_the_path() {
+        let (_dir, store, repo) = open();
+        // The base makes a/b/c; then the directory a/b is replaced by
+        // the FILE a/b (a/b/c deleted, a/b put, one changeset). At the
+        // tip, a/b/c does not exist; its hit is only the file put at the
+        // directory above it. A land on the base must see the conflict.
+        let edits: Vec<Edits> = vec![
+            &[("a/b/c", true)][..],
+            &[("z", true)][..],
+            &[("z", true)][..],
+            &[("z", true)][..],
+            &[("a/b/c", false), ("a/b", true)][..],
+        ];
+        let ids = store_chain(&store, repo, None, &edits, true);
+        let base = ids[0];
+        let base_gen = store.read(|c| c.generation(repo, base)).unwrap();
+        let tip = ids[ids.len() - 1];
+        let root = derived::get_by::<PathHistory>(&store, repo, tip, &later()).unwrap();
+        let touched = store
+            .read(|c| touched_after(c, root, &[path("a/b/c")], base_gen, &later()))
+            .unwrap();
+        assert_eq!(
+            touched,
+            [path("a/b/c")],
+            "a/b was made a file after the base"
+        );
+    }
+
+    /// The base changeset's own touch of the path - as the newest
+    /// generation above it, and as the path's last change - is not a
+    /// conflict: `touched_after` reports paths changed strictly after the
+    /// base. The mutants that count the base itself refuse every land
+    /// whose base touched the path.
+    #[test]
+    fn the_base_touching_the_path_is_not_a_conflict() {
+        let (_dir, store, repo) = open();
+        // gen 1 puts the file a/b; gen 2 changes z. The path a/b/c never
+        // exists; the base of the check is gen 1, which put a/b - the
+        // newest generation above a/b/c. Touched_after must report
+        // nothing: the put is AT the floor, not after it.
+        let edits: Vec<Edits> = vec![&[("a/b", true)][..], &[("z", true)][..]];
+        let ids = store_chain(&store, repo, None, &edits, true);
+        let base_gen = store.read(|c| c.generation(repo, ids[0])).unwrap();
+        let tip = ids[1];
+        let root = derived::get_by::<PathHistory>(&store, repo, tip, &later()).unwrap();
+        let touched = store
+            .read(|c| touched_after(c, root, &[path("a/b/c")], base_gen, &later()))
+            .unwrap();
+        assert!(touched.is_empty(), "{touched:?}");
+
+        // gen 2 creates a/b/c, gen 3 changes z. A floor at the gen that
+        // created a/b/c sees nothing after it - the path's own last
+        // change sits AT the floor.
+        let edits: Vec<Edits> = vec![
+            &[("z", true)][..],
+            &[("a/b/c", true)][..],
+            &[("z", true)][..],
+        ];
+        let ids = store_chain(&store, repo, None, &edits, true);
+        let tip = ids[2];
+        let root = derived::get_by::<PathHistory>(&store, repo, tip, &later()).unwrap();
+        let own = store.read(|c| c.generation(repo, ids[1])).unwrap();
+        let touched = store
+            .read(|c| touched_after(c, root, &[path("a/b/c")], own, &later()))
+            .unwrap();
+        assert!(touched.is_empty(), "{touched:?}");
     }
 
     /// A changeset that puts a file with `blob`, or deletes it, at each path.
@@ -848,10 +956,21 @@ mod tests {
         .expect("changeset fits the format")
     }
 
-    /// A new store with repo `r`.
+    /// A new test store with repo `r`.
     fn open() -> (tempfile::TempDir, Backend, RepoId) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
+        let repo = store.write(|c| c.create_repo("r")).unwrap();
+        (dir, store, repo)
+    }
+
+    /// [`open`], with the reader pool the caller names: the proof that
+    /// walks every (path, tip) pair opens with
+    /// [`PROOF_READERS`](crate::test_support::PROOF_READERS), the rest of
+    /// the suite stays at the default of two.
+    fn open_with(readers: usize) -> (tempfile::TempDir, Backend, RepoId) {
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test_with_readers(dir.path(), readers).unwrap();
         let repo = store.write(|c| c.create_repo("r")).unwrap();
         (dir, store, repo)
     }
@@ -918,33 +1037,62 @@ mod tests {
             (parents, edits) in testing::histories(24),
             limit in 1..4_usize,
         ) {
-            let (_dir, store, repo) = open();
+            let (_dir, store, repo) = open_with(crate::test_support::PROOF_READERS);
             // In one transaction: a commit per step would take most of the
             // time.
             let ids = store
                 .write(|c| {
-                    let ids = testing::insert_history(c.sqlite().unwrap(), repo, &parents, &edits)?;
+                    let ids = testing::insert_history(c, repo, &parents, &edits)?;
                     for &tip in &ids {
-                        derived::derive::<PathHistory>(c, repo, tip, &mut crate::tree::lens_none())?;
+                        derived::derive::<PathHistory>(c, repo, tip, &mut crate::tree::lens_none(), None)?;
                     }
                     Ok(ids)
                 })
                 .unwrap();
-            let queried = testing::PATHS.into_iter().chain(["c", "c/a", "a/b/c/d", "z"]);
-            for p in queried {
-                for &tip in &ids {
-                    let mut walked = Vec::new();
-                    let mut next = Some(tip);
-                    while let Some(id) = next {
-                        let cs = store.read(|c| c.get_changeset(repo, id)).unwrap();
-                        if read::changes_path(&cs, &path(p)) {
-                            walked.push(id);
-                        }
-                        next = cs.parents().first().copied();
+            // The oracle's changesets, one read: the walk below runs in
+            // memory, so the case's round trips stay in the product (the
+            // path log) and not in the oracle. A read per step here would
+            // be about four thousand transactions a case, all test cost.
+            let mut stored: HashMap<ChangesetId, Changeset> = HashMap::with_capacity(ids.len());
+            store
+                .read(|c| {
+                    for &id in &ids {
+                        stored.insert(id, c.get_changeset(repo, id)?);
                     }
-                    proptest::prop_assert_eq!(path_log(&store, tip, p, limit), walked, "{}", p);
+                    Ok(())
+                })
+                .unwrap();
+            let queried = testing::PATHS.into_iter().chain(["c", "c/a", "a/b/c/d", "z"]);
+            // Each (path, tip) pair is one independent read: the log and
+            // the in-memory walk share nothing, so the pool serves the
+            // pairs concurrently. A fixed set of workers takes the next
+            // pair from one index (`for_each_item`). A mismatch is
+            // collected, and the case fails below, where proptest can
+            // shrink it.
+            let pairs: Vec<(&str, ChangesetId)> = queried
+                .flat_map(|p| ids.iter().map(move |&tip| (p, tip)))
+                .collect();
+            let failures = std::sync::Mutex::new(Vec::new());
+            crate::test_support::for_each_item(&pairs, crate::test_support::PROOF_READERS, |(p, tip)| {
+                let mut walked = Vec::new();
+                let mut next = Some(*tip);
+                while let Some(id) = next {
+                    let cs = &stored[&id];
+                    if read::changes_path(cs, &path(p)) {
+                        walked.push(id);
+                    }
+                    next = cs.parents().first().copied();
                 }
-            }
+                let got = path_log(&store, *tip, p, limit);
+                if got != walked {
+                    failures
+                        .lock()
+                        .unwrap()
+                        .push(format!("{p} at {tip:?}: got {got:?}, want {walked:?}"));
+                }
+            });
+            let failures = failures.into_inner().unwrap();
+            proptest::prop_assert!(failures.is_empty(), "{:?}", failures);
         }
 
         /// One level built from the same names through two edit orders
@@ -1011,10 +1159,40 @@ mod tests {
         assert!(matches!(page, Err(Error::DeadlineExceeded(_))), "{page:?}");
     }
 
-    /// A `Log` page checks its deadline before its first entry and then
-    /// once per [`read::DEADLINE_EVERY`] entries, with a path and without:
-    /// a check reads the clock, a system call on a host whose clocksource
-    /// has no user-space read.
+    /// A tampered first-parent row that names another repo's changeset
+    /// refuses the page as the corruption it is: the walk follows only
+    /// the rows the repo may see, and a truncated history must not read
+    /// as a whole one. A body against its ID is not the guard here - the
+    /// other repo's body decodes against its own ID.
+    #[test]
+    fn a_tampered_first_parent_refuses_its_log_page() {
+        let _slot = crate::pg::damage::slot();
+        let (_dir, store, repo) = open();
+        let other_repo = store.write(|c| c.create_repo("other")).unwrap();
+        let steps: &[(&str, bool)] = &[("a", true)];
+        let ids = store_chain(&store, repo, None, &[steps; 3], true);
+        let foreign = store_chain(&store, other_repo, None, &[&[("b", true)][..]; 2], true);
+        // The tip's first parent now names a changeset the repo may not
+        // see. The body of the tip still names its own parent, so the
+        // page's per-row checks stay green: only the membership catches
+        // the crossing.
+        crate::pg::damage::redirect_first_parent(&store, ids.last().unwrap(), &foreign[0]).unwrap();
+        let page = read::log_page(&store, "r", *ids.last().unwrap(), None, 10, &later());
+        let Err(Error::Corrupt(marked)) = &page else {
+            panic!("the page refuses a history it cannot follow: {page:?}");
+        };
+        assert!(
+            marked.contains(&format!("changeset {}", ids[2])),
+            "{marked}"
+        );
+        assert!(marked.contains(&format!("{}", foreign[0])), "{marked}");
+    }
+
+    /// A `Log` page with a path checks its deadline before its first
+    /// entry and then once per [`read::DEADLINE_EVERY`] entries: a check
+    /// reads the clock, a system call on a host whose clocksource has no
+    /// user-space read. A page without a path is one statement, so it
+    /// reads the clock once, before that statement.
     #[test]
     fn a_log_page_reads_the_clock_once_per_few_entries() {
         let (_dir, store, repo) = open();
@@ -1022,11 +1200,11 @@ mod tests {
         let ids = store_chain(&store, repo, None, &[steps; 40], true);
         let tip = *ids.last().unwrap();
         let checks = 40_usize.div_ceil(read::DEADLINE_EVERY);
-        for p in [None, Some(path("d/f"))] {
+        for (p, want) in [(None, 1), (Some(path("d/f")), checks)] {
             crate::deadline::CHECKS.set(0);
             let page = read::log_page(&store, "r", tip, p.as_ref(), 40, &later()).unwrap();
             assert_eq!(page.entries.len(), 40, "{p:?}");
-            assert_eq!(crate::deadline::CHECKS.get(), checks, "{p:?}");
+            assert_eq!(crate::deadline::CHECKS.get(), want, "{p:?}");
         }
     }
 
@@ -1155,7 +1333,7 @@ mod tests {
         let tip = *ids.last().unwrap();
         let changed: Vec<ChangesetId> = ids.iter().copied().step_by(3).rev().collect();
 
-        db::CHANGESET_READS.set(0);
+        CHANGESET_READS.set(0);
         NODE_READS.set(0);
         let page = read::log_page(&store, "r", tip, Some(&path("d/f")), usize::MAX, &later());
         let page = page.unwrap();
@@ -1164,7 +1342,7 @@ mod tests {
         assert_eq!(found, changed[..read::MAX_SCAN]);
         assert_eq!(page.next, Some(ids[2]), "the parent of the last entry");
         // One changeset per entry, and one node per part of the path.
-        assert_eq!(db::CHANGESET_READS.get(), read::MAX_SCAN);
+        assert_eq!(CHANGESET_READS.get(), read::MAX_SCAN);
         assert_eq!(NODE_READS.get(), 2 * read::MAX_SCAN);
 
         let rest = read::log_page(
@@ -1227,6 +1405,9 @@ mod tests {
             &[&first[..], &[("d/f50000", true)]],
             true,
         );
+        // The level's own node bytes, as the first chain's flush wrote
+        // them: about 6.3 MB of chunks for 100,000 names.
+        let whole = NODE_BYTES.get();
         NODE_BYTES.with(|n| n.set(0));
         let _one = store_chain(
             &store,
@@ -1236,8 +1417,10 @@ mod tests {
             true,
         );
         let written = NODE_BYTES.get();
-        // Two chunks and one index node at most, each under the cap.
-        assert!(written <= 3 * CUT.max_bytes, "{written}");
+        // The change stores the chunks on its path - the chunk the two
+        // names share and the index chunks above it - not the level of
+        // every name.
+        assert!(written < whole / 4, "{written} against the level's {whole}");
         // The lookup still answers.
         assert_eq!(
             read::log_page(&store, "r", ids[1], Some(&path("d/f50000")), 10, &later())
@@ -1308,6 +1491,49 @@ mod tests {
             .unwrap();
     }
 
+    /// The cuts of a fixed wide level hold their names: a cut hangs on
+    /// the gear hash of one name, and the backstop on the real entry
+    /// bytes, so the chunks' first names are the same on every machine
+    /// and in every edit order. A changed hash, a changed mask, or a
+    /// wrong byte count moves a boundary, and a stored level reloads
+    /// under an index whose chunks are not the ones on disk.
+    #[test]
+    fn the_cuts_of_a_fixed_wide_level_hold_their_names() {
+        let mut node = BTreeMap::new();
+        for i in 0..300 {
+            node.insert(PathElem::new(format!("n{i:03}")).unwrap(), i);
+        }
+        let cut = Cut {
+            max_bytes: 8192,
+            bits: 4,
+        };
+        let firsts: Vec<String> = split(node.iter(), &cut)
+            .iter()
+            .map(|c| String::from_utf8_lossy(c[0].0.as_bytes()).into_owned())
+            .collect();
+        assert_eq!(
+            firsts,
+            [
+                "n000", "n009", "n036", "n043", "n050", "n053", "n060", "n114", "n122", "n131",
+                "n166", "n175", "n183", "n190", "n193", "n200", "n203", "n210", "n211", "n228",
+                "n249", "n257", "n288", "n298",
+            ]
+        );
+
+        // The backstop cuts on the real entry bytes: this level draws no
+        // hash cut, so every cut is the cap crossing, and the boundary
+        // names the byte count chose. A wrong byte count moves one.
+        let cut = Cut {
+            max_bytes: 8192,
+            bits: 20,
+        };
+        let firsts: Vec<String> = split(node.iter(), &cut)
+            .iter()
+            .map(|c| String::from_utf8_lossy(c[0].0.as_bytes()).into_owned())
+            .collect();
+        assert_eq!(firsts, ["n000", "n093", "n186", "n279"]);
+    }
+
     /// Inserting a name into a wide level re-stores only the chunk that
     /// holds it: a cut hangs on one name, so the boundaries of the later
     /// chunks hold. A cut at a byte count would move the boundary after
@@ -1356,7 +1582,59 @@ mod tests {
                     + before.iter().filter(|(first, _)| !after.contains_key(*first)).count()
                     + after.iter().filter(|(first, _)| !before.contains_key(*first)).count();
 
-                assert!(changed <= 2, "{changed} chunks changed");
+                // The insert must move at least one chunk: an empty
+                // before or after map sees no change at all, and a
+                // level that loads with no chunks lies to every lookup.
+                assert!((1..=2).contains(&changed), "{changed} chunks changed");
+                assert!(
+                    after.contains_key(&PathElem::new("n099").unwrap()),
+                    "a chunk holds the insert's name"
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    /// A chunked level, loaded from its stored root, answers lookups:
+    /// the leaf chunks the index rows name are reachable. A flatten
+    /// that returns no chunks makes every lookup of a wide level miss,
+    /// and the land path's conflict check with it.
+    #[test]
+    fn a_chunked_level_answers_lookups_after_a_reload() {
+        let (_dir, store, _repo) = open();
+        store
+            .write(|c| {
+                let cut = Cut {
+                    max_bytes: 8192,
+                    bits: 2,
+                };
+                let mut edit = Edit::load(c, None)?;
+                let by = Stamp {
+                    id: ChangesetId::from_bytes([7; 32]),
+                    generation: 1,
+                };
+                for i in 0..500 {
+                    edit.stamp(c, &tree::parts(&path(&format!("d/f{i:04}"))), by)?;
+                }
+                let root = edit.store(c, &cut)?;
+                // The root level holds the one directory; the d level
+                // below it is chunked: its row is an index.
+                let Row::Leaf(root_node) = get_row(c, root)?.0 else {
+                    panic!("the root is one leaf");
+                };
+                let dir_id = root_node[&PathElem::new("d").unwrap()]
+                    .below
+                    .expect("the d level is below the root");
+                match get_row(c, dir_id)?.0 {
+                    Row::Chunks(_) => {}
+                    Row::Leaf(_) => panic!("the d level is one leaf, not chunked"),
+                }
+                let mut edit = Edit::load(c, Some(dir_id))?;
+                let node = edit.entries(c, &PathElem::new("f0250").unwrap())?;
+                assert!(
+                    !node.is_empty(),
+                    "a reloaded chunked level answers its names: the chunk is empty"
+                );
                 Ok(())
             })
             .unwrap();
@@ -1502,6 +1780,18 @@ mod tests {
         let mut no_flag = bytes.clone();
         no_flag[3] = 0;
         assert_eq!(decode_node(&no_flag), None);
+        // A one-entry node whose entry has nothing of its own and
+        // nothing below it: it names no state, so the decode must
+        // refuse it even though its bytes align.
+        let one = Node::from_iter([(
+            PathElem::new("x").unwrap(),
+            Entry {
+                last: node[&PathElem::new("a").unwrap()].last,
+                own: None,
+                below: None,
+            },
+        )]);
+        assert_eq!(decode_node(&encode_node(&one)), None);
         let cut = encode_node(&node.clone().into_iter().take(1).collect());
         let mut swapped = bytes[cut.len()..].to_vec();
         swapped.extend(&cut);

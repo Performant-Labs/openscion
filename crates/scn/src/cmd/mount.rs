@@ -33,9 +33,25 @@ pub struct MountArgs {
     no_mount: bool,
     /// Take writes on the mount, for the v0.1 unstable write path: a
     /// symlinked parent directory in the overlay can still redirect a
-    /// write outside it, so the mount is read-only without this.
+    /// write outside it, so the mount is read-only without this. A build
+    /// without the `unstable-writable-mount` feature refuses the flag
+    /// before it connects.
     #[arg(long)]
     unstable_writable: bool,
+}
+
+impl MountArgs {
+    /// Whether the mount was asked to take writes, which only a build
+    /// with the `unstable-writable-mount` feature serves.
+    pub fn writable_requested(&self) -> bool {
+        self.unstable_writable
+    }
+}
+
+/// Whether `scn mount` tries to mount after it serves: `--no-mount`
+/// asks it to only print the command.
+fn mount_requested(args: &MountArgs) -> bool {
+    !args.no_mount
 }
 
 /// Arguments of `scn unmount`.
@@ -52,6 +68,7 @@ pub struct UnmountArgs {
 /// `test_support::cmd::mount`.
 pub(crate) mod record {
     use std::io::Write as _;
+    use std::os::unix::ffi::OsStrExt as _;
     use std::path::{Path, PathBuf};
 
     use anyhow::Result;
@@ -86,13 +103,18 @@ pub(crate) mod record {
         let records: Vec<serde_json::Value> = sessions
             .iter()
             .map(|record| {
-                serde_json::json!({
-                    "dir": record.dir.display().to_string(),
-                    "overlay": record.overlay.display().to_string(),
+                let mut value = serde_json::json!({
                     "rev": record.rev,
                     "pid": record.pid,
                     "writable": record.writable,
-                })
+                });
+                // A path is bytes: one that is not UTF-8 keeps them in a
+                // `_b64` sibling, as scn's JSON output does, so the record
+                // still names its own directory when it is read back.
+                for (field, path) in [("dir", &record.dir), ("overlay", &record.overlay)] {
+                    crate::client::put_json_bytes(&mut value, field, path.as_os_str().as_bytes());
+                }
+                value
             })
             .collect();
         let temp = file.with_extension(format!("json.{}.tmp", std::process::id()));
@@ -112,7 +134,7 @@ pub(crate) mod record {
 /// waits for a signal. The changes go to an overlay directory, which
 /// `scn commit --from-mount DIR` commits.
 pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
-    let dir = std::path::absolute(&args.dir)?;
+    let dir = mount_dir(&args.dir)?;
     // Refuse before anything is served: a missing mount point fails at
     // mount time anyway, and a second mount of a live dir would start a
     // second NFS server that no one can use.
@@ -125,6 +147,9 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
             dir.display()
         );
     }
+    // A build without the writable-mount feature refused the flag in
+    // `main`, before anything connected; the write path it guards is
+    // compiled out of that build.
     let base = ctx.resolve(&args.rev).await?;
     // The server mints the mount's ticket: the read permission of the
     // whole walk below the root tree of the mounted changeset. It goes to
@@ -154,7 +179,9 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
         &reply.ticket,
         overlay.join(CHANGES),
     )
-    .writable(args.unstable_writable);
+    .context("cannot make the mount: the system gave no random bytes")?;
+    #[cfg(feature = "unstable-writable-mount")]
+    let vfs = vfs.writable(args.unstable_writable);
     let secret = vfs.secret_name();
 
     // The identity of the serving process: an exclusive lock on the
@@ -172,7 +199,10 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
         overlay: overlay.clone(),
         rev: args.rev.clone(),
         pid: std::process::id(),
+        #[cfg(feature = "unstable-writable-mount")]
         writable: args.unstable_writable,
+        #[cfg(not(feature = "unstable-writable-mount"))]
+        writable: false,
     })?;
     // The bind is the one step that can still fail before serving: on
     // its failure, remove the record, so the next mount takes over.
@@ -199,11 +229,11 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
         "single-user machines only: any local user who can read the mount table can reach this mount"
     );
     outln!("{}", mount_command(port, &secret, &dir));
-    if !args.no_mount {
+    if mount_requested(&args) {
         try_mount(port, &secret, &dir)?;
     }
 
-    wait_stopped().await;
+    wait_stopped().await?;
     drop(server);
     // Unmount before the overlay goes, so no file disappears mid-read.
     unmount_dir(&dir);
@@ -218,20 +248,13 @@ pub async fn mount(ctx: &mut Ctx, args: MountArgs) -> Result<()> {
 // The signature matches the other commands, which are all async.
 #[allow(clippy::unused_async)]
 pub async fn unmount(_ctx: &mut Ctx, args: UnmountArgs) -> Result<()> {
-    let dir = std::path::absolute(&args.dir)?;
+    let dir = mount_dir(&args.dir)?;
     let file = session_file()?;
     let record = drop_session(&file, &dir)?
         .ok_or_else(|| anyhow!("{}: no mount of scn is recorded", dir.display()))?;
     // The serving process unmounts and removes the overlay on this signal.
     if !stop_serving(&record, &dir) {
-        // The process is alive and the signal did not go out: the mount is
-        // still up. Put the record back, so a retry can find it.
-        save_session(&record)?;
-        anyhow::bail!(
-            "{}: cannot stop the serving process (pid {}): it may still serve the mount",
-            dir.display(),
-            record.pid
-        );
+        a_stop_that_failed_keeps_the_record(&record)?;
     }
     // The unmount itself may need root; say so, and let the user run it.
     if !std::process::Command::new("umount")
@@ -244,6 +267,33 @@ pub async fn unmount(_ctx: &mut Ctx, args: UnmountArgs) -> Result<()> {
     }
     outln!("unmounted {}", dir.display());
     Ok(())
+}
+
+/// The stop did not go out and the process is alive: the mount is
+/// still served. The record goes back, so a retry of the unmount finds
+/// the mount, and the caller is refused with the cause.
+fn a_stop_that_failed_keeps_the_record(record: &MountRecord) -> Result<()> {
+    save_session(record)?;
+    anyhow::bail!(
+        "{}: cannot stop the serving process (pid {}): it may still serve the mount",
+        record.dir.display(),
+        record.pid
+    );
+}
+
+/// The mount directory as the session table records and finds it:
+/// absolute, with its parent resolved, so `scn mount a/../m`, `scn unmount
+/// ../m` from another directory, and a path through a symlinked directory
+/// above it name one record. The last part is kept as given: resolving it
+/// would stat the mount point, which a dead NFS server can hang.
+fn mount_dir(dir: &Path) -> Result<PathBuf> {
+    let dir = std::path::absolute(dir)?;
+    match (dir.parent(), dir.file_name()) {
+        (Some(parent), Some(name)) => Ok(std::fs::canonicalize(parent)
+            .with_context(|| format!("cannot resolve {}", parent.display()))?
+            .join(name)),
+        _ => Ok(dir),
+    }
 }
 
 /// Refuses a mount point that is not a directory: the plain mount would
@@ -449,6 +499,25 @@ fn read_sessions(file: &Path) -> Result<Vec<MountRecord>> {
     parse_sessions(&json).with_context(|| format!("{} does not hold mount records", file.display()))
 }
 
+/// The path a record holds in `field`: the exact bytes of its `_b64`
+/// sibling when the path is not UTF-8, else the field's text.
+fn path_field(record: &serde_json::Value, field: &str) -> Result<PathBuf> {
+    use base64::Engine as _;
+    use std::os::unix::ffi::OsStrExt as _;
+    if let Some(b64) = record.get(format!("{field}_b64")) {
+        let bytes = b64
+            .as_str()
+            .and_then(|b64| base64::engine::general_purpose::STANDARD.decode(b64).ok())
+            .ok_or_else(|| anyhow!("its {field}_b64 is not base64"))?;
+        return Ok(PathBuf::from(std::ffi::OsStr::from_bytes(&bytes)));
+    }
+    record
+        .get(field)
+        .and_then(|v| v.as_str())
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow!("it has no {field}"))
+}
+
 /// The records of a session file's JSON.
 fn parse_sessions(json: &serde_json::Value) -> Result<Vec<MountRecord>> {
     let records = json
@@ -459,18 +528,8 @@ fn parse_sessions(json: &serde_json::Value) -> Result<Vec<MountRecord>> {
         .enumerate()
         .map(|(n, record)| {
             Ok(MountRecord {
-                dir: PathBuf::from(
-                    record
-                        .get("dir")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow!("record {n} has no dir"))?,
-                ),
-                overlay: PathBuf::from(
-                    record
-                        .get("overlay")
-                        .and_then(|v| v.as_str())
-                        .ok_or_else(|| anyhow!("record {n} has no overlay"))?,
-                ),
+                dir: path_field(record, "dir").with_context(|| format!("record {n}"))?,
+                overlay: path_field(record, "overlay").with_context(|| format!("record {n}"))?,
                 rev: record
                     .get("rev")
                     .and_then(|v| v.as_str())
@@ -552,9 +611,12 @@ fn cleanup_at(file: &Path, dir: &Path, overlay: &Path) -> Vec<String> {
 }
 
 /// Sends `pid` the `signal`, and answers whether it was delivered.
+/// The `--` must stay, for the same procps-ng reason the Parked drop
+/// has: without it a negative pid would be read as an option and
+/// folded to its first digit.
 fn kill_pid(pid: u32, signal: &str) -> bool {
     std::process::Command::new("kill")
-        .args([signal, &pid.to_string()])
+        .args([signal, "--", &pid.to_string()])
         .status()
         .is_ok_and(|s| s.success())
 }
@@ -574,6 +636,12 @@ fn stop_serving_with(record: &MountRecord, dir: &Path, kill: impl Fn(u32, &str) 
     if !serving(record) {
         return true;
     }
+    // A pid below 2 names no server: 0 would take the caller's whole
+    // process group and 1 is init, so a record that names one is not
+    // stopped, and the unmount keeps it instead of signaling.
+    if record.pid < 2 {
+        return false;
+    }
     let signaled = kill(record.pid, "-TERM");
     let alive = kill(record.pid, "-0");
     if signaled || !alive {
@@ -583,20 +651,22 @@ fn stop_serving_with(record: &MountRecord, dir: &Path, kill: impl Fn(u32, &str) 
     false
 }
 
-/// Waits for a stop signal.
-async fn wait_stopped() {
+/// Waits for a stop signal. A system that refuses the handlers is
+/// refused here, with the cause, not met with a panic.
+async fn wait_stopped() -> Result<()> {
     use tokio::signal::unix::{SignalKind, signal};
-    let mut stop = signal(SignalKind::interrupt()).expect("cannot listen for SIGINT");
-    let mut term = signal(SignalKind::terminate()).expect("cannot listen for SIGTERM");
+    let mut stop = signal(SignalKind::interrupt()).context("cannot listen for SIGINT")?;
+    let mut term = signal(SignalKind::terminate()).context("cannot listen for SIGTERM")?;
     tokio::select! {
         _ = stop.recv() => {}
         _ = term.recv() => {}
     }
+    Ok(())
 }
 
 /// The recorded mount of `dir`.
 pub(crate) fn session_for_dir(dir: &Path) -> Result<MountRecord> {
-    let dir = std::path::absolute(dir).context("cannot resolve the mount directory")?;
+    let dir = mount_dir(dir).context("cannot resolve the mount directory")?;
     load_sessions()?
         .into_iter()
         .find(|record| record.dir == dir)
@@ -834,6 +904,41 @@ mod silent_failures {
         }
     }
 
+    /// Sets HOME for a test that must own the mount table's home, and
+    /// restores the old value on drop, so the other tests see their
+    /// environment whole. The env calls are unsafe in this edition, so
+    /// they live in their own module under an allow, like the
+    /// workspace's one ffi module; `serial()` keeps two tests from
+    /// touching HOME at once.
+    #[allow(unsafe_code)]
+    mod home_env {
+        /// HOME for one test. See the module note.
+        pub(super) struct Home(pub(super) tempfile::TempDir, Option<std::ffi::OsString>);
+
+        impl Home {
+            pub(super) fn take() -> Self {
+                let old = std::env::var_os("HOME");
+                let dir = tempfile::tempdir().unwrap();
+                // SAFETY: serial() holds this test alone over the process env.
+                unsafe { std::env::set_var("HOME", dir.path()) };
+                Self(dir, old)
+            }
+        }
+
+        impl Drop for Home {
+            fn drop(&mut self) {
+                // SAFETY: serial() holds this test alone over the process env.
+                unsafe {
+                    match self.1.take() {
+                        Some(home) => std::env::set_var("HOME", home),
+                        None => std::env::remove_var("HOME"),
+                    }
+                }
+            }
+        }
+    }
+    use home_env::Home;
+
     impl std::ops::Deref for Parked {
         type Target = std::process::Child;
 
@@ -851,9 +956,14 @@ mod silent_failures {
     impl Drop for Parked {
         fn drop(&mut self) {
             // The group's id is the child's pid, so the kill takes the
-            // child and anything it left; then the reap.
+            // child and anything it left; then the reap. The `--` must
+            // stay: procps-ng's kill reads a negative pid that follows
+            // the signal option as another option and keeps only its
+            // first digit (`kill -9 -123456` runs kill(-1, SIGKILL),
+            // every process of the user), while after `--` it parses
+            // the pid with strtol.
             let _ = std::process::Command::new("kill")
-                .args(["-9", &format!("-{}", self.0.id())])
+                .args(["-KILL", "--", &format!("-{}", self.0.id())])
                 .status();
             let _ = self.0.wait();
         }
@@ -873,6 +983,74 @@ mod silent_failures {
             rev: "main".to_owned(),
             pid,
             writable: false,
+        }
+    }
+
+    /// A path is bytes: a directory and an overlay whose names are not
+    /// UTF-8 come back exactly from the session file, so `scn unmount`
+    /// finds the record. A UTF-8 path is written as before, with no
+    /// `_b64` sibling, and a record without one still reads.
+    #[test]
+    fn a_path_that_is_not_utf8_round_trips_through_the_session_file() {
+        use std::os::unix::ffi::OsStrExt as _;
+        let base = tempfile::tempdir().unwrap();
+        let file = base.path().join("mounts.json");
+        let odd = MountRecord {
+            dir: base.path().join(std::ffi::OsStr::from_bytes(b"m\xff")),
+            overlay: base.path().join(std::ffi::OsStr::from_bytes(b"o\xfe")),
+            rev: "main".to_owned(),
+            pid: 1,
+            writable: false,
+        };
+        add_session(&file, &odd).unwrap();
+        assert_eq!(read_sessions(&file).unwrap(), vec![odd.clone()]);
+        assert!(
+            drop_session(&file, &odd.dir).unwrap().is_some(),
+            "scn unmount finds no mount"
+        );
+
+        let plain = record("/mnt/view", 7);
+        add_session(&file, &plain).unwrap();
+        let text = fs::read_to_string(&file).unwrap();
+        assert!(
+            !text.contains("_b64"),
+            "a UTF-8 path grew a sibling: {text}"
+        );
+        fs::write(
+            &file,
+            r#"[{"dir":"/mnt/view","overlay":"/tmp/o","rev":"main","pid":7,"writable":false}]"#,
+        )
+        .unwrap();
+        assert_eq!(
+            read_sessions(&file).unwrap()[0].dir,
+            PathBuf::from("/mnt/view")
+        );
+    }
+
+    /// A record whose pid cannot name a server (0 or 1) is never
+    /// signaled: the injected kill panics if it is ever called, so the
+    /// refusal holds before any signal, and the record stays.
+    #[test]
+    fn a_pid_that_names_no_server_is_never_signaled() {
+        for pid in [0, 1] {
+            let home = tempfile::tempdir().unwrap();
+            let overlay = home.path().join("overlay");
+            fs::create_dir_all(&overlay).unwrap();
+            let r = MountRecord {
+                dir: PathBuf::from("/mnt/nobody"),
+                overlay: overlay.clone(),
+                rev: "main".to_owned(),
+                pid,
+                writable: false,
+            };
+            let _serial = serial();
+            // The serve lock is held, like a live server holds it, so
+            // only the pid check can refuse.
+            let _lock = hold_serve_lock(&overlay).unwrap();
+            let stop = |_pid: u32, _signal: &str| -> bool {
+                panic!("a pid below 2 must never be signaled")
+            };
+            assert!(!stop_serving_with(&r, &r.dir.clone(), stop));
         }
     }
 
@@ -1109,6 +1287,268 @@ mod silent_failures {
         .is_none()));
     }
 
+    /// The serve lock refuses a second server: with one holder live, a
+    /// second hold errs and names the overlay, so no second mount can
+    /// read the held lock as free and serve over the first.
+    #[test]
+    fn a_held_serve_lock_refuses_a_second_server() {
+        let _serial = serial();
+        let home = tempfile::tempdir().unwrap();
+        let overlay = home.path().join("overlay");
+        fs::create_dir_all(&overlay).unwrap();
+        let _first = hold_serve_lock(&overlay).unwrap();
+        let second = hold_serve_lock(&overlay).unwrap_err().to_string();
+        assert!(
+            second.contains("another scn process serves this overlay"),
+            "{second}"
+        );
+        assert!(second.contains(&overlay.display().to_string()), "{second}");
+    }
+
+    /// The flags of `scn mount` decide the serving: the mount is
+    /// read-only unless the flag asks for writes, and `--no-mount` says
+    /// to only print the command.
+    #[test]
+    fn the_mount_flags_decide_the_serving() {
+        #[derive(clap::Parser)]
+        struct MountCli {
+            #[command(flatten)]
+            args: MountArgs,
+        }
+        use clap::Parser as _;
+        let plain = MountCli::parse_from(["mount", "/mnt/view"]).args;
+        assert!(!plain.writable_requested());
+        assert!(mount_requested(&plain));
+        let asked =
+            MountCli::parse_from(["mount", "--no-mount", "--unstable-writable", "/mnt/view"]).args;
+        assert!(asked.writable_requested());
+        assert!(!mount_requested(&asked));
+    }
+
+    /// The mount directory is absolute, with its parent resolved, so
+    /// `scn mount a/../m` and `scn unmount m` from elsewhere name one
+    /// record; the last part is kept as given.
+    #[test]
+    fn a_mount_dir_resolves_its_parent_and_stays_absolute() {
+        let tmp = tempfile::tempdir().unwrap();
+        let point = tmp.path().join("point");
+        fs::create_dir_all(&point).unwrap();
+        let dir = mount_dir(&tmp.path().join("point")).unwrap();
+        assert!(dir.is_absolute());
+        assert_eq!(dir, fs::canonicalize(&point).unwrap());
+        // The last part is kept as given: resolving it would stat the
+        // mount point, which a dead NFS server can hang.
+        let missing = mount_dir(&tmp.path().join("missing")).unwrap();
+        assert_eq!(
+            missing,
+            fs::canonicalize(tmp.path()).unwrap().join("missing")
+        );
+    }
+
+    /// The printed command names the machine, the export with its
+    /// secret, the port, and the mount point: without any of them the
+    /// user's `sudo mount` cannot reach this mount. The failures name
+    /// the missing piece, never the command: it carries the secret.
+    #[test]
+    fn the_mount_command_names_its_target() {
+        let command = mount_command(12000, "abc123", Path::new("/mnt/view"));
+        assert!(
+            command.contains("sudo mount"),
+            "the sudo command is missing"
+        );
+        assert!(
+            command.contains("127.0.0.1:/scion/abc123"),
+            "the target with its export and secret is missing"
+        );
+        assert!(command.contains("port=12000"), "the port is missing");
+        assert!(command.contains("/mnt/view"), "the mount point is missing");
+    }
+
+    /// The session file sits under the home directory, so a mount table
+    /// is per user, not per machine.
+    #[test]
+    fn the_session_file_sits_under_the_home() {
+        let home = std::env::var_os("HOME").expect("the tests run with a HOME");
+        assert_eq!(
+            session_file().unwrap(),
+            std::path::PathBuf::from(home)
+                .join(".scion")
+                .join("mounts.json")
+        );
+    }
+
+    /// A saved session is found again, and a second save of a dir
+    /// replaces the record instead of duplicating it.
+    #[test]
+    fn a_saved_session_is_found_again() {
+        let _serial = serial();
+        let home = Home::take();
+        let record = MountRecord {
+            dir: PathBuf::from("/mnt/kept"),
+            overlay: home.0.path().join("overlay"),
+            rev: "main".to_owned(),
+            pid: std::process::id(),
+            writable: false,
+        };
+        save_session(&record).unwrap();
+        assert!(
+            load_sessions()
+                .unwrap()
+                .iter()
+                .any(|known| known.dir == record.dir)
+        );
+        let again = MountRecord {
+            pid: 7,
+            ..record.clone()
+        };
+        save_session(&again).unwrap();
+        let found = load_sessions().unwrap();
+        assert_eq!(
+            found.iter().filter(|known| known.dir == record.dir).count(),
+            1
+        );
+        assert_eq!(found[0].pid, 7);
+    }
+
+    /// A session table that is there but cannot be read is an error: a
+    /// broken table must not silently read as "no mounts".
+    #[test]
+    fn a_session_table_that_cannot_be_read_is_an_error() {
+        let home = tempfile::tempdir().unwrap();
+        // A directory at the path: reading it is an error, but not a
+        // missing file.
+        fs::create_dir(home.path().join("mounts.json")).unwrap();
+        assert!(read_sessions(&home.path().join("mounts.json")).is_err());
+    }
+
+    /// The cleanup of a quiet stop warns nothing, and a broken table
+    /// warns with the cause.
+    #[test]
+    fn a_quiet_stop_warns_nothing_and_a_broken_one_warns() {
+        let _serial = serial();
+        let home = Home::take();
+        let overlay = tempfile::tempdir().unwrap();
+        let warnings = cleanup_after_stop(Path::new("/mnt/quiet"), overlay.path());
+        assert_eq!(warnings, Vec::<String>::new(), "{warnings:?}");
+        fs::create_dir_all(home.0.path().join(".scion")).unwrap();
+        fs::write(
+            home.0.path().join(".scion").join("mounts.json"),
+            "{not json",
+        )
+        .unwrap();
+        let warnings = cleanup_after_stop(Path::new("/mnt/quiet"), overlay.path());
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(
+            warnings[0].contains("cannot update the mount table"),
+            "{warnings:?}"
+        );
+    }
+
+    /// A record of pid 2 names a process, and the stop signals it: the
+    /// guard keeps out only 0 and 1, which name no server.
+    #[test]
+    fn a_record_of_pid_two_is_signaled() {
+        let _serial = serial();
+        let home = tempfile::tempdir().unwrap();
+        let overlay = home.path().join("overlay");
+        fs::create_dir_all(&overlay).unwrap();
+        let record = MountRecord {
+            dir: PathBuf::from("/mnt/two"),
+            overlay: overlay.clone(),
+            rev: "main".to_owned(),
+            pid: 2,
+            writable: false,
+        };
+        let _lock = hold_serve_lock(&overlay).unwrap();
+        let stop = |pid: u32, signal: &str| pid == 2 && signal == "-TERM";
+        assert!(stop_serving_with(&record, &record.dir.clone(), stop));
+    }
+
+    /// The session of a dir is its own record: a lookup of one mount
+    /// never answers with another, and a mount that is not recorded has
+    /// no session.
+    #[test]
+    fn the_session_of_a_dir_is_its_own_record() {
+        let _serial = serial();
+        let home = Home::take();
+        let base = home.0.path().join("mnt");
+        fs::create_dir_all(&base).unwrap();
+        // The records hold what a mount recorded: the resolved dir.
+        let one = MountRecord {
+            dir: mount_dir(&base.join("one")).unwrap(),
+            overlay: home.0.path().join("o1"),
+            rev: "main".to_owned(),
+            pid: 11,
+            writable: false,
+        };
+        let two = MountRecord {
+            dir: mount_dir(&base.join("two")).unwrap(),
+            overlay: home.0.path().join("o2"),
+            rev: "main".to_owned(),
+            pid: 22,
+            writable: false,
+        };
+        save_session(&one).unwrap();
+        save_session(&two).unwrap();
+        assert_eq!(
+            session_for_dir(&base.join("two")).unwrap().overlay,
+            two.overlay
+        );
+        assert!(session_for_dir(&base.join("three")).is_err());
+    }
+
+    /// A plain file is a change without the exec bit, and a script is a
+    /// change with it: the walk reads the mode, not the name.
+    #[test]
+    fn a_plain_file_is_not_a_change_with_the_exec_bit() {
+        let home = tempfile::tempdir().unwrap();
+        let changes = home.path().join("changes");
+        fs::create_dir_all(&changes).unwrap();
+        fs::write(changes.join("plain"), b"data").unwrap();
+        fs::write(changes.join("script"), b"#!/bin/sh").unwrap();
+        fs::set_permissions(changes.join("script"), fs::Permissions::from_mode(0o755)).unwrap();
+        let mut out = Vec::new();
+        walk_changes(&changes, b"", &mut out).unwrap();
+        let exec_of = |name: &[u8]| {
+            out.iter()
+                .find(|(path, _)| path.as_bytes() == name)
+                .map(|(_, change)| matches!(change, Change::Put { exec: true }))
+        };
+        assert_eq!(exec_of(b"plain"), Some(false));
+        assert_eq!(exec_of(b"script"), Some(true));
+    }
+
+    /// A stop that did not go out keeps the record and refuses the
+    /// caller with the cause, so a retry of the unmount finds the mount.
+    #[test]
+    fn a_failed_stop_keeps_the_record_and_refuses() {
+        let _serial = serial();
+        let home = Home::take();
+        let overlay = home.0.path().join("overlay");
+        fs::create_dir_all(&overlay).unwrap();
+        let record = MountRecord {
+            dir: PathBuf::from("/mnt/still"),
+            overlay: overlay.clone(),
+            rev: "main".to_owned(),
+            pid: std::process::id(),
+            writable: false,
+        };
+        // The recorded server is live: this process holds its serve lock.
+        let _lock = hold_serve_lock(&overlay).unwrap();
+        let err = a_stop_that_failed_keeps_the_record(&record)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("cannot stop the serving process"), "{err}");
+        assert!(err.contains(&record.pid.to_string()), "{err}");
+        // The record went back, so a retry finds the mount.
+        assert!(
+            load_sessions()
+                .unwrap()
+                .iter()
+                .any(|known| known.dir == record.dir)
+        );
+    }
+
     /// A save that cannot write its temp file errs, and the old table is
     /// still there whole: the rename never happened.
     #[test]
@@ -1128,6 +1568,45 @@ mod silent_failures {
         let found = read_sessions(&file).unwrap();
         assert_eq!(found.len(), 2);
         assert_eq!(found[0].dir, PathBuf::from("/mnt/view"));
+    }
+
+    /// One directory, spelled three ways: with a `..`, through a symlinked
+    /// directory above it, and plainly. The record a mount keeps under one
+    /// spelling is found under the others, so a second mount is refused
+    /// and `scn unmount` finds the mount.
+    #[test]
+    fn a_mount_is_found_by_any_spelling_of_its_directory() {
+        let base = tempfile::tempdir().unwrap();
+        fs::create_dir_all(base.path().join("a")).unwrap();
+        fs::create_dir_all(base.path().join("real/m")).unwrap();
+        std::os::unix::fs::symlink(base.path().join("real"), base.path().join("link")).unwrap();
+        let plain = mount_dir(&base.path().join("real/m")).unwrap();
+        for other in ["a/../real/m", "link/m"] {
+            let spelled = mount_dir(&base.path().join(other)).unwrap();
+            assert_eq!(spelled, plain, "{other}");
+            let file = base.path().join("mounts.json");
+            let _ = fs::remove_file(&file);
+            add_session(
+                &file,
+                &MountRecord {
+                    dir: spelled,
+                    overlay: base.path().join("overlay"),
+                    rev: "main".to_owned(),
+                    pid: 1,
+                    writable: false,
+                },
+            )
+            .unwrap();
+            let sessions = read_sessions(&file).unwrap();
+            assert!(
+                live_record_for(&plain, &sessions, &|_| true).is_some(),
+                "a mount of {other} does not hold off a second mount"
+            );
+            assert!(
+                drop_session(&file, &plain).unwrap().is_some(),
+                "scn unmount does not find a mount of {other}"
+            );
+        }
     }
 
     /// Waits until `cond` holds, with a ceiling: macOS may keep a reaped

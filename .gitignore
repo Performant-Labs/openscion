@@ -1,4 +1,5 @@
 target/
+.target/
 /crates/*/fuzz/target/
 /crates/*/fuzz/corpus/
 /crates/*/fuzz/artifacts/
@@ -7,3 +8,5 @@ target/
 /scion-data/
 /docker/certs/
 /docker/work/
+/.scn-drills/
+mutants-measure/

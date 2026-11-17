@@ -34,8 +34,8 @@ use crate::review::{
     ThreadView, VerdictKind,
 };
 use crate::service::{
-    REQUEST_TIMEOUT, Worker, caller, check_name, check_whole_reader, diff_entry, json_fields,
-    parse_id, request_id_of,
+    REQUEST_TIMEOUT, Worker, caller, check_name, check_whole_reader, count_committed_reply,
+    count_reply, diff_entry, json_fields, parse_id, request_id_of,
 };
 
 /// Proposal diffs running at once: each reads blobs and diffs lines.
@@ -378,7 +378,7 @@ impl Review for ReviewService {
                 proposal_number,
             )
             .await?;
-        Ok(Response::new(proposal))
+        Ok(count_committed_reply(Response::new(proposal)))
     }
 
     async fn update_proposal(
@@ -422,7 +422,7 @@ impl Review for ReviewService {
                 proposal_number,
             )
             .await?;
-        Ok(Response::new(proposal))
+        Ok(count_committed_reply(Response::new(proposal)))
     }
 
     async fn get_proposal(
@@ -444,7 +444,7 @@ impl Review for ReviewService {
                 ))
             })
             .await?;
-        Ok(Response::new(proposal))
+        Ok(count_reply(Response::new(proposal)))
     }
 
     async fn list_proposals(
@@ -489,7 +489,7 @@ impl Review for ReviewService {
                 })
             })
             .await?;
-        Ok(Response::new(reply))
+        Ok(count_reply(Response::new(reply)))
     }
 
     async fn close_proposal(
@@ -522,7 +522,7 @@ impl Review for ReviewService {
                 proposal_number,
             )
             .await?;
-        Ok(Response::new(proposal))
+        Ok(count_committed_reply(Response::new(proposal)))
     }
 
     async fn get_proposal_diff(
@@ -566,7 +566,7 @@ impl Review for ReviewService {
                 )
             })
             .await?;
-        Ok(Response::new(GetProposalDiffResponse {
+        Ok(count_reply(Response::new(GetProposalDiffResponse {
             base_changeset_id: diff.base.as_bytes().to_vec(),
             head_changeset_id: diff.head.as_bytes().to_vec(),
             files: diff
@@ -608,7 +608,7 @@ impl Review for ReviewService {
                 .map(|p| p.as_bytes().to_vec())
                 .unwrap_or_default(),
             renames_incomplete: diff.renames_incomplete,
-        }))
+        })))
     }
 
     async fn add_comment(
@@ -653,7 +653,7 @@ impl Review for ReviewService {
                 |_| 0,
             )
             .await?;
-        Ok(Response::new(thread))
+        Ok(count_committed_reply(Response::new(thread)))
     }
 
     async fn set_thread_resolved(
@@ -687,7 +687,7 @@ impl Review for ReviewService {
                 |_| 0,
             )
             .await?;
-        Ok(Response::new(thread))
+        Ok(count_committed_reply(Response::new(thread)))
     }
 
     async fn list_threads(
@@ -703,9 +703,9 @@ impl Review for ReviewService {
             .worker
             .run(move |store| review::threads(&store, &req.repo, number))
             .await?;
-        Ok(Response::new(ListThreadsResponse {
+        Ok(count_reply(Response::new(ListThreadsResponse {
             threads: threads.into_iter().map(thread_msg).collect(),
-        }))
+        })))
     }
 
     async fn submit_review(
@@ -751,7 +751,7 @@ impl Review for ReviewService {
                 proposal_number,
             )
             .await?;
-        Ok(Response::new(proposal))
+        Ok(count_committed_reply(Response::new(proposal)))
     }
 }
 

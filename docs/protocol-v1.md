@@ -64,12 +64,15 @@ closes a connection:
   fails, and the client MAY retry it (`GetObjects` and `ReadFile` only
   re-read; a `Land` retry uses the same request key).
 - when the replies of the connection that stopped reading hold more than
-  64 MiB together (`--max-stalled-bytes`). A reply that stalls adds what it
-  leaves in HTTP/2, under 4 MiB, to a count of its connection; a connection
-  over the limit is closed, which frees what every stalled reply of it
-  holds. Other connections are not touched. A unary reply that its client
-  never reads is not counted: hyper gives the server no hook that sees it
-  stall.
+  64 MiB together (`--max-stalled-bytes`), or when the replies that
+  stalled connections hold together cross 1 GiB (`STALLED_TOTAL_BYTES`
+  in crates/scion-proto/src/runtime/listen.rs). A reply that stalls adds
+  what it leaves in HTTP/2, under 4 MiB, to a count of its connection
+  and to the process's total; a connection over its own limit, or whose
+  hold crosses the total, is closed, which frees what every stalled
+  reply of it holds. Other connections are not touched. A unary reply
+  that its client never reads is not counted: hyper gives the server no
+  hook that sees it stall.
 
 So a connection beyond the cap waits at most 40 min. A client that stops reading a reply
 keeps the memory that no budget counts for that reply until the stream ends
@@ -88,7 +91,7 @@ upstream token that is not. Every call needs one — except
 `Objects.GetObjects` (section 7.3), whose permission is its read ticket, and
 which MUST carry none. On every call that needs one, a missing or wrong
 token fails with `UNAUTHENTICATED` before the request is read. A token names
-a principal. A server started with `--token T`
+a principal. A server started with `SCION_TOKEN=T` (or `--token-file`)
 has one principal, `default`, which may read and write every repo. A server
 started with `--access FILE` reads the principal of each token and its rules
 from the file; the file's format is a deployment matter and lives in the
@@ -135,7 +138,8 @@ server takes the call until its reply starts), `--max-principal-upload-bytes`
 after a restart). A call over a cap fails before any work with
 `RESOURCE_EXHAUSTED`, and the message names the flag of the cap it hit. A
 cap applies to one principal, so other principals are not slowed. A
-server started with `--token T` has one principal, so its quotas are off
+server with one token (`SCION_TOKEN` or `--token-file`) has one
+principal, so its quotas are off
 unless a flag sets one. An upload whose message would cross the byte cap
 fails with `RESOURCE_EXHAUSTED`, and the bytes it already sent do not count
 once the call ends.
@@ -225,9 +229,9 @@ contract. A client MUST NOT depend on its text.
 | `CANCELLED` | The server's 600 s limit or the client's `grpc-timeout` ran out. A client library can report its own deadline as `DEADLINE_EXCEEDED`. | Yes. A `Land` retry uses the same request key, remembered for at least 7 days (section 6.3). |
 | `DEADLINE_EXCEEDED` | `ReadFile`: the client took no message for 120 s. `GetObjects`: the client took no part for 120 s in the middle of an object (section 7.3). `Land`: the land ran past 600 s from the start of the call. The land stays `PENDING`. `MergeBase`, `IsAncestor`, `Log` with a path: the call ran past its deadline, 600 s from its start or the caller's `grpc-timeout`. From a tier: the caller's deadline ran out while the tier waited for its first object (section 8). | Yes. A `Land` retry uses the same request key, remembered for at least 7 days (section 6.3). |
 | `UNAVAILABLE` | The server cannot be reached or is shutting down, or its database stayed busy for 5 s (another process, such as an import, held its write lock). A tier also replies `UNAVAILABLE` when its upstream does not answer in time, or when it finds no room to fetch an object from upstream within 30 s (section 8). | Yes |
-| `RESOURCE_EXHAUSTED` | `GetObjects` only: no memory for the first object within 30 s, or before the caller's deadline (section 7.3). | Yes, after a wait |
-| `DATA_LOSS` | From a tier only: its upstream sent bytes that are not the object asked for (section 8). | MAY |
-| `INTERNAL` | A database, I/O or stored-data error, or a server bug. The message is `internal error`; the detail stays in the server log. | MAY |
+| `RESOURCE_EXHAUSTED` | A server limit stopped the call, and the message names it: a per-principal quota (section 2); a memory budget that the call's share does not fit, or did not get in time, such as `GetObjects` with no memory for the first object within 30 s or before the caller's deadline (section 7.3) and `Blame` (section 6.10); a graph query (`MergeBase`, `IsAncestor`) whose walk passed its million-visit bound (section 6.11); the server's budget of unary replies its clients have not read; a reply over its size cap; or a server out of disk space. | Yes, after a wait, except a graph query at its visit bound: its retry visits the same changesets and fails the same way. A call whose share is more than the whole budget, or whose reply is over its cap, fails the same way again. |
+| `DATA_LOSS` | Stored data is damaged: a tier's upstream sent bytes that are not the object asked for (section 8), or the server's stored copy failed its own check. The message is `damaged data`; the detail stays in the server log. | MAY |
+| `INTERNAL` | A database, I/O or Git error, or a server bug. The message is `internal error`; the detail stays in the server log. | MAY |
 | `UNIMPLEMENTED` | The server does not have the call, the request is compressed, or the caller is a partial reader of folder read rules and the call reads history or writes (section 2). | After the cause is fixed |
 
 A land that conflicts or is rejected is not an error. It is a state in a
@@ -420,13 +424,16 @@ server stops the land at its next check, and the land stays `PENDING`.
 | `result_changeset_id` | When `LANDED`: the rebased changeset, which was the tip of the ref when the land finished. Empty otherwise. |
 | `detail` | Why the land is `CONFLICT` or `REJECTED`, for people. Empty when `LANDED`. |
 | `conflict_paths` | When `CONFLICT` from step 4: the paths that conflict. Empty otherwise. |
+| `reject_reason` | When `REJECTED`: why the land can never succeed, as one `LandRejectReason` value: `NEEDS_ONE_PARENT` (the changeset does not hold exactly one parent), `MISSING_REF` (the changeset names a ref the repo does not hold), `BASE_NOT_ON_HISTORY` (the base is not on the ref's first-parent history) or `ABANDONED` (the land stayed pending past its deadline, so the server's stale-land sweep stopped it; retry with a new request key). `UNSPECIFIED` for every other state. When `REJECTED` carries `UNSPECIFIED`, no reason was given: the server that rejected it was older than this field, or the row predates it - read `detail`. Programs match on this field; people read `detail`. |
 
 | State | Meaning | Final |
 |---|---|---|
 | `PENDING` | Recorded, not finished. | No |
 | `LANDED` | The ref moved to `result_changeset_id`. | Yes |
 | `CONFLICT` | A change on the ref after the base touched the same paths, or the changes do not apply to the head's tree. The client re-reads those paths on the ref, makes a new changeset on the new head, and lands that. | Yes |
-| `REJECTED` | The land cannot succeed as asked. | Yes |
+| `REJECTED` | The land cannot succeed as asked; `reject_reason` says why. | Yes |
+
+A client that names a `reject_reason` must still read `detail`: a server older than this field answers `REJECTED` with `UNSPECIFIED` and puts the reason in `detail`.
 
 **Request keys and retries.**
 
@@ -498,11 +505,11 @@ content of a regular file, or the target of a symlink, at `path` in
 - Messages come in file order. Each holds at most 1 MiB. Together they are
   the whole content.
 - An empty file is a reply with no message.
-- An error in the request comes before the first message. `INTERNAL` and
+- An error in the request comes before the first message. `DATA_LOSS` and
   `DEADLINE_EXCEEDED` can end the reply after zero or more messages. A client
   MUST take the content as whole only when the reply ends with `OK`.
 - The server checks the content against the blob ID as it sends it. A
-  damaged stored blob ends the reply with `INTERNAL` before its last message,
+  damaged stored blob ends the reply with `DATA_LOSS` before its last message,
   so a client never gets all of a damaged file.
 - The reply ends with `DEADLINE_EXCEEDED` when the client takes no message
   for 120 s (the stall limit). A client that keeps reading has no time
@@ -519,7 +526,7 @@ content of a regular file, or the target of a symlink, at `path` in
 | `INVALID_ARGUMENT` | A bad repo name or ID; a bad or empty path; the path is a directory or a submodule. |
 | `NOT_FOUND` | The repo or changeset does not exist; nothing is at the path. |
 | `DEADLINE_EXCEEDED` | After zero or more messages: the client took no message for 120 s. |
-| `INTERNAL` | After zero or more messages: the stored blob is damaged. |
+| `DATA_LOSS` | After zero or more messages: the stored blob is damaged. |
 
 ### 6.8 ListDir
 
@@ -605,10 +612,13 @@ file has no lines and gets no ranges.
 - `next_cursor` is set when the call stopped at a bound before every line
   had a changeset. It is opaque: the client sends it back unchanged, as
   `cursor`, with the same repo, changeset and path, and the reply continues
-  the blame. The ranges of a reply cover the window that call answered,
-  once each. An empty `next_cursor` ends the blame. The server refuses,
-  with `INVALID_ARGUMENT`, a cursor that was not made for the repo,
-  changeset and path of the request.
+  the blame. A call resumed at a bound answers the same window again, from its first
+  line, so a client joins calls by line, not by appending ranges: it keeps
+  the name an earlier call gave a line, and takes from the new reply only
+  the lines that had none. The ranges of a reply cover the
+  window that call answered, once each. An empty `next_cursor` ends the
+  blame. The server refuses, with `INVALID_ARGUMENT`, a cursor that was not
+  made for the repo, changeset and path of the request.
 
 **Bounds per call.** At most 100 versions diffed, and about 1M lines
 diffed (both sides of each diff; a line counts once per 64 bytes). The
@@ -696,21 +706,27 @@ repository.
 - If one changeset is an ancestor of the other, the answer is that one.
   `changeset_ids` is empty when the two histories share no changeset.
 
-**Cost.** A call has no bound on its steps. A step reads one changeset's
-parents, or one entry of the server's commit-graph index. When neither
-first-parent history has a merge newer than where the two meet, the answer
-takes a few dozen steps, at any depth. Otherwise the server walks from both
-changesets, highest generation first, and stops once no other best common
-ancestor can follow. It reads each merge on the way, and the changesets
-where two parts of the walk are at the same generations. It jumps over the
-other runs of first parents, a few dozen steps for each run. A call stops at
-the 600 s limit (section 2), or when its client cancels it. There is no
-resume.
+**Cost.** A call takes at most a million visits. A visit is one move of
+the walk: a step reads one changeset's parents, or one entry of the
+server's commit-graph index; a move of the paint that finds the best
+common ancestors takes one merge. When neither first-parent history has a
+merge newer than where the two meet, the answer takes a few dozen steps,
+at any depth. Otherwise the server walks from both changesets, highest
+generation first, and stops once no other best common ancestor can follow.
+It reads each merge on the way, and the changesets where two parts of the
+walk are at the same generations. It jumps over the other runs of first
+parents, a few dozen steps for each run. A call that passes its million
+visits fails with `RESOURCE_EXHAUSTED` and names the bound in the error's
+message; a retry of the same query visits the same changesets and fails
+the same way, as a `Blame` call whose share does not fit the memory
+budget (section 6.10) does. A call also stops at the 600 s limit
+(section 2), or when its client cancels it. There is no resume.
 
 | Error | When |
 |---|---|
 | `INVALID_ARGUMENT` | A bad repo name or ID. |
 | `NOT_FOUND` | The repo or a changeset does not exist. |
+| `RESOURCE_EXHAUSTED` | The walk passed its million-visit bound. A retry of the same query fails the same way. |
 | `CANCELLED`, `DEADLINE_EXCEEDED` | The call ran past 600 s, or the client cancelled it. |
 
 ### 6.12 IsAncestor
@@ -719,12 +735,15 @@ resume.
 `is_ancestor` is true when `ancestor_id` is `descendant_id`, or is reached
 from it through parents. Ancestry follows every parent, as in `MergeBase`.
 
-**Cost.** A call has no bound on its steps, as in `MergeBase`, and never
-goes below the generation of `ancestor_id`. So when the two differ and
-`ancestor_id`'s generation is not lower, the answer is false. Without a
-merge between the two, the answer takes a few dozen steps, at any depth.
-Each merge newer than `ancestor_id` that the search reaches costs three
-steps. A call stops at the 600 s limit, or when its client cancels it.
+**Cost.** A call takes at most the same million visits a `MergeBase`
+call takes, and never goes below the generation of `ancestor_id`. So when
+the two differ and `ancestor_id`'s generation is not lower, the answer is
+false. Without a merge between the two, the answer takes a few dozen
+steps, at any depth. Each merge newer than `ancestor_id` that the search
+reaches costs three steps. A call that passes the bound fails with
+`RESOURCE_EXHAUSTED`, as a `MergeBase` call does, and a retry of the same
+query fails the same way. A call also stops at the 600 s limit, or when
+its client cancels it.
 
 | Error | When |
 |---|---|
@@ -764,7 +783,10 @@ merge base for a CI job.
   (over the pair limit) or stopped at its budget. See the rename bounds
   below.
 
-**Bound and resume.** A reply holds at most 1,000 entries. When more follow,
+**Bound and resume.** A reply holds at most 1,000 entries. The bound is the
+walk's: `MergeBase` and `IsAncestor` have none (their steps read without a
+limit, and the call stops only at its deadline), while this one reads at
+most 1,000 paths per call. When more follow,
 `next_after` is the last path in `entries`, and the reply holds exactly
 1,000 entries. To continue, a client sends the same request with `after` set
 to `next_after`, until `next_after` is empty. Snapshots never change, so the
@@ -957,7 +979,7 @@ or the next object if none is in progress. It ends the reply after the
 objects before it. A server or tier MUST NOT put an error about the whole
 call in the stream. A missing object ends the reply with `NOT_FOUND`. A
 damaged stored tree, or a damaged blob that the server unpacks, ends it
-with `INTERNAL`. The server does not check a blob that it sends `ZSTD`: if
+with `DATA_LOSS`. The server does not check a blob that it sends `ZSTD`: if
 the stored file is damaged, the receiver finds it (section 5). The client
 MAY keep the objects it got before the error.
 
@@ -1028,8 +1050,9 @@ order is daemon, cache, server. These rules hold for any tier:
   cache, which covers one step of the server, the cache's own three waits
   of 30 s, and 30 s to spare. On a timeout or a wait that ends, the tier
   fails with `UNAVAILABLE`. A caller's deadline passes down. A tier reads
-  the caller's `grpc-timeout`, ends every wait at it less a margin (a tenth
-  of it, at most 1 s), and sends what is left of it upstream as
+  the caller's `grpc-timeout`, ends every wait at it less a margin (a
+  tenth of it, but at least 50 ms, never more than half of it, and at
+  most 1 s), and sends what is left of it upstream as
   `grpc-timeout`. So the status of the deepest process reaches the caller
   in time, for any deadline. A caller whose deadline passes stops waiting,
   and the fetch that another caller with a later deadline waits for goes
@@ -1134,7 +1157,8 @@ proposal (`FAILED_PRECONDITION` names the other one).
 ### 11.1 Protected refs and the gate
 
 The access file names reviewers and protected refs (a deployment matter;
-the README describes the lines):
+[operations.md](operations.md#tokens-one-or-an-access-file) describes the
+lines):
 
 - `review PRINCIPAL REPO`: the principal's approvals and requests for
   changes count in the repo. It needs a whole-repo read rule.
@@ -1232,5 +1256,5 @@ before it runs and a result line after
 | `RESOURCE_EXHAUSTED` | A proposal's cap of heads, reviews or comments. |
 | `UNIMPLEMENTED` | A partial reader, or a server without the service. |
 
-Review state lives in the server's metadata store (SQLite schema 10,
-Postgres schema 6). A `scion-archive-1` export does not carry it yet.
+Review state lives in the server's metadata store (Postgres schema 7,
+`0007_review`). A `scion-archive-1` export does not carry it yet.

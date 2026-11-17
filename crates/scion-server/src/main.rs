@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 //! The `scion-server` binary: `import`, `serve` and `derive`.
 
+use std::io::IsTerminal;
 use std::io::Write as _;
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
@@ -14,7 +15,7 @@ use clap::{Parser, Subcommand, ValueEnum};
 use scion_proto::runtime::listen::{self, Limits};
 use scion_proto::runtime::metrics::{loopback_or_allow, serve as metrics_serve};
 use scion_proto::runtime::tls::ServerTls;
-use scion_server::{ImportOptions, import_git};
+use scion_server::{ImportOptions, admin, import_git};
 
 use scion_server::Metrics;
 use scion_server::Quotas;
@@ -25,28 +26,23 @@ use tracing_subscriber::EnvFilter;
 #[derive(Parser)]
 #[command(version, about, long_about = None)]
 struct Cli {
-    /// The data directory. Holds the SQLite database and the objects.
-    #[arg(long, env = "SCION_DATA", default_value = "scion-data")]
+    /// The data directory. Holds the objects and the backend marker file.
+    #[arg(long, global = true, env = "SCION_DATA", default_value = "scion-data")]
     data: PathBuf,
-    /// Serve metadata from Postgres at this URL instead of the SQLite
-    /// database of the data directory. The URL holds the credentials, so it
-    /// is never logged. Prefer `--postgres-url-file` or `SCION_POSTGRES_URL`:
-    /// a URL on the command line is readable by every local account (`ps`).
-    #[arg(long, value_name = "URL")]
-    postgres_url: Option<String>,
     /// File with the Postgres URL, read like the access file: the owner
-    /// alone may read it, and a symlink is refused. Give `--postgres-url`
-    /// or `--postgres-url-file`, not both.
+    /// alone may read it, and a symlink is refused. The URL may also ride
+    /// `SCION_POSTGRES_URL`; give one, not both.
     #[arg(
         long,
-        conflicts_with = "postgres_url",
+        global = true,
         env = "SCION_POSTGRES_URL_FILE",
         value_name = "FILE"
     )]
     postgres_url_file: Option<PathBuf>,
     /// Verify the certificate of the Postgres server with this CA (PEM).
-    /// Required when `--postgres-url` names a host that is not local.
-    #[arg(long, requires = "postgres_url", value_name = "FILE")]
+    /// Required when the URL names a host that is not local; the URL may
+    /// come from `--postgres-url-file` or `SCION_POSTGRES_URL`.
+    #[arg(long, global = true, value_name = "FILE")]
     postgres_ca: Option<PathBuf>,
     #[command(subcommand)]
     command: Command,
@@ -58,33 +54,37 @@ struct ServeArgs {
     /// Address to listen on.
     #[arg(long, default_value = "127.0.0.1:7878")]
     listen: SocketAddr,
-    /// Bearer token that clients must send. Its principal, `default`,
-    /// may read and write every repo. Give `--token`, `--token-file` or
-    /// `--access`, not two. With this, the per-principal quotas are off
+    /// Move the metadata schema to this build's version at the open,
+    /// when the database is behind. Without it, a serve on a database
+    /// that is behind is refused with the fix named (`scion-server
+    /// migrate`); a fresh database is created either way.
+    #[arg(long)]
+    migrate: bool,
+    /// File with the bearer token of the single principal, `default`,
+    /// which may read and write every repo. Give `--token-file` or
+    /// `--access`, not both. With this, the per-principal quotas are off
     /// unless a flag sets one: every client is the same principal, so a
     /// cap would be a global one.
-    #[arg(long, value_name = "TOKEN")]
-    token: Option<String>,
-    /// File with the bearer token of `--token`, read like the access
-    /// file: the owner alone may read it, and a symlink is refused.
-    #[arg(long, conflicts_with_all = ["token", "access"], value_name = "FILE")]
+    #[arg(long, conflicts_with = "access", value_name = "FILE")]
     token_file: Option<PathBuf>,
     /// Access file: tokens with principals, and which repos and paths
-    /// each principal may read and write. Give `--token` or `--access`,
-    /// not both.
+    /// each principal may read and write. Give `--token-file` or
+    /// `--access`, not both.
     #[arg(long, value_name = "FILE")]
     access: Option<PathBuf>,
     /// Most requests one principal may hold at once. With `--access`
-    /// the default is 64; with `--token` the check is off.
+    /// the default is 64; in the single-principal mode the check is
+    /// off.
     #[arg(long)]
     max_principal_requests: Option<NonZeroUsize>,
     /// Most upload bytes one principal may hold in flight. With
-    /// `--access` the default is 536870912 (512 MiB); with `--token`
-    /// the check is off.
+    /// `--access` the default is 536870912 (512 MiB); in the
+    /// single-principal mode the check is off.
     #[arg(long, value_name = "BYTES")]
     max_principal_upload_bytes: Option<NonZeroUsize>,
     /// Most pending lands one principal may hold at once. With
-    /// `--access` the default is 64; with `--token` the check is off.
+    /// `--access` the default is 64; in the single-principal mode the
+    /// check is off.
     #[arg(long)]
     max_principal_pending_lands: Option<NonZeroUsize>,
     /// A land that has been pending for longer than this many seconds is
@@ -155,16 +155,34 @@ struct ServeArgs {
 enum Command {
     /// Serve the gRPC API.
     Serve(ServeArgs),
+    /// Check everything a first boot needs, read-only: one line per
+    /// check, and an exit code for the shell (0 all pass, 1 one warns,
+    /// 2 one fails). The flags are `serve`'s; nothing is written, no
+    /// lock is taken, and the database is read through plain selects.
+    Preflight(ServeArgs),
+    /// Move the metadata schema to this build's version: the steps an
+    /// open would run, one transaction each, under the schema's lock.
+    /// `serve` without `--migrate` refuses a database that is behind.
+    /// With `--check`, print the state instead: the database's version,
+    /// this build's version, and the steps a migration would run.
+    Migrate {
+        /// Print the state and exit without touching anything. Exit 3
+        /// when steps are pending, 0 when none, 1 when the state cannot
+        /// be read (a newer database, a database that does not answer).
+        #[arg(long)]
+        check: bool,
+        /// Where the audit log goes. The default is `audit.log` in the
+        /// data directory: the migration's record opens the same file
+        /// every other command appends to.
+        #[arg(long, value_name = "FILE")]
+        audit_file: Option<PathBuf>,
+    },
     /// Print the BLAKE3 digest of a token, as a `token` line of an access
     /// file wants it. The file holds digests, never tokens.
     HashToken {
-        /// The token to digest. Give `--token` (deprecated: it sits in
-        /// the process list), `--token-file`, `SCION_TOKEN`, or the
-        /// token on stdin.
-        #[arg(long, value_name = "TOKEN")]
-        token: Option<String>,
-        /// File with the token to digest, read like the access file.
-        #[arg(long, conflicts_with = "token", value_name = "FILE")]
+        /// The token to digest. Give `--token-file`, `SCION_TOKEN`, or
+        /// the token on stdin.
+        #[arg(long, value_name = "FILE")]
         token_file: Option<PathBuf>,
     },
     /// Generate an Ed25519 key for the tickets of object reads: writes the
@@ -198,6 +216,41 @@ enum Command {
         verify: usize,
         /// Path to the git repository.
         git_dir: PathBuf,
+        /// Where the audit log goes. The default is `audit.log` in the
+        /// data directory: the same file the server appends to, so one
+        /// file holds the whole history of a data directory.
+        #[arg(long, value_name = "FILE")]
+        audit_file: Option<PathBuf>,
+    },
+    /// Make a repository with one root changeset (no parents, the empty
+    /// tree) and its first ref at it, without a Git import. Refuses a repo
+    /// that exists. It can run while the server runs.
+    CreateRepo {
+        /// Scion repository to make.
+        #[arg(long)]
+        repo: String,
+        /// The first ref, at the root changeset. A client lands on it.
+        #[arg(long = "ref", default_value = "main")]
+        trunk: String,
+        /// Where the audit log goes. The default is `audit.log` in the
+        /// data directory: the same file the server appends to, so one
+        /// file holds the whole history of a data directory.
+        #[arg(long, value_name = "FILE")]
+        audit_file: Option<PathBuf>,
+    },
+    /// Make a ref in an existing repository at a changeset the repository
+    /// holds, named by its hex ID. Refuses a ref that exists; moving a ref
+    /// is a land's compare-and-set. It can run while the server runs.
+    CreateRef {
+        /// Scion repository to make the ref in.
+        #[arg(long)]
+        repo: String,
+        /// The ref to make.
+        #[arg(long = "ref")]
+        target_ref: String,
+        /// Hex ID of the changeset the ref points at.
+        #[arg(long)]
+        at: String,
         /// Where the audit log goes. The default is `audit.log` in the
         /// data directory: the same file the server appends to, so one
         /// file holds the whole history of a data directory.
@@ -317,9 +370,11 @@ enum KindName {
     PathHistory,
 }
 
-/// Runs `export` and prints the manifest's counts. Exits 0, or 2 when
-/// the export could not run.
-fn archive_export(store: &Backend, data: &Path, repo: Option<&str>, all: bool, out: &Path) -> ! {
+/// Runs `export` and prints the manifest's counts, and returns the exit
+/// code: 0, or 2 when the export could not run. The code returns
+/// instead of `std::process::exit`, whose destructors skip the caller's
+/// cleanup: the staging folder goes with the run.
+fn archive_export(store: &Backend, data: &Path, repo: Option<&str>, all: bool, out: &Path) -> i32 {
     match archive::export(store, data, repo, all, out) {
         Ok(manifest) => {
             let counts = &manifest["counts"];
@@ -331,27 +386,26 @@ fn archive_export(store: &Backend, data: &Path, repo: Option<&str>, all: bool, o
                 counts["pending_lands"],
                 counts["blobs"],
             );
-            std::process::exit(0)
+            0
         }
         Err(e) => {
             eprintln!("scion-server export: {e}");
-            std::process::exit(2);
+            2
         }
     }
 }
 
-/// Runs `fsck` against `store`, prints one line per problem, and exits:
-/// 0 when it saw no damage, 1 when it did, 2 when it could not run.
-/// The exits are `std::process::exit`, which skips destructors: safe
-/// here, because nothing this function holds needs dropping — the
-/// store's lock is released by the kernel at exit, and the report is
-/// plain data.
-fn fsck_command(store: &Backend) -> anyhow::Result<()> {
+/// Runs `fsck` against `store`, prints one line per problem, and returns
+/// the exit code: 0 when it saw no damage, 1 when it did, 2 when it
+/// could not run. The code returns instead of `std::process::exit`,
+/// whose destructors skip the caller's cleanup: the staging folder goes
+/// with the run.
+fn fsck_command(store: &Backend) -> i32 {
     let report = match fsck::run(store, fsck::BATCH, &mut |_| {}) {
         Ok(report) => report,
         Err(e) => {
             eprintln!("scion-server fsck: {e}");
-            std::process::exit(2);
+            return 2;
         }
     };
     for problem in &report.problems {
@@ -365,17 +419,14 @@ fn fsck_command(store: &Backend) -> anyhow::Result<()> {
         report.problems.len(),
         report.old.len()
     );
-    if report.is_clean() {
-        std::process::exit(0);
-    }
-    std::process::exit(1);
+    i32::from(!report.is_clean())
 }
 
 /// Opens the audit log a CLI subcommand records its admin lines in:
 /// the same file, checks, and writer the server uses, so the CLI and a
 /// running server append whole lines to one file. A run that cannot
 /// record refuses before it changes anything.
-/// D25: a missing data directory is refused, not created. One rule for
+/// A missing data directory is refused, not created (#578). One rule for
 /// every subcommand that touches a store; `restore` creates its own
 /// target and never sees this.
 fn refuse_missing_data_dir(data: &Path) -> anyhow::Result<()> {
@@ -541,7 +592,7 @@ async fn restore_command(
     audit: scion_server::Audit,
     data: &Path,
     archive: &Path,
-    postgres_url: Option<&str>,
+    postgres_url: &str,
     postgres_ca: Option<&Path>,
 ) -> anyhow::Result<()> {
     let what = serde_json::json!({ "what": "restore" });
@@ -576,6 +627,26 @@ async fn restore_command(
         report.refs,
         report.lands
     );
+    // The RSS ceiling's measurement seam (test-hooks only): at the very
+    // end, the process reads its own high-water mark - the kernel's
+    // exact peak RSS of this run, race-free because the reader is the
+    // process that lived it. The ceiling test parses this line from the
+    // child's stderr; a default build never reads the environment.
+    #[cfg(all(target_os = "linux", any(test, feature = "test-hooks")))]
+    if std::env::var_os("SCION_TEST_RESTORE_PEAK").is_some() {
+        let status = std::fs::read_to_string("/proc/self/status")
+            .context("cannot read /proc/self/status")?;
+        for line in status.lines() {
+            if let Some(kb) = line.strip_prefix("VmHWM:") {
+                // The number only: the ceiling test parses the rest of
+                // this line as the peak.
+                println!(
+                    "restore: peak RSS {}",
+                    kb.trim().trim_end_matches("kB").trim()
+                );
+            }
+        }
+    }
     Ok(())
 }
 
@@ -717,15 +788,82 @@ fn write_gc_metrics_file(path: &Path, report: &gc::Report, took: Duration, dry_r
     }
 }
 
+/// The reply-memory budget the serve command runs with: the compiled
+/// default, or the size the env names. Test-hooks only: the lever tests
+/// spawn a child server and need a budget small enough that parking a
+/// few unread replies binds it (the compiled 128 MiB cannot be bound by
+/// the 256 streams one connection may open). Release builds never read
+/// the env.
+#[cfg(feature = "test-hooks")]
+fn test_reply_budget() -> usize {
+    match std::env::var_os("SCION_TEST_REPLY_BUDGET") {
+        Some(value) => value
+            .to_str()
+            .and_then(|value| value.parse().ok())
+            .unwrap_or(scion_server::REPLY_MEMORY_BUDGET),
+        None => scion_server::REPLY_MEMORY_BUDGET,
+    }
+}
+
+#[cfg(not(feature = "test-hooks"))]
+fn test_reply_budget() -> usize {
+    scion_server::REPLY_MEMORY_BUDGET
+}
+
+/// The staging folder a one-shot command removes when it ends - success,
+/// error, or panic - so the next open's sweep has nothing of a live run
+/// to call a crash's leftover. The server keeps its folder for its life.
+struct StagingFolder {
+    path: std::path::PathBuf,
+}
+
+impl Drop for StagingFolder {
+    fn drop(&mut self) {
+        // A failed cleanup would show up at the next start as a crash's
+        // leftover, with nothing saying why: name the path and the error.
+        // NotFound is fine: the folder is gone, which is the point.
+        if let Err(why) = std::fs::remove_dir_all(&self.path)
+            && why.kind() != std::io::ErrorKind::NotFound
+        {
+            tracing::warn!(
+                path = %self.path.display(),
+                error = %why,
+                "the run's staging folder could not be removed"
+            );
+        }
+    }
+}
 #[tokio::main]
 #[allow(clippy::too_many_lines)]
 async fn main() -> anyhow::Result<()> {
     // Logs go to stderr: stdout carries the output of `ticket-key` and
     // `hash-token`, which callers capture with $(...).
+    // Color only when stderr is a terminal: a file or a pipe is a log
+    // to keep, and escape bytes in it are noise on every line.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .init();
+    if let Some(removed) = scion_proto::runtime::auth::removed::removed_flag_of(
+        std::env::args_os().skip(1).collect::<Vec<_>>().as_slice(),
+        &[
+            scion_proto::runtime::auth::removed::RemovedFlag {
+                flag: "--token",
+                instead: "pass the token in SCION_TOKEN, in a file with --token-file FILE, or in --access FILE",
+            },
+            scion_proto::runtime::auth::removed::RemovedFlag {
+                flag: "--postgres-url",
+                instead: "pass the URL in SCION_POSTGRES_URL, or in a file with --postgres-url-file FILE",
+            },
+        ],
+    ) {
+        eprintln!(
+            "error: {}",
+            scion_proto::runtime::auth::removed::refusal_text(removed)
+        );
+        std::process::exit(2);
+    }
     let cli = Cli::parse();
     // Every `serve` flag is checked before the data directory opens: a bad
     // flag must not take the data directory's one-server lock, and must
@@ -735,19 +873,103 @@ async fn main() -> anyhow::Result<()> {
         _ => None,
     };
     // `hash-token`, `verify`, and `restore` need no data directory (verify
-    // reads only the archive; restore makes a new one). An import does not
-    // land, so it can run beside the server. `derive` removes rows of older
-    // versions of a kind, which a running server of an older build may
-    // read, so it opens as the server.
-    // The Postgres URL of the flags: the file form wins (the two cannot
-    // be given together), the argv form warns, the env is quiet.
-    let postgres_url = postgres_url_of(&cli)?;
+    // reads only the archive; restore makes a new one), and `hash-token`
+    // and `ticket-key` read no store, so none of the four needs the
+    // Postgres URL. An import does not land, so it can run beside the
+    // server. `derive` removes rows of older versions of a kind, which a
+    // running server of an older build may read, so it opens as the
+    // server.
     // `verify` and `restore` run without a store: verify reads only the
     // archive, and restore makes a data directory of its own. Handle them
     // before the store opens, so a restore's empty target stays empty of
     // one, and an archive check opens nothing at all.
     match cli.command {
+        // `preflight` reports a missing directory as a failed check, so
+        // it runs before the refusal and writes nothing anywhere.
+        Command::Preflight(ref args) => {
+            // The flags' rules are serve's own: the token source, the
+            // listen rules, the TLS and ticket files. A failure here is
+            // one failed check, not the whole answer: the line prints
+            // and the checks still run - one bad flag must not hide
+            // every other check, which is what this command exists to
+            // stop. The chain prints whole ({error:#}), as serve's own
+            // exit does, so the cause shows.
+            let flags_error = serve_flags(args).err();
+            if let Some(error) = &flags_error {
+                println!("fail serve flags: {error:#}");
+            }
+            let options = preflight_options(&cli, args);
+            // The checks' database reads are synchronous, and main runs
+            // in tokio's runtime: the run takes a thread of its own,
+            // where a blocking connect is just a blocking connect.
+            let report = std::thread::spawn(move || scion_server::preflight::run(&options))
+                .join()
+                .expect("the preflight thread does not panic");
+            for line in report.lines {
+                println!("{line}");
+            }
+            // The higher of the checks' code and the flags' failure: a
+            // warn with a bad flag still exits 2, and a fail without
+            // one does too.
+            std::process::exit(report.code.max(if flags_error.is_some() { 2 } else { 0 }));
+        }
         Command::Verify { archive } => verify_command(&archive),
+        // `hash-token` reads none of the store: it runs before the URL
+        // is resolved, so an operator who hashes a token needs no
+        // database.
+        Command::HashToken { .. } => return hash_token(),
+        // `migrate --check` reads the schema state and writes nothing:
+        // the check is safe beside a live server, and its exit table is
+        // 0 clean, 3 pending, 1 unreadable. A pending database is not a
+        // failure of the command - it is the answer the operator asked
+        // for - so it gets its own code.
+        Command::Migrate { check: true, .. } => {
+            let postgres_url = postgres_url_of(cli.postgres_url_file.as_ref())?;
+            let state = scion_server::check_schema(&postgres_url, cli.postgres_ca.as_deref())?;
+            println!(
+                "the database is at schema version {}, this build ships {}",
+                state.db_version(),
+                state.build_version()
+            );
+            if state.is_pending() {
+                for name in state.pending() {
+                    println!("would run: {name}");
+                }
+                eprintln!(
+                    "scion-server migrate --check: {} migration(s) pending; run `scion-server migrate`",
+                    state.pending().len()
+                );
+                std::process::exit(3);
+            }
+            println!("no migrations pending");
+            return Ok(());
+        }
+        // `migrate` moves the schema on purpose: the same path the
+        // open runs, under the schema's lock. The audit record lands in
+        // the data directory's own file, like every other command's.
+        Command::Migrate {
+            check: false,
+            audit_file,
+        } => {
+            refuse_missing_data_dir(&cli.data)?;
+            let postgres_url = postgres_url_of(cli.postgres_url_file.as_ref())?;
+            let moved = scion_server::migrate_store(&postgres_url, cli.postgres_ca.as_deref())?;
+            let audit = cli_audit(&cli.data, audit_file.as_deref())?;
+            if let Some((from, to)) = moved {
+                audit
+                    .record(scion_server::Event::new(
+                        "admin",
+                        "ok",
+                        serde_json::json!({ "what": "migrate", "from": from, "to": to }),
+                    ))
+                    .await
+                    .with_context(|| "cannot record the migration in the audit log".to_owned())?;
+                println!("migrated the metadata schema from version {from} to {to}");
+            } else {
+                println!("no migrations pending");
+            }
+            return Ok(());
+        }
         Command::Restore {
             archive,
             audit_file,
@@ -759,33 +981,28 @@ async fn main() -> anyhow::Result<()> {
             scion_proto::runtime::auth::create_private_dir_all(&cli.data)
                 .with_context(|| format!("cannot create {}", cli.data.display()))?;
             let audit = cli_audit(&cli.data, audit_file.as_deref())?;
+            // Restore makes a store, so it needs the URL.
+            let postgres_url = postgres_url_of(cli.postgres_url_file.as_ref())?;
             return restore_command(
                 audit,
                 &cli.data,
                 &archive,
-                cli.postgres_url.as_deref(),
+                &postgres_url,
                 cli.postgres_ca.as_deref(),
             )
             .await;
         }
         _ => {}
     }
-    // D25: a missing data directory is refused, not created. Every
+    // A missing data directory is refused, not created (#578). Every
     // subcommand that touches a store or writes into the directory must
     // find it there; `restore` is the one command whose job is to
-    // create one, `verify` reads only the archive, and `hash-token`
-    // touches no store. A silent `./scion-data` in whatever directory a
+    // create one, and `verify`, `hash-token` and `ticket-key` returned
+    // above. A silent `./scion-data` in whatever directory a
     // run happened to start in has bitten once already: ticket-key
     // wrote an audit log into the cwd's default, where CI's ACL
     // refused it.
-    if let Err(refusal) = if matches!(
-        cli.command,
-        Command::Verify { .. } | Command::Restore { .. } | Command::HashToken { .. }
-    ) {
-        Ok(())
-    } else {
-        refuse_missing_data_dir(&cli.data)
-    } {
+    if let Err(refusal) = refuse_missing_data_dir(&cli.data) {
         if matches!(cli.command, Command::Fsck) {
             // fsck's exit table promises 2 for "could not run"
             // (docs/stability.md, 1.x): the refusal is that case.
@@ -794,52 +1011,86 @@ async fn main() -> anyhow::Result<()> {
         }
         return Err(refusal);
     }
-    let store = match cli.command {
-        Command::Import { .. } | Command::Gc { .. } | Command::Export { .. } => {
-            Backend::open_shared(
-                &cli.data,
-                postgres_url.as_deref(),
-                cli.postgres_ca.as_deref(),
-            )
+    // `ticket-key` writes the key file and the audit log, and reads no
+    // store: it runs before the URL is resolved, so a key run needs no
+    // database.
+    if let Command::TicketKey { out, audit_file } = cli.command {
+        // The key file lives wherever the operator says; the audit
+        // log lives in the data directory, as for every other
+        // command. A run that cannot record refuses to make the key.
+        scion_proto::runtime::auth::create_private_dir_all(&cli.data)
+            .with_context(|| format!("cannot create {}", cli.data.display()))?;
+        let audit = cli_audit(&cli.data, audit_file.as_deref())?;
+        return ticket_key_command(audit, &out).await;
+    }
+    // Every remaining command opens the store, so all of them need the
+    // Postgres URL: resolve it once, here. The commands that read none
+    // of the store - `verify`, `hash-token`, `ticket-key` - returned
+    // above, and never refuse a missing one. `fsck`'s exit table
+    // promises 2 for "could not run", and a missing URL is that case;
+    // the other commands fail with the generic open failure's 1.
+    let postgres_url = match postgres_url_of(cli.postgres_url_file.as_ref()) {
+        Ok(url) => url,
+        Err(why) => {
+            if matches!(cli.command, Command::Fsck) {
+                eprintln!("scion-server fsck: {why:#}");
+                std::process::exit(2);
+            }
+            return Err(why);
         }
-        Command::HashToken { .. } => return hash_token(),
-        Command::TicketKey { out, audit_file } => {
-            // The key file lives wherever the operator says; the audit
-            // log lives in the data directory, as for every other
-            // command. A run that cannot record refuses to make the key.
-            scion_proto::runtime::auth::create_private_dir_all(&cli.data)
-                .with_context(|| format!("cannot create {}", cli.data.display()))?;
-            let audit = cli_audit(&cli.data, audit_file.as_deref())?;
-            return ticket_key_command(audit, &out).await;
+    };
+    let store = match cli.command {
+        Command::Import { .. }
+        | Command::CreateRepo { .. }
+        | Command::CreateRef { .. }
+        | Command::Gc { .. }
+        | Command::Export { .. } => {
+            Backend::open_shared(&cli.data, &postgres_url, cli.postgres_ca.as_deref())
         }
         // `fsck` cannot run when the store cannot open, and its table
         // says that is 2, not the generic open failure's 1.
-        Command::Fsck => match Backend::open_shared(
-            &cli.data,
-            postgres_url.as_deref(),
-            cli.postgres_ca.as_deref(),
-        ) {
-            Ok(store) => Ok(store),
-            Err(e) => {
-                eprintln!("scion-server fsck: {e}");
-                // `exit` skips destructors: safe on this path, because
-                // nothing was opened yet — the store refused to open,
-                // so there is no lock to release and nothing buffered.
-                std::process::exit(2);
+        Command::Fsck => {
+            match Backend::open_shared(&cli.data, &postgres_url, cli.postgres_ca.as_deref()) {
+                Ok(store) => Ok(store),
+                Err(e) => {
+                    eprintln!("scion-server fsck: {e}");
+                    // `exit` skips destructors: safe on this path, because
+                    // nothing was opened yet — the store refused to open,
+                    // so there is no lock to release and nothing buffered.
+                    std::process::exit(2);
+                }
             }
-        },
-        // `verify` and `restore` ended the function above: verify exits,
-        // and restore returns.
-        Command::Verify { .. } | Command::Restore { .. } => {
+        }
+        // `verify`, `restore`, `hash-token` and `ticket-key` ended the
+        // function above: verify exits, and the others return. `migrate`
+        // ran its command above and returned: it opens no store here.
+        Command::Preflight(_)
+        | Command::Verify { .. }
+        | Command::Restore { .. }
+        | Command::HashToken { .. }
+        | Command::TicketKey { .. }
+        | Command::Migrate { .. } => {
             unreachable!("handled before the store opens")
         }
-        Command::Serve { .. } | Command::Derive { .. } => Backend::open(
-            &cli.data,
-            postgres_url.as_deref(),
-            cli.postgres_ca.as_deref(),
-        ),
+        Command::Serve(ref args) if args.migrate => {
+            Backend::open_migrating(&cli.data, &postgres_url, cli.postgres_ca.as_deref())
+        }
+        Command::Serve { .. } | Command::Derive { .. } => {
+            Backend::open(&cli.data, &postgres_url, cli.postgres_ca.as_deref())
+        }
     }
-    .with_context(|| format!("cannot open data directory {}", cli.data.display()))?;
+    .with_context(|| format!("cannot open the store at {}", cli.data.display()))?;
+    // A one-shot command removes its own staging folder when it ends -
+    // success, error, or panic - so the next open's sweep has nothing of
+    // a live run to call a crash's leftover. The guard is armed after
+    // the store opens; the server keeps its folder for its life.
+    let staging = if matches!(cli.command, Command::Serve { .. }) {
+        None
+    } else {
+        Some(StagingFolder {
+            path: store.temp_folder().to_path_buf(),
+        })
+    };
     match cli.command {
         Command::Serve { .. } => {
             let flags = flags.expect("a serve command validated its flags");
@@ -893,15 +1144,21 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::HashToken { .. }
         | Command::TicketKey { .. }
+        | Command::Preflight(_)
         | Command::Verify { .. }
-        | Command::Restore { .. } => {
+        | Command::Restore { .. }
+        | Command::Migrate { .. } => {
             unreachable!("handled before the store opens")
         }
         Command::Export { repo, all, out } => {
-            archive_export(&store, &cli.data, repo.as_deref(), all, &out);
+            let code = archive_export(&store, &cli.data, repo.as_deref(), all, &out);
+            drop(staging);
+            std::process::exit(code);
         }
         Command::Fsck => {
-            return fsck_command(&store);
+            let code = fsck_command(&store);
+            drop(staging);
+            std::process::exit(code);
         }
         Command::Gc {
             grace_secs,
@@ -936,6 +1193,25 @@ async fn main() -> anyhow::Result<()> {
                 verify_sample: verify,
             };
             import_command(audit, store, repo, git_dir, opts).await?;
+        }
+        Command::CreateRepo {
+            repo,
+            trunk,
+            audit_file,
+        } => {
+            let audit = cli_audit(&cli.data, audit_file.as_deref())?;
+            record_migrated(&audit, &store).await?;
+            admin::create_repo(audit, store, repo, trunk).await?;
+        }
+        Command::CreateRef {
+            repo,
+            target_ref,
+            at,
+            audit_file,
+        } => {
+            let audit = cli_audit(&cli.data, audit_file.as_deref())?;
+            record_migrated(&audit, &store).await?;
+            admin::create_ref(audit, store, repo, target_ref, at).await?;
         }
         Command::Derive {
             kind,
@@ -1016,9 +1292,10 @@ fn server_tls(
     }
 }
 
-/// The three per-principal caps, as the flags set them. With one principal
-/// (the `--token` mode) a per-principal cap is a global one, so each cap is
-/// off unless a flag sets it; with an access file the defaults apply.
+/// The three per-principal caps, as the flags set them. In the
+/// single-principal mode (one token from the environment or a file) a
+/// per-principal cap is a global one, so each cap is off unless a flag
+/// sets it; with an access file the defaults apply.
 struct Caps {
     quotas: Quotas,
     pending_lands: Option<usize>,
@@ -1089,25 +1366,25 @@ struct ServeFlags {
     mtls: bool,
 }
 
-/// Checks every `serve` flag that a parse alone does not settle: the rules
-/// of `--token` against `--access`, the TLS files, the ticket keys, and the
-/// listen rule (a non-loopback address needs TLS or `--insecure-listen`).
-/// Checks every `serve` flag that a parse alone does not settle: the rules
-/// of `--token` against `--access`, the TLS files, the ticket keys, and the
-/// listen rule (a non-loopback address needs TLS or `--insecure-listen`).
+/// Checks every `serve` flag that a parse alone does not settle: the
+/// token's rules against `--access`, the TLS files, the ticket keys,
+/// and the listen rule (a non-loopback address needs TLS or
+/// `--insecure-listen`).
+/// Checks every `serve` flag that a parse alone does not settle: the
+/// token's rules against `--access`, the TLS files, the ticket keys,
+/// and the listen rule (a non-loopback address needs TLS or
+/// `--insecure-listen`).
 fn serve_flags(args: &ServeArgs) -> anyhow::Result<ServeFlags> {
-    // The token of the flags: the file form, the env, or the argv form,
-    // which warns. The second reply says whether the mode is one token:
-    // with one principal, a per-principal cap is a global one, so the
-    // quotas are off unless a flag sets one.
-    let token = match (&args.token, &args.token_file) {
-        (Some(_), Some(_)) => unreachable!("clap refuses --token with --token-file"),
-        (Some(_), None) => {
-            warn_argv_secret("--token", "--token-file (or SCION_TOKEN)");
-            args.token.clone()
-        }
-        (None, Some(file)) => Some(secret_file(file)?),
-        (None, None) => std::env::var("SCION_TOKEN").ok().filter(|t| !t.is_empty()),
+    // The token of the flags: the checked file, or the environment. The
+    // second reply says whether the mode is one token: with one
+    // principal, a per-principal cap is a global one, so the quotas are
+    // off unless a flag sets one.
+    let token = match &args.token_file {
+        Some(file) => Some(secret_file(file)?),
+        None => std::env::var("SCION_TOKEN")
+            .ok()
+            .map(|t| t.trim().to_owned())
+            .filter(|t| !t.is_empty()),
     };
     let (access, single) = load_access(token, None, args.access.clone())?;
     let caps = caps(
@@ -1220,6 +1497,7 @@ async fn serve(
                 connections: config.max_connections,
                 streams: config.max_streams,
                 stalled_bytes: config.max_stalled_bytes,
+                ..Limits::default()
             },
             quotas: config.quotas,
             pending_lands: config.pending_lands,
@@ -1227,6 +1505,7 @@ async fn serve(
             tls: config.server_tls,
             metrics,
             audit: config.audit,
+            reply_memory_budget: test_reply_budget(),
         },
         tickets,
         async move {
@@ -1236,24 +1515,6 @@ async fn serve(
     ))
     .await?;
     Ok(())
-}
-
-/// The stderr warning of a secret that arrived on the command line: ps
-/// and `/proc/$$/cmdline` show it to every local account, and it lands
-/// in shell history. The argv form stays for now (the owner's D8: warn
-/// first, remove in a later minor); the replacement reads a file that
-/// the checked read of the access file protects.
-fn argv_secret_warning(flag: &str, replacement: &str) -> String {
-    format!(
-        "warning: {flag} put a secret on the command line, which ps and \
-         /proc/$$/cmdline show to every local account, and which lands in \
-         shell history; use {replacement} instead (the argv form is \
-         deprecated and goes away in a later release)"
-    )
-}
-
-fn warn_argv_secret(flag: &str, replacement: &str) {
-    eprintln!("{}", argv_secret_warning(flag, replacement));
 }
 
 /// A secret from a file the checked read protects, trimmed: the owner
@@ -1269,27 +1530,45 @@ fn secret_file(file: &Path) -> anyhow::Result<String> {
     Ok(token.to_owned())
 }
 
-/// The Postgres URL of the CLI: the file form wins (clap refuses both
-/// at once), the argv form warns, the env is quiet.
-fn postgres_url_of(cli: &Cli) -> anyhow::Result<Option<String>> {
-    if let Some(file) = &cli.postgres_url_file {
-        return Ok(Some(secret_file(file)?));
+/// The options of a `preflight` run, as the flags hand them over. The
+/// data directory, the URL file and the CA ride the command line's
+/// global flags; the rest are serve's own.
+fn preflight_options(cli: &Cli, args: &ServeArgs) -> scion_server::preflight::PreflightOptions {
+    scion_server::preflight::PreflightOptions {
+        data: cli.data.clone(),
+        postgres_url_file: cli.postgres_url_file.clone(),
+        postgres_ca: cli.postgres_ca.clone(),
+        listen: args.listen,
+        metrics_listen: args.metrics_listen,
+        migrate: args.migrate,
     }
-    if let Some(url) = &cli.postgres_url {
-        warn_argv_secret(
-            "--postgres-url",
-            "--postgres-url-file (or SCION_POSTGRES_URL)",
-        );
-        return Ok(Some(url.clone()));
-    }
-    Ok(std::env::var("SCION_POSTGRES_URL")
-        .ok()
-        .filter(|u| !u.is_empty()))
 }
 
-/// The rules of `serve`: exactly one of `--token` (one principal with
-/// every right), `--token-file` (the same principal, from a checked
-/// file) and `--access` (a file of tokens and rules).
+/// The Postgres URL of the CLI, required: a checked file named by
+/// `--postgres-url-file`, or `SCION_POSTGRES_URL`. Every command that
+/// opens the store needs one: the metadata has nowhere else to live.
+/// The fields come in one at a time, because a caller that matched its
+/// command out of `Cli` holds a partially moved value.
+fn postgres_url_of(url_file: Option<&PathBuf>) -> anyhow::Result<String> {
+    if let Some(file) = url_file {
+        let url = secret_file(file)?;
+        scion_server::check_db_url(&url, &format!("--postgres-url-file {}", file.display()))?;
+        return Ok(url);
+    }
+    let url = std::env::var("SCION_POSTGRES_URL")
+        .ok()
+        .filter(|u| !u.is_empty())
+        .ok_or_else(|| {
+            anyhow::anyhow!("no Postgres URL: give --postgres-url-file or SCION_POSTGRES_URL")
+        })?;
+    scion_server::check_db_url(&url, "SCION_POSTGRES_URL")?;
+    Ok(url)
+}
+
+/// The rules of `serve`: exactly one of `--token-file` (one principal
+/// with every right, from a checked file) and `--access` (a file of
+/// tokens and rules). The environment form of the single principal is
+/// `SCION_TOKEN`.
 fn load_access(
     token: Option<String>,
     token_file: Option<PathBuf>,
@@ -1301,15 +1580,23 @@ fn load_access(
         .count();
     anyhow::ensure!(
         given == 1,
-        "give --token, --token-file or --access, not two"
+        if given == 0 {
+            "give --token-file, SCION_TOKEN or --access: serve has no token source"
+        } else {
+            "give --token-file, SCION_TOKEN or --access, not two"
+        }
     );
     if let Some(file) = token_file {
         let token = secret_file(&file)?;
         return Ok((scion_server::Access::single(&token), true));
     }
     if let Some(token) = token {
-        anyhow::ensure!(!token.is_empty(), "--token must not be empty");
-        return Ok((scion_server::Access::single(&token), true));
+        let trimmed = token.trim();
+        anyhow::ensure!(
+            !trimmed.is_empty(),
+            "SCION_TOKEN must not be empty or whitespace-only"
+        );
+        return Ok((scion_server::Access::single(trimmed), true));
     }
     let file = access.expect("exactly one source is given");
     // The access file holds bearer tokens: read through one checked
@@ -1428,21 +1715,16 @@ fn make_key_file(out: &Path) -> std::result::Result<scion_server::Keys, anyhow::
 /// Prints the BLAKE3 digest of the token of `hash-token`.
 fn hash_token() -> anyhow::Result<()> {
     let Cli { command, .. } = Cli::parse();
-    let Command::HashToken { token, token_file } = command else {
+    let Command::HashToken { token_file } = command else {
         unreachable!("hash_token handles only the hash-token command")
     };
     // The token's source: the checked file, the env, the argv form (it
     // warns), or stdin, which keeps the token out of the process list
     // and out of the shell history alike.
-    let token = match (&token, &token_file) {
-        (Some(_), Some(_)) => unreachable!("clap refuses --token with --token-file"),
-        (None, Some(file)) => secret_file(file)?,
-        (Some(_), None) => {
-            warn_argv_secret("--token", "--token-file, SCION_TOKEN or stdin");
-            token.expect("the argv form is given")
-        }
-        (None, None) => match std::env::var("SCION_TOKEN") {
-            Ok(env_token) if !env_token.is_empty() => env_token,
+    let token = match &token_file {
+        Some(file) => secret_file(file)?,
+        None => match std::env::var("SCION_TOKEN") {
+            Ok(env_token) if !env_token.trim().is_empty() => env_token.trim().to_owned(),
             _ => {
                 use std::io::Read as _;
                 let mut from_stdin = String::new();
@@ -1452,7 +1734,7 @@ fn hash_token() -> anyhow::Result<()> {
                 let from_stdin = from_stdin.trim().to_owned();
                 anyhow::ensure!(
                     !from_stdin.is_empty(),
-                    "give --token, --token-file, SCION_TOKEN or a token on stdin"
+                    "give --token-file, SCION_TOKEN or a token on stdin"
                 );
                 from_stdin
             }
@@ -1468,6 +1750,16 @@ fn hash_token() -> anyhow::Result<()> {
 #[cfg(test)]
 mod key_file_tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// A temp directory the run owns outright: mode 0700, whatever the
+    /// umask. The server refuses a data directory group or others can
+    /// read, and a plain temp directory is 0777 less the umask.
+    fn private_tempdir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
 
     fn write_key(dir: &Path, name: &str, mode: u32, text: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1479,21 +1771,21 @@ mod key_file_tests {
 
     #[test]
     fn a_private_seed_reads_back_trimmed() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let file = write_key(dir.path(), "seed", 0o600, "  abcd \n");
         assert_eq!(read_hex(&file, true).unwrap(), "abcd");
     }
 
     #[test]
     fn a_public_key_reads_back() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let file = write_key(dir.path(), "old", 0o644, "abcd\n");
         assert_eq!(read_hex(&file, false).unwrap(), "abcd");
     }
 
     #[test]
     fn a_group_readable_seed_file_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let file = write_key(dir.path(), "seed", 0o640, "abcd");
         let err = read_hex(&file, true).unwrap_err().to_string();
         assert!(err.contains("read by group or others"), "{err}");
@@ -1501,7 +1793,7 @@ mod key_file_tests {
 
     #[test]
     fn a_group_writable_public_key_file_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let file = write_key(dir.path(), "old", 0o664, "abcd");
         let err = read_hex(&file, false).unwrap_err().to_string();
         assert!(err.contains("written by group or others"), "{err}");
@@ -1513,7 +1805,7 @@ mod key_file_tests {
     /// whichever file the path names when the read happens.
     #[test]
     fn a_symlinked_key_is_refused_with_a_perfect_target() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let target = write_key(dir.path(), "real", 0o600, "abcd");
         let link = dir.path().join("seed");
         std::os::unix::fs::symlink(&target, &link).unwrap();
@@ -1528,6 +1820,16 @@ mod key_file_tests {
 #[cfg(test)]
 mod access_file_tests {
     use super::*;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    /// A temp directory the run owns outright: mode 0700, whatever the
+    /// umask. The server refuses a data directory group or others can
+    /// read, and a plain temp directory is 0777 less the umask.
+    fn private_tempdir() -> tempfile::TempDir {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
 
     fn write_access(dir: &Path, name: &str, mode: u32, text: &str) -> PathBuf {
         use std::os::unix::fs::PermissionsExt as _;
@@ -1537,9 +1839,25 @@ mod access_file_tests {
         file
     }
 
+    /// With no token source at all, the refusal says what is missing;
+    /// with two sources, it keeps "not two".
+    #[test]
+    fn serve_without_a_token_source_says_what_is_missing() {
+        let err = load_access(None, None, None).unwrap_err().to_string();
+        assert!(
+            err.contains("--token-file, SCION_TOKEN or --access")
+                && err.contains("no token source"),
+            "{err}"
+        );
+        let err = load_access(Some("t".into()), Some(PathBuf::from("k")), None)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("not two"), "{err}");
+    }
+
     #[test]
     fn an_access_file_the_group_or_others_can_read_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let file = write_access(dir.path(), "access", 0o644, "# rules\n");
         let err = load_access(None, None, Some(file)).unwrap_err().to_string();
         assert!(err.contains("read by group or others"), "{err}");
@@ -1547,7 +1865,7 @@ mod access_file_tests {
 
     #[test]
     fn a_private_access_file_parses() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let file = write_access(dir.path(), "access", 0o600, "# rules\n");
         let (_, single) = load_access(None, None, Some(file)).unwrap();
         assert!(!single);
@@ -1555,11 +1873,125 @@ mod access_file_tests {
 
     #[test]
     fn a_symlinked_access_file_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let target = write_access(dir.path(), "real", 0o600, "# rules\n");
         let link = dir.path().join("access");
         std::os::unix::fs::symlink(&target, &link).unwrap();
         let err = load_access(None, None, Some(link)).unwrap_err().to_string();
         assert!(err.contains("symlink"), "{err}");
+    }
+}
+
+/// The labels an admin line names its failure under: the class, never
+/// the message, which can carry a path.
+#[cfg(test)]
+mod error_class_tests {
+    use super::*;
+    use scion_server::Storage;
+
+    #[test]
+    fn a_storage_error_is_classed_by_the_engine_s_answer() {
+        let busy = Error::Storage(Storage::busy_for_test(std::io::Error::other("gone")));
+        assert_eq!(error_class(&busy), "busy");
+        let full = Error::Storage(Storage::disk_full_for_test(std::io::Error::other(
+            "the drive is full",
+        )));
+        assert_eq!(error_class(&full), "disk_full");
+        let internal = Error::Storage(Storage::internal_for_test(std::io::Error::other("refused")));
+        assert_eq!(error_class(&internal), "failed");
+    }
+
+    #[test]
+    fn an_error_that_is_not_the_engine_s_is_classed_failed() {
+        let io = Error::Io(std::io::Error::other("the file went away"));
+        assert_eq!(error_class(&io), "failed");
+    }
+
+    #[test]
+    fn is_disk_full_says_which_io_errors_are_the_disk_s() {
+        let full = std::io::Error::from(std::io::ErrorKind::StorageFull);
+        assert!(is_disk_full(&full), "out-of-space is the disk's answer");
+        let quota = std::io::Error::from(std::io::ErrorKind::QuotaExceeded);
+        assert!(is_disk_full(&quota), "over-quota is the disk's answer");
+        let other = std::io::Error::other("the file went away");
+        assert!(!is_disk_full(&other), "another error is not the disk's");
+    }
+}
+
+/// The gc's audit intent on a failing audit log: a disk-full append
+/// defers the intent and the run goes on, the deferred line names why
+/// it was late, and every other append failure refuses before any
+/// change. The audit's own test hook makes the appends fail as an
+/// out-of-space answer would, without touching a real disk.
+#[cfg(test)]
+mod gc_intent_tests {
+    use super::*;
+
+    fn audit_with_faults(dir: &Path, faults: u32) -> scion_server::Audit {
+        let audit = scion_server::Audit::open(&dir.join("audit.log")).unwrap();
+        audit.fail_next_appends(faults).unwrap();
+        audit
+    }
+
+    #[tokio::test]
+    async fn a_disk_full_intent_defers_and_the_run_answers() {
+        let dir = scion_server::test_support::private_tempdir();
+        let store = Backend::open_test(&dir.path().join("data")).unwrap();
+        // One failed append: the intent's. The run defers it, finishes,
+        // and the deferred line lands when the disk has room again.
+        let audit = audit_with_faults(dir.path(), 1);
+        gc_command(audit, &store, Duration::from_secs(60), true, None)
+            .await
+            .expect("the run goes on past the failed intent");
+        let log = std::fs::read_to_string(dir.path().join("audit.log")).unwrap();
+        assert!(
+            log.contains("\"what\":\"gc\"") && log.contains("\"deferred\":\"disk_full\""),
+            "the deferred intent names why it was late: {log}"
+        );
+        assert!(
+            log.contains("\"status\":\"ok\"") || log.contains("admin"),
+            "the run's own line is recorded: {log}"
+        );
+    }
+
+    /// The deferred intent's exit answers the run's own status: a run that
+    /// succeeded answers 0 even when its deferred line still fails. The
+    /// probe runs in a child of this same test binary, because the answer
+    /// is the process's exit status, and the probe's own process is the
+    /// only one that can carry it.
+    #[cfg(test)]
+    mod deferred_intent_exit_tests {
+        use super::*;
+
+        #[tokio::test]
+        async fn the_exit_answers_the_run_s_own_status() {
+            let exe = std::env::current_exe().expect("the test binary is known");
+            let out = std::process::Command::new(exe)
+                .args(["deferred_intent_exit_probe", "--nocapture"])
+                .env("SCION_TEST_DEFERRED_EXIT_PROBE", "1")
+                .output()
+                .expect("the probe runs");
+            assert!(
+                out.status.success(),
+                "a run that succeeded answers 0 even when its deferred line still fails: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+
+        #[tokio::test]
+        async fn deferred_intent_exit_probe() {
+            if std::env::var_os("SCION_TEST_DEFERRED_EXIT_PROBE").is_none() {
+                // The suite's own run: nothing to probe.
+                return;
+            }
+            let dir = scion_server::test_support::private_tempdir();
+            let audit = scion_server::Audit::open(&dir.path().join("audit.log")).unwrap();
+            // Both appends fail as an out-of-space answer would: the run's
+            // own write is gone by the time the deferred line is written,
+            // and the deferred line fails again. The run succeeded, so the
+            // process answers 0.
+            audit.fail_next_appends(2).unwrap();
+            write_deferred_intent(&audit, true, true).await;
+        }
     }
 }

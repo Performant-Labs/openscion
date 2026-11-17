@@ -6,7 +6,6 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-homepage.workspace = true
 keywords.workspace = true
 categories.workspace = true
 authors.workspace = true
@@ -32,7 +31,6 @@ tower.workspace = true
 clap.workspace = true
 gix.workspace = true
 hashlink.workspace = true
-rusqlite.workspace = true
 jiff = "0.2"
 serde_json.workspace = true
 rustix.workspace = true
@@ -61,14 +59,21 @@ tokio-postgres-rustls = "0.14"
 test-hooks = []
 
 [dev-dependencies]
+# The auth walk reads the descriptor set through the test-hooks seam.
+open-scion-proto = { workspace = true, features = ["test-hooks"] }
+# The h2-level proof of the reply-memory budget's release on a reset:
+# only a raw HTTP/2 client can open a call and reset it unread.
+h2 = "0.4"
 open-scion-server = { path = ".", features = ["test-hooks"] }
 # The ledger's own hash, on purpose not the store's BLAKE3 (#377).
 sha2 = "0.11.1"
 proptest.workspace = true
 tempfile.workspace = true
+# The auth walk decodes the descriptor set the build compiled (through
+# scion_proto::descriptor_set, a test-hooks seam).
+prost-types = "0.14"
 tonic-health.workspace = true
 # A test runs code while a commit is visible and its COMMIT still runs.
-rusqlite = { workspace = true, features = ["hooks"] }
 # Tests of the reply timeouts run on a paused clock.
 tokio = { workspace = true, features = ["test-util"] }
 # A test fetches from a real server through a tier with no token.

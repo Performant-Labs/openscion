@@ -44,16 +44,17 @@
 //! refused at load.
 //!
 //! The file holds digests, not tokens: `scion-server hash-token` prints
-//! one. With `--token` instead, one principal, `default`, may read and
-//! write every repo ([`Access::single`]).
+//! one. With the single-principal mode instead (`SCION_TOKEN` or
+//! `--token-file`), one principal, `default`, may read and write every
+//! repo ([`Access::single`]).
 
 use std::collections::{BTreeSet, HashMap};
 
 use scion_core::RepoPath;
 use scion_proto::runtime::auth::{Auth, Caller, DEFAULT_PRINCIPAL, token_digest};
 
-use crate::db;
 use crate::error::{Error, Result};
+use crate::meta as db;
 
 /// Longest principal name, in bytes.
 pub(crate) const MAX_PRINCIPAL_BYTES: usize = 64;
@@ -220,7 +221,8 @@ pub struct Access {
     tokens: Vec<([u8; 32], String)>,
     /// By principal and repo.
     grants: HashMap<(String, String), Grant>,
-    /// The one principal of `--token`, which may read and write every repo.
+    /// The one principal of the single-principal mode, which may read
+    /// and write every repo.
     everything: Option<String>,
     /// By repo: the principals whose reviews count (`review` lines).
     reviewers: HashMap<String, BTreeSet<String>>,
@@ -234,8 +236,8 @@ pub(crate) const MAX_REQUIRED_APPROVALS: u32 = 16;
 
 impl Access {
     /// How many tokens the access carries: one per line of an access
-    /// file, or the one token of `--token`. The audit's start line
-    /// names it, so an operator can match a config to a log.
+    /// file, or the one token of the single-principal mode. The audit's
+    /// start line names it, so an operator can match a config to a log.
     #[must_use]
     pub fn token_count(&self) -> usize {
         self.tokens.len()
@@ -291,6 +293,11 @@ impl Access {
                     let digest = blake3::Hash::from_hex(digest)
                         .map_err(|_| at("a token digest is 64 hex digits".into()))?;
                     let digest = *digest.as_bytes();
+                    if digest == token_digest("") {
+                        return Err(at("this is the digest of an empty token, and an empty \
+                             token is no secret; hash the real token with `hash-token`"
+                            .into()));
+                    }
                     if access.tokens.iter().any(|(d, _)| *d == digest) {
                         return Err(at("another principal has this token".into()));
                     }
@@ -882,6 +889,17 @@ mod tests {
             (format!("{token}write\talice\tmain\ta\tb\n"), "expected"),
             (format!("{token}read\talice\t\n"), "repo"),
             (format!("token\tal ice\t{}\n", hex("a")), "bad principal"),
+            (
+                // 65 legal characters: over MAX_PRINCIPAL_BYTES by one. The
+                // length check must refuse it on its own: a name of legal
+                // characters but over-long is still a bad principal.
+                format!(
+                    "token\t{}\t{}\n",
+                    "a".repeat(MAX_PRINCIPAL_BYTES + 1),
+                    hex("a")
+                ),
+                "bad principal",
+            ),
             (format!("{token}delete\talice\tmain\n"), "expected"),
         ];
         for (text, fragment) in cases {

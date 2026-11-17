@@ -64,12 +64,17 @@ private key"). One file per run, in this shape.
    the same. For the first release nothing is bumped; a later release
    bumps all five in one commit.
 
+4. Every transcript under `crates/scn/tests/transcripts/` that says
+   `since: unreleased` is set to the release's tag (RELEASING.md
+   "The release PR" 4).
+
    Done when: the PR carries the merged changelog, the dated section,
-   and the version step.
+   the version step, and no `since: unreleased` that this release
+   names.
 
    Notes: ___
 
-### R5 - Notes from the tagged commit, and the smoke (RELEASING.md "The release PR" 4-7)
+### R5 - Notes from the tagged commit, and the smoke (RELEASING.md "The release PR" 5-8)
 
 1. The GitHub release notes come from the version's `CHANGELOG.md`
    section read at the tagged commit, never a local working tree:
@@ -80,7 +85,7 @@ private key"). One file per run, in this shape.
    ```
 
 2. From a fresh clone of the tagged commit, build the workspace and
-   run the README's `Try it` flow end to end.
+   run the README's quick start end to end.
 
 3. The benchmark numbers in the release note record the commit they
    measured, the OS, the filesystem, the dataset, the command, and the
@@ -92,7 +97,7 @@ private key"). One file per run, in this shape.
 
    Notes: ___
 
-### R6 - The umask-002 run (RELEASING.md "The release PR" 6)
+### R6 - The umask-002 run (RELEASING.md "The release PR" 7)
 
 1. Once #302's CI job exists, it runs on the release commit and its
    green result is part of the release. Until it exists, this step
@@ -103,7 +108,7 @@ private key"). One file per run, in this shape.
 ### R7 - The tag, signed - **OWNER** (RELEASING.md "Release steps" 1)
 
 1. The owner signs the annotated tag personally with their SSH key
-   (D18); the signature a verifier checks is the owner's, not a CI
+   the signature a verifier checks is the owner's, not a CI
    secret's:
 
    ```sh
@@ -163,7 +168,7 @@ The v0.8 list ("without one person's account, machine or private
 key"), from this drill:
 
 1. **The signed tag** (R7): the owner's personal SSH key, by decision
-   D18. A second maintainer cannot tag a release.
+A second maintainer cannot tag a release.
 2. **The `refs/tags/v*` ruleset** (R8): creation restricted to the
    owner, so tag rights live in one account.
 3. **The immutable-releases setting** (R8): a repository setting only

@@ -90,6 +90,15 @@ enum Op {
         /// the land's row stays pending (M4).
         cut_ms: u64,
     },
+    /// A NEW land whose reply arrives and is dropped unread: the land
+    /// decided on the server for certain, while the ledger holds no
+    /// reply for it. No cancel races the handler; the outcome is
+    /// decided and unseen at once.
+    LandBlind {
+        caller: usize,
+        target: usize,
+        shared: bool,
+    },
     /// Poll an earlier land by ID.
     Poll { caller: usize, land: usize },
     /// SIGKILL the server now, and restart it.
@@ -233,6 +242,11 @@ fn parse_script(text: &str) -> Vec<Op> {
                     // pending, short enough that the cancel lands
                     // mid-flow and the row never decides.
                     cut_ms: 8,
+                },
+                ["land-blind", caller, target, shared] => Op::LandBlind {
+                    caller: num(caller),
+                    target: num(target),
+                    shared: *shared == "shared" || *shared == "1",
                 },
                 ["poll", caller, land] => Op::Poll {
                     caller: num(caller),
@@ -449,9 +463,14 @@ fn m2_phase_for(state: &mut Run, caller: usize, target: usize, shared: bool) -> 
         if rec.target != name || rec.m2_phase.is_none() {
             continue;
         }
-        let Some(reply) = rec.final_reply() else {
-            continue;
-        };
+        // A step with no final reply has an unknown outcome: a cut
+        // dropped its reply while the server may still have landed it.
+        // Picking a step now could repeat the dropped one on a head it
+        // already landed, and CreateChangeset would refuse the repeat
+        // (the path the step deletes is gone). The trio waits: a
+        // Retry, a Twin or the next check answers the land, and the
+        // phase reads on.
+        let reply = rec.final_reply()?;
         match (rec.m2_phase, reply.state()) {
             (Some(0), LandState::Landed) => put_landed = true,
             (Some(1), LandState::Landed) => file_landed = true,
@@ -584,7 +603,7 @@ struct RunSummary {
 /// Runs the whole script against one real server, then checks.
 #[allow(clippy::too_many_lines)] // one arm per op: the dispatch is the table
 async fn run_script(script: &[Op]) -> RunSummary {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let (data, log) = (dir.path().join("data"), dir.path().join("server.log"));
     create_repo(&data);
     let mut server = Server::start(&data, &log);
@@ -730,6 +749,46 @@ async fn run_script(script: &[Op]) -> RunSummary {
                 }
                 note_head(&mut state, name, &[idx]).await;
             }
+            Op::LandBlind {
+                caller,
+                target,
+                shared,
+            } => {
+                let name = target_name(*target);
+                let head = match resolve_ref(&mut state.objects, name).await {
+                    Ok(head) => Some(head),
+                    Err(_) if *target == MISSING => None,
+                    Err(status) => panic!("ResolveRef {name}: {status:?}"),
+                };
+                let m2_phase = m2_phase_for(&mut state, *caller, *target, *shared);
+                let base = match head {
+                    Some(head) => {
+                        state.heads.entry(name).or_default().push(head);
+                        let heads = &state.heads[name];
+                        // The trio's steps ride the base their tree
+                        // facts hold (see the Land arm).
+                        if m2_phase == Some(2) { heads[0] } else { head }
+                    }
+                    None => resolve_ref(&mut state.objects, REFS[0]).await.unwrap(),
+                };
+                let idx = send_land(&mut state, *caller, *target, base, *shared, m2_phase).await;
+                let request = state.lands[idx].request();
+                // The reply arrives and is dropped unread: the land
+                // decided on the server for certain, while the ledger
+                // holds no reply for it. Nothing answers the row until
+                // a later op asks. The drop premised on a decision: a
+                // PENDING reply would leave the outcome unknown, which
+                // is the cut's shape, not this op's.
+                let reply = ceiling("land-blind", state.scion.land(request))
+                    .await
+                    .into_inner();
+                assert_ne!(
+                    reply.state(),
+                    LandState::Pending,
+                    "land-blind needs a decided land; the reply was PENDING"
+                );
+                note_head(&mut state, name, &[idx]).await;
+            }
             Op::Retry { caller: _, land } => {
                 if state.lands.is_empty() {
                     continue;
@@ -810,30 +869,22 @@ async fn run_script(script: &[Op]) -> RunSummary {
                         Some((idx, changeset_id(&reply.result_changeset_id)))
                     }));
                 if *op == Op::KillAtPending {
-                    // A crash that meets a pending row. The store may be
-                    // Postgres in the parity job, where the SQLite file
-                    // does not exist; then wait a moment and kill. The
-                    // wait can miss: a land can pass through pending and
-                    // finish between two polls of the file. A missed row
-                    // is logged, and the kill still runs - it is the
-                    // plain kill then, which the checks already hold.
-                    let db = data.join("scion.db");
-                    if db.exists() {
-                        let conn = rusqlite::Connection::open(&db).unwrap();
-                        let saw = wait_until_or_timeout("a land pending in the database", || {
-                            pending_lands(&conn) > 0
-                        })
-                        .await;
-                        if !saw {
-                            println!(
-                                "seed {}: kill-pending saw no pending row; \
-                                 the land finished between two polls, and \
-                                 the kill is a plain kill",
-                                seed()
-                            );
-                        }
-                    } else {
-                        tokio::time::sleep(Duration::from_millis(150)).await;
+                    // A crash that meets a pending row. The wait can
+                    // miss: a land can pass through pending and finish
+                    // between two polls of the rows. A missed row is
+                    // logged, and the kill still runs - it is the plain
+                    // kill then, which the checks already hold.
+                    let saw = wait_until_or_timeout("a land pending in the database", || {
+                        common::LandsReader::open(&data).counts().1 > 0
+                    })
+                    .await;
+                    if !saw {
+                        println!(
+                            "seed {}: kill-pending saw no pending row; \
+                             the land finished between two polls, and \
+                             the kill is a plain kill",
+                            seed()
+                        );
                     }
                 }
                 state.killed = true;
@@ -857,22 +908,16 @@ async fn run_script(script: &[Op]) -> RunSummary {
                 // its store; without a bound it was the one op that
                 // could block past the script's own budget.
                 {
-                    let db = data.join("scion.db");
-                    if db.exists() {
-                        let conn = rusqlite::Connection::open(&db).unwrap();
-                        println!(
-                            "gc: pending rows in the database before the sweep: {}",
-                            pending_lands(&conn)
-                        );
-                    }
+                    let (_, pending) = common::LandsReader::open(&data).counts();
+                    println!("gc: pending rows in the database before the sweep: {pending}");
                 }
                 let mut gc = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"));
                 gc.arg("--data").arg(&data);
-                // On Postgres the gc subprocess reads the store through
-                // the URL, the way the server does: the schema follows
-                // the store, not the path.
-                if scion_server::Backend::test_is_postgres() {
-                    gc.arg("--postgres-url").arg(common::postgres_url(&data));
+                // The gc subprocess reads the store through the URL, the
+                // way the server does: the schema follows the store, not
+                // the path.
+                {
+                    gc.env("SCION_POSTGRES_URL", common::postgres_url(&data));
                 }
                 let mut child = gc
                     .args(["gc", "--grace-secs", "0"])
@@ -967,20 +1012,15 @@ async fn run_script(script: &[Op]) -> RunSummary {
                     let mut conn = state.scion.clone();
                     calls.spawn(async move { (idx, conn.land(request).await) });
                 }
-                let db = data.join("scion.db");
-                if db.exists() {
-                    let conn = rusqlite::Connection::open(&db).unwrap();
-                    let saw =
-                        wait_until_or_timeout("a queued land pending in the database", || {
-                            pending_lands(&conn) > 0
-                        })
-                        .await;
-                    if !saw {
-                        println!(
-                            "seed {}: burst-cut saw no pending row; the queue drained before the kill",
-                            seed()
-                        );
-                    }
+                let saw = wait_until_or_timeout("a queued land pending in the database", || {
+                    common::LandsReader::open(&data).counts().1 > 0
+                })
+                .await;
+                if !saw {
+                    println!(
+                        "seed {}: burst-cut saw no pending row; the queue drained before the kill",
+                        seed()
+                    );
                 }
                 state.killed = true;
                 drop(server); // SIGKILL
@@ -1038,14 +1078,12 @@ async fn run_script(script: &[Op]) -> RunSummary {
     }
     // fsck sees no damage. It is read-only and safe beside a live
     // server, and the retry phase of the final Check has settled every
-    // land, so nothing is pending to look like a problem. On Postgres
-    // the fsck subprocess reads the store through the URL, the way the
-    // server does: the schema follows the store, not the path.
+    // land, so nothing is pending to look like a problem. The fsck
+    // subprocess reads the store through the URL, the way the server
+    // does: the schema follows the store, not the path.
     let mut fsck = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"));
     fsck.arg("--data").arg(&data);
-    if scion_server::Backend::test_is_postgres() {
-        fsck.arg("--postgres-url").arg(common::postgres_url(&data));
-    }
+    fsck.env("SCION_POSTGRES_URL", common::postgres_url(&data));
     let out = fsck.arg("fsck").output().unwrap();
     assert!(
         out.status.success(),
@@ -1618,10 +1656,10 @@ async fn get_changeset(scion: &mut Scion, id: ChangesetId) -> (Changeset, Change
 /// says the wait happened. Any other refusal fails at once.
 #[test]
 fn a_restart_waits_for_the_killed_servers_store_lock() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let data = dir.path().join("data");
     let log = dir.path().join("server.log");
-    std::fs::create_dir_all(&data).unwrap();
+    scion_proto::runtime::auth::create_private_dir_all(&data).unwrap();
     let holder = Server::start(&data, &log);
     // The restart races a lock the holder keeps. On its own thread, on
     // a log of its own: `listens` takes the newest serving line of the
@@ -1690,18 +1728,18 @@ fn the_seed_corpus_holds() {
     // Postgres pays per-op commits and a full server restart per script:
     // the whole corpus measured 1m53s under it on the runner, and a
     // per-PR share that keeps every outcome kind - kill, twin, gc, a
-    // conflict, a missing ref - is these six files, under one minute.
+    // conflict, a missing ref, a step whose land decided unseen - is
+    // these seven files.
     // The nightly land-model workflow runs the whole corpus there
     // (SCION_LANDMODEL_CASES set).
-    let short_on_postgres = ["02", "03", "05", "06", "08", "10"];
+    let short_on_postgres = ["02", "03", "05", "06", "08", "10", "12"];
     let dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/land_model_corpus");
     let mut names = Vec::new();
     for entry in std::fs::read_dir(&dir).unwrap() {
         let path = entry.unwrap().path();
         if path.extension().is_some_and(|e| e == "txt") {
             let name = path.file_name().unwrap().to_string_lossy().into_owned();
-            if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres")
-                && std::env::var("SCION_LANDMODEL_CASES").is_err()
+            if std::env::var("SCION_LANDMODEL_CASES").is_err()
                 && !short_on_postgres.iter().any(|p| name.starts_with(p))
             {
                 continue;
@@ -1776,16 +1814,12 @@ fn the_seed_corpus_holds() {
 #[test]
 fn the_model_holds_across_a_random_script() {
     install_panic_hook();
-    // Postgres pays per-op commits and full server restarts: the
-    // whole suite under it ran past this job's 30 minutes, and the
-    // nightly workflow carries the full random coverage there
-    // instead (8 cases, its own job). The per-PR Postgres share
-    // stays the corpus, measured at about 2 minutes.
-    if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres")
-        && std::env::var("SCION_LANDMODEL_CASES").is_err()
-    {
+    // The random case is a nightly shape: the per-PR job stays the
+    // corpus, measured at about 2 minutes. SCION_LANDMODEL_CASES
+    // forces the random case on.
+    if std::env::var("SCION_LANDMODEL_CASES").is_err() {
         println!(
-            "skipping the random case on Postgres: the nightly land-model workflow carries it there (SCION_LANDMODEL_CASES forces it on)"
+            "skipping the random case here: the nightly land-model workflow carries it there (SCION_LANDMODEL_CASES forces it on)"
         );
         return;
     }

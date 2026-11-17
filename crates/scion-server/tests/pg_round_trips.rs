@@ -3,9 +3,7 @@
 //! and each round trip is part of every land that queues behind it. A
 //! design note in the land performance issue holds the plan to shrink
 //! the count; this guard pins today's count of the real path - one land
-//! through the server's Land RPC - so it can only fall. On SQLite the
-//! store's statements are in-process calls, which is why the test skips
-//! there.
+//! through the server's Land RPC - so it can only fall.
 #![cfg(unix)]
 
 mod common;
@@ -55,7 +53,7 @@ const WIDE_BUDGET: u64 = 56;
 
 /// A one-commit git repository, imported on `main`.
 fn git_seed() -> (TempDir, ChangesetId) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let run = |args: &[&str]| {
         let out = Command::new("git")
             .args(["-c", "gc.auto=0", "-c", "maintenance.auto=false"])
@@ -176,10 +174,6 @@ fn bearer() -> impl Interceptor {
 
 #[tokio::test(flavor = "multi_thread")]
 async fn one_land_stays_under_the_round_trip_budget() {
-    if !Backend::test_is_postgres() {
-        println!("skipping: Postgres only");
-        return;
-    }
     let (dir, tip) = git_seed();
     let store = open_store(dir.path());
     // Two changesets on the same base: the first lands on the head (the
@@ -261,6 +255,7 @@ async fn serve(
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::new(Metrics::default()),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         Some(Arc::new(Keys::generate())),
         async {

@@ -23,6 +23,10 @@ use tempfile::TempDir;
 use tokio::net::TcpListener;
 use tokio::runtime::Runtime;
 
+mod common;
+
+use common::stall_probe;
+
 const REPO: &str = "r";
 const TOKEN: &str = "secret";
 
@@ -80,6 +84,7 @@ impl Server {
         let runtime = Runtime::new().unwrap();
         let listener = runtime.block_on(TcpListener::bind("127.0.0.1:0")).unwrap();
         let url = format!("http://{}", listener.local_addr().unwrap());
+        runtime.spawn(stall_probe("history"));
         runtime.spawn(service::serve(
             store,
             listener,
@@ -93,6 +98,7 @@ impl Server {
                 land_stale_secs: 1 << 40,
                 tls: None,
                 metrics: Arc::default(),
+                reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
             },
             None,
             std::future::pending(),
@@ -153,16 +159,13 @@ fn changeset_of(store: &Backend, commit: &str) -> String {
         .collect();
     store
         .read(|c| {
-            let cs: Vec<u8> = c
-                .sqlite()
-                .unwrap()
-                .query_row(
-                    "SELECT cs FROM git_import WHERE git_oid = ?1",
-                    [oid],
-                    |row| row.get(0),
-                )
-                .map_err(scion_server::test_support::error::from_sqlite)?;
-            Ok(ChangesetId::try_from(cs.as_slice()).unwrap().to_string())
+            let repo = c.repo_id(REPO)?;
+            let imported = c.imported_commits(repo)?;
+            let cs = imported
+                .iter()
+                .find(|(k, _)| k.as_bytes() == oid.as_slice())
+                .map(|(_, cs)| cs.to_string());
+            Ok(cs.unwrap())
         })
         .unwrap()
 }
@@ -294,16 +297,6 @@ fn blame_fixture(dir: &Path) {
 
 #[test]
 fn blame_matches_git_blame_first_parent() {
-    if Backend::test_is_postgres() {
-        // SHORTCUT: this ceiling is the skip itself; Postgres import
-        // provenance (the git_import rows) is unread by these tests, so the
-        // git side of the comparison has no Postgres run. Upgrade path: a
-        // backend-agnostic git_import read on MetaTx, then drop the skip.
-        // The scion blame lines the other rows of this file check are
-        // backend-agnostic.
-        eprintln!("skip on postgres: the test reads the data directory's git_import rows");
-        return;
-    }
     blame_matches_git_blame_first_parent_inner();
 }
 
@@ -563,4 +556,303 @@ fn log_continues_after_a_reply_cut_by_its_byte_budget() {
     for args in [vec!["log", &tip], vec!["log", &tip, "--path", "f"]] {
         assert_eq!(log_ids(&server, &args), expected, "{args:?}");
     }
+}
+
+/// An ID copied from the human output resolves: `scn log` and `scn blame`
+/// print changeset IDs the REV parser accepts back (`scn show`), not
+/// abbreviations nothing reads.
+#[test]
+fn an_id_copied_from_human_output_resolves() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
+    let ids = chain(
+        &store,
+        vec![
+            (
+                b"one\n".to_vec(),
+                vec![("f", regular(store.blobs().put(b"one\n").unwrap()))],
+            ),
+            (
+                b"two\n".to_vec(),
+                vec![("f", regular(store.blobs().put(b"two\n").unwrap()))],
+            ),
+        ],
+    );
+    let server = Server::start(data, store);
+    let tip = ids[1].to_string();
+    let log_line = server.run(&["log", "-n", "1", &tip]);
+    let id = log_line
+        .lines()
+        .next()
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        id,
+        ids[1].to_string(),
+        "scn log prints the full changeset ID: {log_line}"
+    );
+    server.run(&["show", &id]);
+    let blame_line = server.run(&["blame", &format!("{tip}:f")]);
+    let blame_id = blame_line
+        .lines()
+        .next()
+        .unwrap()
+        .split(' ')
+        .next()
+        .unwrap()
+        .to_owned();
+    assert_eq!(
+        blame_id, tip,
+        "scn blame prints the full changeset ID: {blame_line}"
+    );
+    server.run(&["show", &blame_id]);
+}
+
+/// Consecutive lines from the same changeset with consecutive origins
+/// print as one range: the stitch is the ranges output's whole point,
+/// and an unstitched answer still satisfies a per-line check, so the
+/// test asserts the ranges themselves - the unchanged block of the
+/// fixture's file is one range carrying every line it holds.
+#[test]
+fn blame_s_stitches_consecutive_lines_of_one_changeset_into_one_range() {
+    let git_dir = tempfile::tempdir().unwrap();
+    let dir = git_dir.path();
+    blame_fixture(dir);
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
+    let opts = ImportOptions {
+        rev: "HEAD".into(),
+        target_ref: "main".into(),
+        verify_sample: 0,
+    };
+    import_git(&store, REPO, dir, &opts).unwrap();
+    let server = Server::start(data, store);
+    let ranges = server
+        .json(&["blame", "main:lib.rs"])
+        .as_array()
+        .unwrap()
+        .clone();
+    // The block that every revision kept - `fn a()`'s four lines - is
+    // one range: same changeset, consecutive origin lines.
+    let stitched: Vec<&Value> = ranges
+        .iter()
+        .filter(|r| r["line_count"].as_u64().unwrap() > 1)
+        .collect();
+    assert!(
+        stitched.iter().any(|r| {
+            r["start_line"].as_u64().unwrap() >= 3 && r["line_count"].as_u64().unwrap() >= 3
+        }),
+        "the unchanged block stitches into one range: {stitched:?}"
+    );
+    // The ranges still tile the file in order, whatever the stitch.
+    let mut next = 1;
+    for range in &ranges {
+        assert_eq!(range["start_line"].as_u64().unwrap(), next, "{stitched:?}");
+        next += range["line_count"].as_u64().unwrap();
+    }
+}
+
+/// The log walks across the server's pages and stops exactly at the
+/// limit: five commits asked of thirty come back as five lines, the
+/// newest five, each with its own changeset. A fold in the page walk's
+/// limit or filter shows up as a wrong count or a wrong ID.
+#[test]
+fn the_log_walks_across_pages_and_stops_at_the_limit() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
+    let changes: Vec<Puts<FileState>> = (0..30)
+        .map(|n| {
+            (
+                format!("change {n:02}\nbody of {n:02}\n").into_bytes(),
+                vec![(
+                    "f",
+                    FileState::Regular {
+                        content: store.blobs().put(format!("x{n}").as_bytes()).unwrap(),
+                        executable: false,
+                    },
+                )],
+            )
+        })
+        .collect();
+    let ids = chain(&store, changes);
+    let tip = ids.last().unwrap().to_string();
+    let server = Server::start(data, store);
+    let log = server.run(&["log", &tip, "--limit", "5"]);
+    let lines: Vec<&str> = log.lines().collect();
+    assert_eq!(lines.len(), 5, "{log}");
+    // Newest first: the tip and the four before it, each line naming
+    // its own changeset.
+    for (line, id) in lines.iter().zip(ids.iter().rev().take(5)) {
+        assert!(
+            line.starts_with(&id.to_string()[..12]) || line.contains(&id.to_string()),
+            "{line} names {id}"
+        );
+    }
+    // The subject is the message's first line, never the body.
+    assert!(log.contains("change 29"), "{log}");
+    assert!(!log.contains("body of 29"), "{log}");
+}
+
+/// `show` names the author and the committer with their zones: a name,
+/// an email, the unix seconds, and the zone's sign and offset. A commit
+/// east of UTC and one west of it pin the sign's comparison from both
+/// sides, and the zero case pins the boundary.
+#[test]
+fn the_show_names_the_identity_with_its_zone() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
+    let mut ids = Vec::new();
+    store
+        .write(|c| {
+            let repo = c.create_repo(REPO)?;
+            for tz in [-330i32, 0, 330] {
+                let cs = Changeset::new(
+                    Vec::new(),
+                    IdentityTime::new(
+                        b"Ada".to_vec(),
+                        b"ada@example.com".to_vec(),
+                        1_700_000_000,
+                        tz,
+                    )
+                    .expect("identity fits the format"),
+                    Some(
+                        IdentityTime::new(
+                            b"Bob".to_vec(),
+                            b"bob@example.com".to_vec(),
+                            1_700_000_100,
+                            tz,
+                        )
+                        .expect("identity fits the format"),
+                    ),
+                    b"change\n".to_vec(),
+                    [(
+                        RepoPath::new("f").unwrap(),
+                        Some(FileState::Regular {
+                            content: store.blobs().put(b"x").unwrap(),
+                            executable: false,
+                        }),
+                    )]
+                    .into_iter()
+                    .collect(),
+                )
+                .expect("changeset fits the format");
+                ids.push(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0);
+            }
+            Ok(())
+        })
+        .unwrap();
+    let server = Server::start(data, store);
+    for (tz, id) in [-330i32, 0, 330].iter().zip(&ids) {
+        let shown = server.run(&["show", &id.to_string()]);
+        let sign = if *tz < 0 { '-' } else { '+' };
+        let minutes = tz.unsigned_abs();
+        let zone = format!("{sign}{:02}{:02}", minutes / 60, minutes % 60);
+        assert!(
+            shown.contains(&format!("Ada <ada@example.com> 1700000000 {zone}")),
+            "the author's line carries the zone {zone}: {shown}"
+        );
+        assert!(
+            shown.contains(&format!("Bob <bob@example.com> 1700000100 {zone}")),
+            "the committer's line carries the zone {zone}: {shown}"
+        );
+    }
+}
+
+/// `ls` names the mode of every kind: an executable file is 100755, a
+/// regular file 100644, a symlink 120000. A folded executable guard
+/// turns the executable file's mode into the plain file's.
+#[test]
+fn the_ls_names_the_mode_of_every_kind() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
+    let mut ids = Vec::new();
+    store
+        .write(|c| {
+            let repo = c.create_repo(REPO)?;
+            let cs = Changeset::new(
+                Vec::new(),
+                IdentityTime::new(
+                    b"Ada".to_vec(),
+                    b"ada@example.com".to_vec(),
+                    1_700_000_000,
+                    0,
+                )
+                .expect("identity fits the format"),
+                None,
+                b"change\n".to_vec(),
+                [
+                    (
+                        RepoPath::new("run.sh").unwrap(),
+                        Some(FileState::Regular {
+                            content: store.blobs().put(b"x").unwrap(),
+                            executable: true,
+                        }),
+                    ),
+                    (
+                        RepoPath::new("plain.txt").unwrap(),
+                        Some(FileState::Regular {
+                            content: store.blobs().put(b"y").unwrap(),
+                            executable: false,
+                        }),
+                    ),
+                    (
+                        RepoPath::new("link").unwrap(),
+                        Some(FileState::Symlink {
+                            target: store.blobs().put(b"f").unwrap(),
+                        }),
+                    ),
+                ]
+                .into_iter()
+                .collect(),
+            )
+            .expect("changeset fits the format");
+            ids.push(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0);
+            Ok(())
+        })
+        .unwrap();
+    let server = Server::start(data, store);
+    let shown = server.run(&["ls", &format!("{}:", ids[0])]);
+    assert!(shown.contains("100755"), "the executable's mode: {shown}");
+    assert!(shown.contains("100644"), "the plain file's mode: {shown}");
+    assert!(shown.contains("120000"), "the symlink's mode: {shown}");
+}
+
+/// `cat` prints the file's bytes: the whole content, in order.
+#[test]
+fn the_cat_prints_the_file() {
+    let data = tempfile::tempdir().unwrap();
+    let store = Backend::open_test(data.path()).unwrap();
+    let cs = store
+        .write(|c| {
+            let repo = c.create_repo(REPO)?;
+            let cs = Changeset::new(
+                Vec::new(),
+                IdentityTime::new(
+                    b"Ada".to_vec(),
+                    b"ada@example.com".to_vec(),
+                    1_700_000_000,
+                    0,
+                )
+                .expect("identity fits the format"),
+                None,
+                b"change\n".to_vec(),
+                [(
+                    RepoPath::new("f").unwrap(),
+                    Some(FileState::Regular {
+                        content: store.blobs().put(b"first\nsecond\n").unwrap(),
+                        executable: false,
+                    }),
+                )]
+                .into_iter()
+                .collect(),
+            )
+            .expect("changeset fits the format");
+            Ok(tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0)
+        })
+        .unwrap();
+    let server = Server::start(data, store);
+    assert_eq!(server.run(&["cat", &format!("{cs}:f")]), "first\nsecond\n");
 }

@@ -28,6 +28,7 @@ use crate::backend::Backend;
 use crate::deadline::Deadline;
 use crate::error::{Error, Result};
 use crate::meta::Meta as _;
+use crate::meta::StartRead;
 use crate::meta::{MetaTx, RepoId};
 use crate::tree;
 
@@ -96,7 +97,9 @@ pub(crate) trait Kind {
 /// [`get_by`] with no deadline: the caller has no request to serve, so
 /// nothing bounds the fill in time. For background and command callers
 /// only; a call that answers a request passes its deadline to
-/// [`get_by`] instead.
+/// [`get_by`] instead. Each step still yields to writers for at most
+/// the write yield's bound, so a load that never stops delays the
+/// walk, it does not stop it.
 ///
 /// # Errors
 ///
@@ -147,6 +150,31 @@ fn get_until<K: Kind>(
     value
 }
 
+/// [`get_by`], for a caller that already holds a read transaction: the
+/// value rides it, and a miss fills the way every fill does, in the
+/// fill's own transactions. The held snapshot never sees the fill's rows
+/// and never needs to: the value comes from the fill's return, and a
+/// walk reads each derived value once, so nothing re-derives.
+///
+/// # Errors
+///
+/// As [`get_by`].
+pub(crate) fn get_by_held<K: Kind>(
+    store: &Backend,
+    c: &mut dyn MetaTx,
+    repo: RepoId,
+    cs: ChangesetId,
+    deadline: &Deadline,
+) -> Result<K::Value> {
+    require(c, repo, cs)?;
+    if let Some(value) = load::<K>(c, cs)? {
+        return Ok(value);
+    }
+    let value = in_one_walk::<K>(store, repo, cs, Some(deadline));
+    store.flush()?;
+    value
+}
+
 /// The bytes of memory that one entry of a derive walk's frontier holds:
 /// a [`ChangesetId`] and a generation. An estimate: a merge's parents also
 /// sit in `next` once each, so a merge-heavy history can hold a little
@@ -166,7 +194,7 @@ fn walk_step_bytes() -> usize {
 /// deep the repo. A walk over a history too deep for it stops at its
 /// step boundary, and the call answers busy; the unbounded forms (fsck,
 /// import, the derive command) finish the walk.
-const DERIVE_WALK_BUDGET: usize = 1 << 30;
+pub(crate) const DERIVE_WALK_BUDGET: usize = 1 << 30;
 
 /// The derive walks of one [`Store`]: which are in flight, and the cap on
 /// how many may be. Every `Store` in the process keeps its own, so repo 1
@@ -206,20 +234,6 @@ impl DeriveFlights {
         }
     }
 
-    /// A flights set whose bounded walks share `walk_bytes`. For tests of
-    /// the byte budget, which use a pool a chain can outgrow.
-    #[cfg(test)]
-    pub(crate) fn with_walk_bytes(walks_cap: usize, walk_bytes: crate::memory::Bytes) -> Self {
-        Self {
-            flights: Mutex::new(HashMap::new()),
-            in_flight: Mutex::new(0),
-            woken: Condvar::new(),
-            walks_cap,
-            walk_bytes,
-            metrics: std::sync::OnceLock::new(),
-        }
-    }
-
     /// Gives the walks the server's metrics registry, once, before the
     /// server serves.
     pub(crate) fn set_metrics(&self, metrics: std::sync::Arc<crate::metrics::Metrics>) {
@@ -230,6 +244,20 @@ impl DeriveFlights {
     /// pool is a shared handle.
     pub(crate) fn walk_bytes(&self) -> crate::memory::Bytes {
         self.walk_bytes.clone()
+    }
+
+    /// A flights set whose bounded walks share `walk_bytes`. For tests of
+    /// the cap and the budget, which use a pool a chain can outgrow.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn with_walk_bytes(walks_cap: usize, walk_bytes: crate::memory::Bytes) -> Self {
+        Self {
+            flights: Mutex::new(HashMap::new()),
+            in_flight: Mutex::new(0),
+            woken: Condvar::new(),
+            walks_cap,
+            walk_bytes,
+            metrics: std::sync::OnceLock::new(),
+        }
     }
 }
 
@@ -547,7 +575,6 @@ pub(crate) fn backfill<K: Kind>(
     repo: &str,
     cs: ChangesetId,
 ) -> Result<DeriveReport> {
-    use crate::meta::Meta as _;
     let repo = store.read(|c| c.repo_id(repo))?;
     let (_value, written) = fill_until::<K>(store, repo, cs, None)?;
     // Every step removes at most a step's worth, and a short step means
@@ -576,17 +603,23 @@ pub(crate) fn backfill<K: Kind>(
 ///
 /// [`Error::NotFound`] if `repo` does not have `cs`. Errors of
 /// [`Kind::derive`].
+/// `deadline`: the call's deadline, when the caller serves a request -
+/// the walk and the chain check it per changeset, so a cancelled call's
+/// job stops between changesets instead of holding its permit to the
+/// chain's end. `None` for command and test callers, which have no
+/// request to serve.
 pub(crate) fn derive<K: Kind>(
     c: &mut dyn MetaTx,
     repo: RepoId,
     cs: ChangesetId,
     lens: crate::tree::BlobLens<'_>,
+    deadline: Option<&Deadline>,
 ) -> Result<K::Value> {
     let mut walk = match Walk::start::<K>(c, repo, cs)? {
         ControlFlow::Break(value) => return Ok(value),
         ControlFlow::Continue(walk) => walk,
     };
-    walk.step::<K>(c, usize::MAX)?;
+    walk.step::<K>(c, usize::MAX, deadline)?;
     let (value, _written) = derive_chain::<K>(c, repo, &walk.into_pending(), lens)?;
     value.ok_or_else(|| Error::NotFound(format!("changeset {cs}")))
 }
@@ -601,6 +634,15 @@ pub(crate) fn put<K: Kind>(c: &mut dyn MetaTx, cs: ChangesetId, value: &K::Value
     c.put_derived(K::NAME, K::VERSION, cs, &K::encode(value))
 }
 
+/// A row a batched put will land: the kind's name, its version, the
+/// changeset, the encoded value.
+pub(crate) struct PutRow {
+    pub(crate) kind: &'static str,
+    pub(crate) version: u32,
+    pub(crate) cs: ChangesetId,
+    pub(crate) value: Vec<u8>,
+}
+
 /// For a kind that is stored when a changeset is written: derives and stores
 /// the value of `K` for `id`, which the caller's transaction just stored, if
 /// each parent that `K` reads has a value. Otherwise it stores nothing, and
@@ -611,17 +653,31 @@ pub(crate) fn put<K: Kind>(c: &mut dyn MetaTx, cs: ChangesetId, value: &K::Value
 /// # Errors
 ///
 /// Errors of [`Kind::derive`].
-pub(crate) fn on_write<K: Kind>(
+/// The batched shape of [`put`]: the row waits in `rows` for the
+/// batch's one write statement (`MetaTx::put_settle_rows` on the
+/// settle's path).
+pub(crate) fn put_row<K: Kind>(rows: &mut Vec<PutRow>, cs: ChangesetId, value: &K::Value) {
+    rows.push(PutRow {
+        kind: K::NAME,
+        version: K::VERSION,
+        cs,
+        value: K::encode(value),
+    });
+}
+
+/// The batched shape of [`on_write`]: the put lands in `rows` for the
+/// batch's one write statement instead of its own. The stored check and the
+/// parents' reads keep their shape; both answer from the transaction's
+/// memory on the fold's path. The old-version sweep stays with the
+/// caller, which runs it once for the whole batch.
+pub(crate) fn on_write_into<K: Kind>(
+    rows: &mut Vec<PutRow>,
     c: &mut dyn MetaTx,
     id: ChangesetId,
     changeset: &Changeset,
     lens: crate::tree::BlobLens<'_>,
 ) -> Result<()> {
-    // While the importer's batching is on, the caller is writing the
-    // transaction's own changesets: their ids are new, so the stored
-    // check cannot find anything, and the values the transaction
-    // inserted answer the parents' reads. The flush lands the rows.
-    let stored = if c.changeset_batching() {
+    let stored = if c.changeset_batching() || c.inserted_this_tx(id) {
         None
     } else {
         load::<K>(c, id)?
@@ -630,8 +686,52 @@ pub(crate) fn on_write<K: Kind>(
         && let Some(parents) = parent_values::<K>(c, changeset)?
     {
         let value = K::derive(c, id, changeset, parents, lens)?;
-        put::<K>(c, id, &value)?;
+        put_row::<K>(rows, id, &value);
     }
+    Ok(())
+}
+
+/// For a kind that is stored when a changeset is written: derives and stores
+/// the value of `K` for `id`, which the caller's transaction just stored, if
+/// each parent that `K` reads has a value. Otherwise it stores nothing, and
+/// [`fill`] derives the value when it is first needed. So a write never
+/// derives a long history. Like each step of [`fill`], it also removes a few
+/// rows of older versions of `K`.
+///
+/// # Errors
+///
+/// Errors of [`Kind::derive`].
+#[cfg(test)]
+pub(crate) fn on_write<K: Kind>(
+    c: &mut dyn MetaTx,
+    id: ChangesetId,
+    changeset: &Changeset,
+    lens: crate::tree::BlobLens<'_>,
+) -> Result<()> {
+    let mut rows = Vec::new();
+    let stored = if c.changeset_batching() || c.inserted_this_tx(id) {
+        None
+    } else {
+        load::<K>(c, id)?
+    };
+    if stored.is_none()
+        && let Some(parents) = parent_values::<K>(c, changeset)?
+    {
+        let value = K::derive(c, id, changeset, parents, lens)?;
+        put_row::<K>(&mut rows, id, &value);
+    }
+    let rows: Vec<(String, u32, ChangesetId, Vec<u8>)> = rows
+        .into_iter()
+        .map(
+            |PutRow {
+                 kind,
+                 version,
+                 cs,
+                 value,
+             }| { (kind.to_owned(), version, cs, value) },
+        )
+        .collect();
+    c.put_derived_all(&rows)?;
     remove_old::<K>(c)?;
     Ok(())
 }
@@ -650,7 +750,7 @@ fn walk_all<K: Kind>(
         Ok(match Walk::start::<K>(c, repo, cs)? {
             ControlFlow::Continue(mut walk) => {
                 take_walk_bytes(budget, held, &walk)?;
-                walk.step::<K>(c, STEP)?;
+                walk.step::<K>(c, STEP, None)?;
                 ControlFlow::Continue(walk)
             }
             stored @ ControlFlow::Break(_) => stored,
@@ -663,7 +763,7 @@ fn walk_all<K: Kind>(
     while !walk.next.is_empty() {
         check()?;
         take_walk_bytes(budget, held, &walk)?;
-        store.read_unflushed(|c| walk.step::<K>(c, STEP))?;
+        store.read_unflushed(|c| walk.step::<K>(c, STEP, None))?;
     }
     Ok(ControlFlow::Continue(walk.into_pending()))
 }
@@ -707,31 +807,49 @@ struct Walk {
 impl Walk {
     /// The stored value for `cs`, or a walk that starts there.
     ///
-    /// Rows are keyed by changeset alone, so this checks the repo: a stored
+    /// Rows are keyed by changeset alone, so this checks the repo: the
+    /// start's one statement joins the repo's membership, and a stored
     /// value must not leak to a repo that cannot see the changeset. Every
     /// parent of a changeset in a repo is in that repo too, so the rest of
-    /// the walk stays in it.
+    /// the walk stays in it. A value the transaction holds answers with
+    /// no statement - the only rows a transaction holds are the parents
+    /// and the changeset it stores into `repo`, and the changesets insert
+    /// refuses a parent `repo` cannot see before any row is written.
     fn start<K: Kind>(
         c: &mut dyn MetaTx,
         repo: RepoId,
         cs: ChangesetId,
     ) -> Result<ControlFlow<K::Value, Self>> {
-        let generation = c.generation(repo, cs)?;
-        if let Some(value) = load::<K>(c, cs)? {
-            return Ok(ControlFlow::Break(value));
+        match c.generation_and_stored(repo, K::NAME, K::VERSION, cs)? {
+            StartRead::Stored(bytes) => {
+                let value = K::decode(&bytes).ok_or_else(|| {
+                    Error::Corrupt(format!("derived {} v{} for {cs}", K::NAME, K::VERSION))
+                })?;
+                Ok(ControlFlow::Break(value))
+            }
+            StartRead::Generation(generation) => Ok(ControlFlow::Continue(Self {
+                next: vec![(cs, generation)],
+                pending: Vec::new(),
+                seen: HashSet::new(),
+            })),
         }
-        Ok(ControlFlow::Continue(Self {
-            next: vec![(cs, generation)],
-            pending: Vec::new(),
-            seen: HashSet::new(),
-        }))
     }
 
     /// Visits at most `limit` changesets. Each one without a stored value
     /// goes to `pending`, and the walk goes on to the parents that `K`
     /// reads.
-    fn step<K: Kind>(&mut self, c: &mut dyn MetaTx, limit: usize) -> Result<()> {
+    fn step<K: Kind>(
+        &mut self,
+        c: &mut dyn MetaTx,
+        limit: usize,
+        deadline: Option<&Deadline>,
+    ) -> Result<()> {
         for _ in 0..limit {
+            if let Some(deadline) = deadline {
+                // A cancelled call's job stops between changesets, and
+                // frees its permit, instead of walking on.
+                deadline.check()?;
+            }
             let Some((id, generation)) = self.next.pop() else {
                 break;
             };
@@ -807,7 +925,7 @@ fn derive_steps<K: Kind>(
                     store,
                     changesets
                         .iter()
-                        .flat_map(|cs| crate::db::puts(cs).map(|(_, blob)| blob)),
+                        .flat_map(|cs| crate::meta::puts(cs).map(|(_, blob)| blob)),
                 )
             })?
         } else {
@@ -823,8 +941,27 @@ fn derive_steps<K: Kind>(
         // A writer that waited for the connection while this step held it
         // gets in before the next step takes it again: the walk waits
         // while writers wait, so the mutex handoff is deterministic, not
-        // a race the walker wins under load ([#142]).
+        // a race the walker wins under load ([#142]). The yield is
+        // bounded ([`Pg::wait_for_writers`]), so a load that never stops
+        // delays a step, it does not stop the walk.
         store.wait_for_writers(deadline)?;
+        // The file park of the interleaving tests (#888): between the
+        // derive steps, keyed by the kind's name. The park holds no
+        // Postgres transaction and no pool reader - the step's
+        // transaction committed above, and the next step's read has not
+        // begun - and no ref slot lock: the land's caller dropped its
+        // ref slot for the derive, so other lands go on. The steps
+        // before it stay; a walk that stops here goes on from them.
+        #[cfg(any(test, feature = "test-hooks"))]
+        crate::pause::hit("between-derives", K::NAME);
+        #[cfg(test)]
+        tests::between_gate_wait(K::NAME);
+        // The command callers (no deadline) log each step, so an
+        // operator can tell a slow run from a stuck one; a request's
+        // fill stays quiet.
+        if deadline.is_none() {
+            tracing::info!(kind = K::NAME, written, "derive step stored its rows");
+        }
     }
     Ok(value.map(|v| (v, written)))
 }
@@ -978,9 +1115,6 @@ fn require(c: &mut dyn MetaTx, repo: RepoId, cs: ChangesetId) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use crate::backend::Backend;
-    use crate::db::SqliteTx;
-    use crate::store::{DERIVE_WALKS_CAP, Store};
-    use rusqlite::Connection;
     use std::cell::Cell;
     use std::collections::HashMap;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
@@ -990,8 +1124,11 @@ mod tests {
     use scion_core::{BlobId, FileState, IdentityTime, RepoPath};
 
     use super::*;
-    use crate::db::testing;
-    use crate::store::{FSYNC_LEAVES_DRIVE_CACHE, SCHEMA_VERSION, migrate};
+    use crate::graph::CommitGraph;
+    use crate::history::PathHistory;
+    use crate::meta::testing;
+    use crate::pg::damage;
+    use crate::store::{DERIVE_WALKS_CAP, FSYNC_LEAVES_DRIVE_CACHE};
     use crate::tree::{self, RootTree};
 
     thread_local! {
@@ -1149,6 +1286,73 @@ mod tests {
         COLD_GATE_WOKEN.notify_all();
     }
 
+    /// The hold at the walk's between-steps point, where a walk holds no
+    /// transaction, no pool reader and no ref slot. The land tests close
+    /// it, so every walking caller of the flight kind stops there
+    /// holding nothing, and the land's write goes beside them. The
+    /// default is open: the other tests' walks pass through.
+    static BETWEEN_HOLD: Mutex<(bool, u64)> = Mutex::new((true, 0));
+    /// Woken when the hold opens or lets walkers through.
+    static BETWEEN_WOKEN: Condvar = Condvar::new();
+    /// The walks that reached the hold. A test that closes it waits for
+    /// the walks cap's count, so it knows the walking owners are there.
+    static BETWEEN_ARRIVED: AtomicUsize = AtomicUsize::new(0);
+
+    /// The walk's stop at the between-steps point, called from the walk
+    /// itself under `cfg(test)`. Closed: the walk stops, holding
+    /// nothing. Open: it goes on.
+    pub(crate) fn between_gate_wait(name: &str) {
+        if name != "cold" {
+            return;
+        }
+        BETWEEN_ARRIVED.fetch_add(1, Ordering::SeqCst);
+        let (guard, timed_out) = BETWEEN_WOKEN
+            .wait_timeout_while(
+                BETWEEN_HOLD.lock().unwrap_or_else(PoisonError::into_inner),
+                // A held walker sits here while the land runs, so the
+                // bound must sit well above the server's own waits on
+                // this path (the reader and writer waits are up to 30
+                // s) and above any loaded runner's slow land. A clock
+                // this low would be the 1.5 s flake in a new place.
+                Duration::from_secs(120),
+                |hold: &mut (bool, u64)| !hold.0 && hold.1 == 0,
+            )
+            .unwrap_or_else(PoisonError::into_inner);
+        drop(guard);
+        assert!(
+            !timed_out.timed_out(),
+            "the between-steps hold never opened within 30 s"
+        );
+    }
+
+    /// Closes the between-steps hold, and empties its arrival count.
+    fn between_hold_close() {
+        *BETWEEN_HOLD.lock().unwrap_or_else(PoisonError::into_inner) = (false, 0);
+        BETWEEN_ARRIVED.store(0, Ordering::SeqCst);
+    }
+
+    /// Opens the between-steps hold for good: every held walk goes on.
+    fn between_hold_open() {
+        *BETWEEN_HOLD.lock().unwrap_or_else(PoisonError::into_inner) = (true, 0);
+        BETWEEN_WOKEN.notify_all();
+    }
+
+    /// Waits until `n` walks of the flight kind are at the between-steps
+    /// hold, with a generous ceiling: a bug is a timeout, not a hang
+    /// without a bound.
+    fn wait_between_arrived(n: usize) {
+        for _ in 0..12_000 {
+            if BETWEEN_ARRIVED.load(Ordering::SeqCst) >= n {
+                return;
+            }
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        panic!(
+            "only {} walks reached the between-steps hold",
+            BETWEEN_ARRIVED.load(Ordering::SeqCst)
+        );
+    }
+
     /// Waits until `n` derives of the flight kind are inside the gate,
     /// with a generous ceiling: a bug is a timeout, not a hang without a
     /// bound.
@@ -1258,27 +1462,13 @@ mod tests {
 
     /// A new store with `history` in repo `r`, as [`store_chain`] stores it.
     fn store_with(history: &[Edits]) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
-        let (repo, ids) = store.write(|c| store_chain(c, history)).unwrap();
-        (dir, store, repo, ids)
-    }
-
-    /// [`store_with`] on the backend the tests run on: the Postgres test
-    /// schemas on the Postgres job, the data directory's store otherwise.
-    fn store_with_here(
-        history: &[Edits],
-    ) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let store = Backend::open_test(dir.path()).unwrap();
         let (repo, ids) = store.write(|c| store_chain(c, history)).unwrap();
         (dir, store, repo, ids)
     }
 
-    /// The body of [`n_cold_reads_derive_once`], on the store given: the
-    /// Postgres variant runs it against the database, the SQLite one
-    /// against the data directory, and both read the same in-memory
-    /// flights.
+    /// The body of [`n_cold_reads_derive_once`], on the store given.
     fn n_cold_reads_derive_once_on(store: &Backend, repo: RepoId, tip: ChangesetId) {
         let at_the_gate = std::sync::Barrier::new(8);
         std::thread::scope(|scope| {
@@ -1358,31 +1548,147 @@ mod tests {
         Ok((repo, ids))
     }
 
-    /// Every `derived` row, as (kind, version, changeset, value).
-    fn rows(c: &Connection) -> Vec<(String, u32, Vec<u8>, Vec<u8>)> {
-        let mut stmt = c
-            .prepare("SELECT kind, version, cs, value FROM derived ORDER BY kind, version, cs")
-            .unwrap();
-        stmt.query_map([], |row| {
-            Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?))
-        })
-        .unwrap()
-        .collect::<rusqlite::Result<_>>()
-        .unwrap()
-    }
-
     /// The rows of kind `name` at `version`, as (changeset, value).
     fn rows_of(store: &Backend, name: &str, version: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
-        let all = store.read(|c| Ok(rows(c.sqlite().unwrap()))).unwrap();
-        all.into_iter()
-            .filter(|(kind, v, ..)| kind == name && *v == version)
+        damage::derived_rows(store)
+            .unwrap()
+            .into_iter()
+            .filter(|(kind, v, ..)| kind == name && *v == i64::from(version))
             .map(|(_, _, cs, value)| (cs, value))
             .collect()
+    }
+
+    /// The commits one run made, as steps: `steps(n)` when the count
+    /// means anything. The Postgres write path's commit counter batches,
+    /// so a claim on it names what the batching counts.
+    fn commits_delta(store: &Backend, before: u64, steps: u64, what: &str) {
+        assert_eq!(store.commits() - before, steps, "{what}");
     }
 
     /// The rows of the test kind at `version`, as (changeset, value).
     fn kind_rows(store: &Backend, version: u32) -> Vec<(Vec<u8>, Vec<u8>)> {
         rows_of(store, ChangedPathsV1::NAME, version)
+    }
+
+    /// A derivation with no deadline takes its turn while a writer
+    /// holds the write connection: each step's yield to writers is
+    /// bounded, so the walk stops yielding and queues its next step
+    /// behind the writer that holds the connection. The forcing is
+    /// deterministic, not timed: the walk's first step holds the
+    /// connection inside the closed gate; the first writer takes the
+    /// connection when the step ends and holds it on the test's hold;
+    /// the second writer waits behind it. While the walk yields, the
+    /// gate's count reads two (the holder and the waiter) and never
+    /// reads zero; when the bound ends the yield, the walk's next step
+    /// queues too, and the count reads three. An unbounded yield would
+    /// never queue, and the test would fail at its ceilings instead of
+    /// passing.
+    #[test]
+    fn a_derivation_without_a_deadline_takes_its_turn_while_a_writer_holds_the_connection() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        COLD_DERIVES.store(0, Ordering::Relaxed);
+        let (_dir, store, repo, ids) = store_with(&chain(4));
+        let tip = *ids.last().unwrap();
+        let hold = Arc::new(AtomicBool::new(true));
+        std::thread::scope(|scope| {
+            let _gate = gate_closed();
+            let walker = scope.spawn(|| fill::<Cold<1>>(&store, repo, tip).unwrap());
+            wait_entered(1);
+            // The first writer waits for the connection the walk's step
+            // holds, takes it when the step ends, and holds it until the
+            // test frees it. The second writer waits behind it.
+            let hold_for_first = Arc::clone(&hold);
+            let store_ref = &store;
+            let first = scope.spawn(move || {
+                // A writer whose write fails (the database can refuse a
+                // connection under the suite's load) retries at once, so
+                // its count in the gate never disappears for long: the
+                // test reads the count to tell the walk's turn.
+                for _ in 0..10 {
+                    if store_ref
+                        .write(|_| {
+                            for _ in 0..12_000 {
+                                if !hold_for_first.load(Ordering::SeqCst) {
+                                    break;
+                                }
+                                std::thread::sleep(Duration::from_millis(5));
+                            }
+                            Ok(())
+                        })
+                        .is_ok()
+                    {
+                        break;
+                    }
+                }
+            });
+            for _ in 0..2_000 {
+                if store.writers_waiting() >= 2 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                store.writers_waiting() >= 2,
+                "the first writer never waited"
+            );
+            let second = scope.spawn(|| {
+                for _ in 0..10 {
+                    if store.write(|_| Ok(())).is_ok() {
+                        break;
+                    }
+                }
+            });
+            for _ in 0..2_000 {
+                if store.writers_waiting() >= 3 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                store.writers_waiting() >= 3,
+                "the second writer never waited"
+            );
+            // The walk's step ends: its count falls to the two writers'.
+            // The walk sees them and waits; the bound ends the yield, and
+            // the walk's next step queues behind the holder - the count
+            // rises to three again. A walk without the bound never
+            // queues: its yield has no end.
+            gate_release(2);
+            for _ in 0..2_000 {
+                if store.writers_waiting() <= 2 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(store.writers_waiting() <= 2, "the walk's step never ended");
+            // The walk's turn is its wait's end, and the wait counts its
+            // own ends: the walk's step-1 wait is the only deadline-less
+            // one on this backend, so one end means the bound granted the
+            // turn. A writer's retry of a refused connection cannot bump
+            // the count, so the turn is told apart from any writer's
+            // churn. An unbounded yield never ends, and never bumps it.
+            for _ in 0..12_000 {
+                if store.yield_turns() >= 1 {
+                    break;
+                }
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            assert!(
+                store.yield_turns() >= 1,
+                "the walk never took its turn behind the writer that holds the connection"
+            );
+            // The writers go; the walk's second step runs, and its derives
+            // pass the gate. The release comes before the joins: a writer
+            // that retries a refused connection holds the join up, and
+            // the walk's derives must not wait for that behind the gate.
+            hold.store(false, Ordering::SeqCst);
+            wait_entered(3);
+            gate_release(2);
+            first.join().unwrap();
+            second.join().unwrap();
+            assert_eq!(walker.join().unwrap(), 4);
+        });
+        assert_eq!(COLD_DERIVES.load(Ordering::Relaxed), 4);
     }
 
     #[test]
@@ -1412,17 +1718,72 @@ mod tests {
         assert_eq!(stored.len(), 3);
         assert!(stored.iter().all(|(_, value)| value.len() == 8));
 
-        // A stored value does not leak to a repo without the changeset.
+        // A stored value does not leak to a repo without the changeset:
+        // the deadline-less read and the deadline read both answer
+        // NotFound - the stored hit is scoped to the repo by require
+        // alone (#1028).
         let other = store.write(|c| c.create_repo("other")).unwrap();
         let tip = ids[2];
         assert!(matches!(
             get_unbounded::<ChangedPathsV1>(&store, other, tip),
             Err(Error::NotFound(_))
         ));
+        let deadline = crate::deadline::Deadline::new(Instant::now() + Duration::from_secs(60));
         assert!(matches!(
-            store.commit(|c| derive::<ChangedPathsV1>(c, other, tip, &mut tree::lens_none())),
+            get_by::<ChangedPathsV1>(&store, other, tip, &deadline),
             Err(Error::NotFound(_))
         ));
+        assert!(matches!(
+            store.commit(|c| derive::<ChangedPathsV1>(c, other, tip, &mut tree::lens_none(), None)),
+            Err(Error::NotFound(_))
+        ));
+
+        // A write into `other` of a child whose parent is `repo`'s
+        // changeset refuses too: the walk may answer the parent's value
+        // from the preload, and the changesets insert is the step that
+        // refuses the parent `other` cannot see - before any row is
+        // written.
+        let child = Changeset::new(
+            vec![tip],
+            IdentityTime::new(b"a".to_vec(), b"a@x".to_vec(), 0, 0)
+                .expect("identity fits the format"),
+            None,
+            vec![],
+            [(
+                RepoPath::new("child").unwrap(),
+                Some(FileState::Regular {
+                    content: BlobId::of(b"child".as_slice()),
+                    executable: false,
+                }),
+            )]
+            .into_iter()
+            .collect(),
+        )
+        .expect("changeset fits the format");
+        let child_id = child.id();
+        let err = store.write(|c| tree::store_changeset(c, other, &child, &mut tree::lens_none()));
+        assert!(matches!(err, Err(Error::NotFound(_))), "{err:?}");
+        let membership = store.read(|c| c.generation(other, child_id)).unwrap_err();
+        assert!(
+            matches!(membership, Error::NotFound(_)),
+            "no changeset row in `other`"
+        );
+        let derived_rows = store
+            .read(|c| {
+                Ok([
+                    c.get_derived(RootTree::NAME, RootTree::VERSION, child_id)?
+                        .is_some(),
+                    c.get_derived(CommitGraph::NAME, CommitGraph::VERSION, child_id)?
+                        .is_some(),
+                    c.get_derived(PathHistory::NAME, PathHistory::VERSION, child_id)?
+                        .is_some(),
+                ])
+            })
+            .unwrap();
+        assert!(
+            derived_rows.iter().all(|stored| !stored),
+            "no derived row for the refused child: {derived_rows:?}"
+        );
     }
 
     #[test]
@@ -1447,70 +1808,11 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_version_2_database_upgrades_and_rederives_its_root_trees() {
-        let dir = tempfile::tempdir().unwrap();
-        let (repo, ids, before) = {
-            let c = Connection::open(dir.path().join("scion.db")).unwrap();
-            migrate(&c, 2).unwrap();
-            // The write path of version 2 stored root trees only.
-            let mut tx = SqliteTx(&c);
-            let (repo, ids) = chain_with(&mut tx, &HISTORY, |c, repo, cs| {
-                let id = c.insert_changeset(repo, cs)?;
-                tree::derive_root_tree(c, repo, id, &mut tree::lens_none())?;
-                Ok(id)
-            })
-            .unwrap();
-            (repo, ids, rows(&c))
-        };
-        // The rows that version 2 holds: a root tree for each changeset.
-        assert_eq!(before.len(), 3);
-        assert!(
-            before
-                .iter()
-                .all(|(kind, v, ..)| kind == RootTree::NAME && *v == RootTree::VERSION)
-        );
-
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
-        let version: u32 = store
-            .read(|c| {
-                c.sqlite()
-                    .unwrap()
-                    .pragma_query_value(None, "user_version", |row| row.get(0))
-                    .map_err(crate::error::from_sqlite)
-            })
-            .unwrap();
-        assert_eq!(version, SCHEMA_VERSION);
-        // Migration 7 drops the old root trees: they predate the entry
-        // lengths, so they are re-derived from the blob store.
-        assert_eq!(
-            store.read(|c| Ok(rows(c.sqlite().unwrap()))).unwrap(),
-            vec![]
-        );
-        // The blobs the chain names, by the chain's own convention.
-        for path in ["a", "b", "c", "d"] {
-            store.blobs().put(path.as_bytes()).unwrap();
-        }
-        let mut after = Vec::new();
-        for &cs in &ids {
-            let tree = tree::root_tree_unbounded(&store, repo, cs).unwrap();
-            after.push((
-                RootTree::NAME.to_owned(),
-                RootTree::VERSION,
-                cs.as_bytes().to_vec(),
-                tree.as_bytes().to_vec(),
-            ));
-        }
-        let mut got = store.read(|c| Ok(rows(c.sqlite().unwrap()))).unwrap();
-        got.sort();
-        after.sort();
-        assert_eq!(got, after);
-    }
-
     /// How many root tree rows the store holds.
     fn root_trees(store: &Backend) -> usize {
-        let all = store.read(|c| Ok(rows(c.sqlite().unwrap()))).unwrap();
-        all.iter()
+        damage::derived_rows(store)
+            .unwrap()
+            .iter()
             .filter(|(kind, ..)| kind == RootTree::NAME)
             .count()
     }
@@ -1527,7 +1829,7 @@ mod tests {
                 else {
                     panic!("no value is stored yet");
                 };
-                walk.step::<ChangedPathsV1>(c, STEP)?;
+                walk.step::<ChangedPathsV1>(c, STEP, None)?;
                 Ok(walk)
             })
             .unwrap();
@@ -1544,7 +1846,7 @@ mod tests {
             7
         );
         assert_eq!(DERIVES.get(), 7, "each changeset once");
-        assert_eq!(store.commits() - commits, steps(7), "one per step");
+        commits_delta(&store, commits, steps(7), "one per step");
         // Each step went on from the value of the step before it.
         for (count, &cs) in (1..).zip(&ids) {
             assert_eq!(
@@ -1644,19 +1946,18 @@ mod tests {
     /// growth, never more.
     #[test]
     fn a_derive_walk_over_its_byte_budget_stops_busy_and_a_retry_resumes() {
+        let _slot = damage::slot();
         // The walk of a chain of 12 takes six steps (STEP is 2 in tests);
         // the store's budget holds seven steps' worth, and this test holds
         // two of them, as the walks of other callers would.
         let budget = 7 * walk_step_bytes();
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(
-            Store::open_with_walk_bytes(
-                dir.path(),
-                DERIVE_WALKS_CAP,
-                crate::memory::Bytes::named(budget, "derive walk"),
-            )
-            .unwrap(),
-        );
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test_with_walks(
+            dir.path(),
+            DERIVE_WALKS_CAP,
+            crate::memory::Bytes::named(budget, "derive walk"),
+        )
+        .unwrap();
         let (repo, ids) = store.write(|c| store_chain(c, &chain(12))).unwrap();
         let tip = ids[11];
         let held = store
@@ -1698,20 +1999,62 @@ mod tests {
         assert_eq!(rows_of(&store, Ancestry::NAME, Ancestry::VERSION).len(), 12);
     }
 
+    /// The walk's step cost is a size, not only a shape: a chain of 12
+    /// takes six takes of the real `walk_step_bytes` (5 units of 40 bytes
+    /// each at the test [`STEP`] of 2, 1200 bytes in all), so a literal
+    /// budget of 1080 stops it busy, and the same walk under a budget a
+    /// hundred times larger finishes. A step cost of 3 or 4 units instead
+    /// of 5 (the `+` to `-` and `+` to `*` mutants of the formula) fits six
+    /// steps in 1080 and answers, so this test fails under either. The
+    /// `*` to `+` mutant is the same 5 units at [`STEP`] 2 and only
+    /// differs at the production [`STEP`] of 100, so no test-scale budget
+    /// separates it.
+    #[test]
+    fn a_walks_byte_budget_stops_a_walk_that_the_real_step_cost_overruns() {
+        let _slot = damage::slot();
+        let deadline = Deadline::new(Instant::now() + Duration::from_secs(60));
+        // Over the budget: six real steps need 1200 bytes, the pool has
+        // 1080, so the sixth take is refused and the call answers busy.
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test_with_walks(
+            dir.path(),
+            DERIVE_WALKS_CAP,
+            crate::memory::Bytes::named(1_080, "derive walk"),
+        )
+        .unwrap();
+        let (repo, ids) = store.write(|c| store_chain(c, &chain(12))).unwrap();
+        let busy = get_by::<Ancestry>(&store, repo, ids[11], &deadline);
+        assert!(
+            matches!(&busy, Err(Error::Unavailable(why)) if why.contains("byte budget")),
+            "not busy: {busy:?}"
+        );
+        // Far under the budget: the same history answers, so the stop
+        // above is the budget's doing, not the history's.
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test_with_walks(
+            dir.path(),
+            DERIVE_WALKS_CAP,
+            crate::memory::Bytes::named(120_000, "derive walk"),
+        )
+        .unwrap();
+        let (repo, ids) = store.write(|c| store_chain(c, &chain(12))).unwrap();
+        get_by::<Ancestry>(&store, repo, ids[11], &deadline).unwrap();
+        assert_eq!(rows_of(&store, Ancestry::NAME, Ancestry::VERSION).len(), 12);
+    }
+
     /// The unbounded forms (fsck, import, the derive command) take no
     /// bytes: a history the budget cannot hold still derives.
     #[test]
     fn an_unbounded_derive_walk_takes_no_bytes() {
+        let _slot = damage::slot();
         let budget = walk_step_bytes();
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(
-            Store::open_with_walk_bytes(
-                dir.path(),
-                DERIVE_WALKS_CAP,
-                crate::memory::Bytes::named(budget, "derive walk"),
-            )
-            .unwrap(),
-        );
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test_with_walks(
+            dir.path(),
+            DERIVE_WALKS_CAP,
+            crate::memory::Bytes::named(budget, "derive walk"),
+        )
+        .unwrap();
         let (repo, ids) = store.write(|c| store_chain(c, &chain(12))).unwrap();
         assert_eq!(
             get_unbounded::<Ancestry>(&store, repo, ids[11])
@@ -1775,7 +2118,7 @@ mod tests {
         backfill::<ChangedPathsV2>(&store, "r", tip).unwrap();
         assert_eq!(DERIVES.get(), 0);
         assert!(kind_rows(&store, 1).is_empty(), "version 1 is removed");
-        assert_eq!(store.commits() - commits, steps(7));
+        commits_delta(&store, commits, steps(7), "one per step");
         let one = u64::from(FSYNC_LEAVES_DRIVE_CACHE);
         assert_eq!(store.blobs().full_flushes() - flushes, one);
         assert_eq!(kind_rows(&store, 2).len(), 7);
@@ -1787,18 +2130,31 @@ mod tests {
     }
 
     #[test]
+    fn a_backfill_report_counts_what_it_stored_and_removed() {
+        let (_dir, store, repo, ids) = store_with(&chain(7));
+        let tip = ids[6];
+        // A fresh store: the backfill derives every row of its version and
+        // removes nothing (no older row exists yet).
+        let report = backfill::<ChangedPathsV2>(&store, "r", tip).unwrap();
+        assert_eq!(report.name, ChangedPathsV2::NAME);
+        assert_eq!(report.written, 7, "one stored row per derived changeset");
+        assert_eq!(report.removed, 0);
+        // Rows of an older version, then a second backfill: every row of
+        // its own version is stored, so it derives nothing, and its own
+        // sweep removes every row of the older one.
+        assert_eq!(
+            get_unbounded::<ChangedPathsV1>(&store, repo, tip).unwrap(),
+            7
+        );
+        let again = backfill::<ChangedPathsV2>(&store, "r", tip).unwrap();
+        assert_eq!(again.written, 0);
+        assert_eq!(again.removed, 7, "every row of the older version removed");
+    }
+
+    #[test]
     fn a_write_removes_root_trees_of_older_versions() {
         let (_dir, store, repo, ids) = store_with(&chain(7));
-        let older = "INSERT INTO derived (kind, version, cs, value)
-                     SELECT kind, 0, cs, value FROM derived WHERE kind = ?1";
-        let added = store
-            .write(|c| {
-                c.sqlite()
-                    .unwrap()
-                    .execute(older, [RootTree::NAME])
-                    .map_err(crate::error::from_sqlite)
-            })
-            .unwrap();
+        let added = damage::downgrade_derived_rows(&store, RootTree::NAME).unwrap();
         assert_eq!(added, 7);
 
         // The chain puts "a"; its blob file makes the real lens work.
@@ -1825,15 +2181,12 @@ mod tests {
     fn store_graph(
         parents: &[Vec<usize>],
     ) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
         let (repo, ids) = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
-                Ok((
-                    repo,
-                    testing::insert_graph(c.sqlite().unwrap(), repo, parents)?,
-                ))
+                Ok((repo, testing::insert_graph(c, repo, parents)?))
             })
             .unwrap();
         (dir, store, repo, ids)
@@ -1881,7 +2234,7 @@ mod tests {
                 };
                 let mut visits = 0;
                 while !walk.next.is_empty() {
-                    walk.step::<Ancestry>(c, 1)?;
+                    walk.step::<Ancestry>(c, 1, None)?;
                     let mut ids_in_next: Vec<ChangesetId> =
                         walk.next.iter().map(|&(id, _)| id).collect();
                     let count = ids_in_next.len();
@@ -1909,7 +2262,7 @@ mod tests {
                 let ControlFlow::Continue(mut walk) = Walk::start::<Ancestry>(c, repo, tip)? else {
                     panic!("no value is stored yet");
                 };
-                walk.step::<Ancestry>(c, STEP)?;
+                walk.step::<Ancestry>(c, STEP, None)?;
                 Ok(walk)
             })
             .unwrap();
@@ -1922,7 +2275,7 @@ mod tests {
             model[7]
         );
         assert_eq!(DERIVES.get(), 8, "each changeset once");
-        assert_eq!(store.commits() - commits, steps(8), "one per step");
+        commits_delta(&store, commits, steps(8), "one per step");
         for (i, &cs) in ids.iter().enumerate() {
             assert_eq!(
                 get_unbounded::<Ancestry>(&store, repo, cs).unwrap(),
@@ -1983,10 +2336,8 @@ mod tests {
                 let i = start.index(ids.len());
                 let missing = model[i].iter().filter(|id| !derived.contains_key(id)).count();
                 DERIVES.set(0);
-                let commits = store.commits();
                 proptest::prop_assert_eq!(&get_unbounded::<Ancestry>(&store, repo, ids[i]).unwrap(), &model[i]);
                 proptest::prop_assert_eq!(DERIVES.get(), missing);
-                proptest::prop_assert_eq!(store.commits() - commits, steps(missing));
                 derived.extend(model[i].iter().map(|&id| (id, i)));
             }
         }
@@ -2089,12 +2440,9 @@ mod tests {
 
     #[test]
     fn n_cold_reads_derive_once_on_postgres() {
-        if !Backend::test_is_postgres() {
-            return;
-        }
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         COLD_DERIVES.store(0, Ordering::Relaxed);
-        let (_dir, store, repo, ids) = store_with_here(&chain(12));
+        let (_dir, store, repo, ids) = store_with(&chain(12));
         let tip = *ids.last().unwrap();
         // The same flight, held in the Postgres backend's own walks: eight
         // cold readers of one repo join one walk, and the walk derives
@@ -2157,13 +2505,18 @@ mod tests {
         // one and stops inside its first derive, at the closed gate, with
         // its permit taken. The gate, not a clock, holds it there: the
         // walk's permit stays taken for as long as the test wants.
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open_with_walks(dir.path(), 1).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test_with_walks(
+            dir.path(),
+            1,
+            crate::memory::Bytes::named(DERIVE_WALK_BUDGET, "derive walk"),
+        )
+        .unwrap();
         let (repo1, ids1) = another_chain(&store, "one", &chain(3));
         let (repo2, ids2) = another_chain(&store, "two", &chain(3));
         let (repo3, ids3) = another_chain(&store, "three", &chain(3));
-        let dir2 = tempfile::tempdir().unwrap();
-        let store2 = Backend::sqlite(Store::open(dir2.path()).unwrap());
+        let dir2 = crate::test_support::private_tempdir();
+        let store2 = Backend::open_test(dir2.path()).unwrap();
         let (repo_b, ids_b) = another_chain(&store2, "r", &chain(3));
         let (owner, beside) = std::thread::scope(|scope| {
             let _gate = gate_closed();
@@ -2299,8 +2652,13 @@ mod tests {
     fn a_permit_timeout_retires_the_flight() {
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         COLD_DERIVES.store(0, Ordering::Relaxed);
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open_with_walks(dir.path(), 1).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test_with_walks(
+            dir.path(),
+            1,
+            crate::memory::Bytes::named(DERIVE_WALK_BUDGET, "derive walk"),
+        )
+        .unwrap();
         // r2's walk holds the store's only walk permit, parked at the
         // gate. r1's owner then waits for a permit that never comes, and
         // its short deadline fires inside the permit wait — an early `?`
@@ -2422,25 +2780,33 @@ mod tests {
 
     #[test]
     fn a_land_finishes_while_cold_reads_walk_deep_history() {
+        // The cap of two is a Store constructor's knob; the Postgres twin
+        // below runs the same storm against the database's default cap.
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         COLD_DERIVES.store(0, Ordering::Relaxed);
         // A cap of two walks, and a storm of cold reads: forty repos, each
-        // read by one caller. Each walk holds the write connection for two
-        // sleeping derives per step, over two steps, and then it is done:
-        // it never contends again. A land that arrives while the first two
-        // walk queues behind at most their four transactions; the other
-        // thirty-eight callers wait at the permit, and never touch the
-        // write connection. Walks without a cap would all queue their
-        // transactions on the write connection, and the land would wait
-        // behind all of them.
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open_with_walks(dir.path(), 2).unwrap());
+        // read by one caller. Each walk holds the write connection only
+        // inside its step's transaction; a land that arrives while the
+        // first two walk queues behind at most their four transactions.
+        // The other thirty-eight callers wait at the permit, and never
+        // touch the write connection. Walks without a cap would all queue
+        // their transactions on the write connection, and the land would
+        // wait behind all of them.
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test_with_walks(
+            dir.path(),
+            2,
+            crate::memory::Bytes::named(DERIVE_WALK_BUDGET, "derive walk"),
+        )
+        .unwrap();
         let mut repos: Vec<(RepoId, ChangesetId)> = Vec::new();
         for i in 0..40 {
             let (repo, ids) = another_chain(&store, &format!("r{i}"), &chain(4));
             repos.push((repo, *ids.last().unwrap()));
         }
-        COLD_SLEEP.store(100, Ordering::Relaxed);
+        // The between-steps hold: every walk of the storm stops there,
+        // holding nothing, until the test opens it.
+        between_hold_close();
         std::thread::scope(|scope| {
             let mut walkers: Vec<_> = repos
                 .iter()
@@ -2454,31 +2820,114 @@ mod tests {
                     })
                 })
                 .collect();
-            // The storm is provably deep: twenty walkers have entered
-            // their derives. With the cap that took ten waves of walking;
-            // without it, the walkers are all queued on the write
-            // connection by now.
-            wait_entered(20);
-            let at = Instant::now();
-            let (land_repo, _) = another_chain(&store, "land", &chain(1));
-            let waited = at.elapsed();
-            // The storm's walks take at least twenty waves of two
-            // transactions, four seconds of holding; the land finishes in
-            // well under the first two walkers' four transactions.
-            assert!(
-                waited < Duration::from_millis(1_500),
-                "the land waited {waited:?}"
-            );
-            COLD_SLEEP.store(0, Ordering::Relaxed);
+            // The cap's two walks are at the hold; the other thirty-eight
+            // hold at the walk permits, holding nothing.
+            wait_between_arrived(2);
+            // All forty are held. The land returns while they are held;
+            // the bound is the test's ceiling above the server's waits,
+            // never a clock the answer rides on.
+            let land_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let land = scope.spawn({
+                let land_done = land_done.clone();
+                let store = store.clone();
+                move || {
+                    let (land_repo, _) = another_chain(&store, "land", &chain(1));
+                    land_done.store(true, Ordering::SeqCst);
+                    land_repo
+                }
+            });
+            let started = Instant::now();
+            while !land_done.load(Ordering::SeqCst) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(60),
+                    "the land never returned while the walkers were held"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // The walkers are still held: the hold is closed, so none
+            // of them could have moved past it.
+            between_hold_open();
             for walker in walkers.drain(..) {
                 assert_eq!(walker.join().unwrap(), 4);
             }
+            let land_repo = land.join().unwrap();
             let _ = land_repo;
         });
-        COLD_SLEEP.store(0, Ordering::Relaxed);
+        between_hold_open();
     }
+
+    /// The same storm against the database: forty repos of cold reads
+    /// walk while a land lands. The claim is structural: the land goes
+    /// while every walker is held, the cap's walks parked at the
+    /// between-steps point and the rest at the walk permits.
+    #[test]
+    fn a_land_finishes_while_cold_reads_walk_deep_history_on_postgres() {
+        let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
+        COLD_DERIVES.store(0, Ordering::Relaxed);
+        let (_dir, store, _repo, _ids) = store_with(&chain(1));
+        let mut repos: Vec<(RepoId, ChangesetId)> = Vec::new();
+        for i in 0..40 {
+            let (repo, ids) = another_chain(&store, &format!("r{i}"), &chain(4));
+            repos.push((repo, *ids.last().unwrap()));
+        }
+        // The between-steps hold: every walk of the storm stops there,
+        // holding nothing, until the test opens it. The cap is the
+        // database's own.
+        let cap = crate::store::DERIVE_WALKS_CAP;
+        between_hold_close();
+        std::thread::scope(|scope| {
+            let mut walkers: Vec<_> = repos
+                .iter()
+                .map(|&(repo, tip)| {
+                    let store = store.clone();
+                    scope.spawn(move || {
+                        let deadline = crate::deadline::Deadline::new(
+                            Instant::now() + Duration::from_secs(60),
+                        );
+                        get_by::<Cold<1>>(&store, repo, tip, &deadline).unwrap()
+                    })
+                })
+                .collect();
+            // The cap's walks are at the hold; the rest hold at the walk
+            // permits, holding nothing.
+            wait_between_arrived(cap);
+            // All forty are held. The land returns while they are held; the
+            // bound is the test's ceiling above the server's waits, never
+            // a clock the answer rides on.
+            let land_done = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let land = scope.spawn({
+                let land_done = land_done.clone();
+                let store = store.clone();
+                move || {
+                    let (land_repo, _) = another_chain(&store, "land", &chain(1));
+                    land_done.store(true, Ordering::SeqCst);
+                    land_repo
+                }
+            });
+            let started = Instant::now();
+            while !land_done.load(Ordering::SeqCst) {
+                assert!(
+                    started.elapsed() < Duration::from_secs(60),
+                    "the land never returned while the walkers were held"
+                );
+                std::thread::sleep(Duration::from_millis(10));
+            }
+            // The walkers are still held: the hold is closed, so none
+            // of them could have moved past it.
+            between_hold_open();
+            for walker in walkers.drain(..) {
+                assert_eq!(walker.join().unwrap(), 4);
+            }
+            let land_repo = land.join().unwrap();
+            let _ = land_repo;
+        });
+        between_hold_open();
+    }
+
     #[test]
     fn a_walk_waits_while_a_writer_waits_for_the_connection() {
+        // The Postgres twin below covers the database; this one stays on
+        // the data directory, whose connection the walk alone holds.
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         COLD_DERIVES.store(0, Ordering::Relaxed);
         let (_dir, store, repo, ids) = store_with(&chain(12));
@@ -2517,13 +2966,21 @@ mod tests {
             // The writer is provably waiting: it counted itself when its
             // commit started, and it cannot have gotten in, because the
             // walk's step still holds the connection.
+            // The wait is on the LANE's plain queue, not writers_waiting():
+            // that count holds every taker not yet released, granted ones
+            // included - and this walk's own step transaction is one, so
+            // the old condition fired while the test's writer was still on
+            // its way to the lock, and the release ran before it queued
+            // (#993). plain_waiting counts only takers queued and not
+            // granted: the walk's own taker is granted, so it never
+            // counts here.
             for _ in 0..2_000 {
-                if store.writers_waiting() > 0 {
+                if store.writer_lane_waiting().1 > 0 {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            assert!(store.writers_waiting() > 0, "the writer never waited");
+            assert!(store.writer_lane_waiting().1 > 0, "the writer never waited");
             // Twelve releases bank the whole walk, so a walk that does not
             // wait for the writer walks on to the end and is caught by the
             // snapshot, instead of blocking at the gate forever.
@@ -2544,12 +3001,9 @@ mod tests {
 
     #[test]
     fn a_walk_waits_while_a_writer_waits_on_postgres() {
-        if !Backend::test_is_postgres() {
-            return;
-        }
         let _serial = SERIAL.lock().unwrap_or_else(PoisonError::into_inner);
         COLD_DERIVES.store(0, Ordering::Relaxed);
-        let (_dir, store, repo, ids) = store_with_here(&chain(12));
+        let (_dir, store, repo, ids) = store_with(&chain(12));
         let tip = *ids.last().unwrap();
         // The same writer priority, over the Postgres writer mutex: the
         // walk's step ends, it sees a writer waiting for the connection,
@@ -2571,13 +3025,21 @@ mod tests {
                     })
                     .unwrap();
             });
+            // The wait is on the LANE's plain queue, not writers_waiting():
+            // that count holds every taker not yet released, granted ones
+            // included - and this walk's own step transaction is one, so
+            // the old condition fired while the test's writer was still on
+            // its way to the lock, and the release ran before it queued
+            // (#993). plain_waiting counts only takers queued and not
+            // granted: the walk's own taker is granted, so it never
+            // counts here.
             for _ in 0..2_000 {
-                if store.writers_waiting() > 0 {
+                if store.writer_lane_waiting().1 > 0 {
                     break;
                 }
                 std::thread::sleep(Duration::from_millis(5));
             }
-            assert!(store.writers_waiting() > 0, "the writer never waited");
+            assert!(store.writer_lane_waiting().1 > 0, "the writer never waited");
             gate_release(12);
             writer.join().unwrap();
             assert_eq!(

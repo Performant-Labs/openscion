@@ -14,7 +14,7 @@ In scope, in the supported profile
 ([threat-model.md](threat-model.md), section 1):
 
 - `scion-server` — the active server: the RPC surface, the metadata
-  stores (SQLite and Postgres), the blob store, the archive verify and
+  (Postgres), the blob store, the archive verify and
   restore, the audit log.
 - `scion-cache` and `scion-daemon` — the tiers in front of it, and
   what they trust.
@@ -66,7 +66,7 @@ test, is [threat-model.md](threat-model.md), section 5.
 | Deny-only and partial reads | A principal whose rules deny prefixes; a partial reader's ticket, writes, history and directory views | A deny-only entry read through as allow; closed; the partial view is derived and ticket-minted on the view root | [#403](https://github.com/bnsd55/openscion/pull/403), and the `access.rs` tests |
 | Tickets and object reads | A ticket serving beyond its walk; a forged or replayed ticket; object frames from a hostile peer | The ticket check and the walk hold on server and tiers; the frame decoder is fuzzed | the `tickets.rs` suite, and [fuzzing.md](fuzzing.md)'s `object` target |
 | Secrets on disk | Symlinks, hard links, group-writable and ACL-amplified files behind `--tls-key`, `--ticket-key`, the access file, seeds | Files were read by path; now every checked file is read through one descriptor whose stat is the file that was read | [#354](https://github.com/bnsd55/openscion/pull/354), [#356](https://github.com/bnsd55/openscion/pull/356), [#360](https://github.com/bnsd55/openscion/pull/360), [#369](https://github.com/bnsd55/openscion/pull/369) |
-| Secrets in argv | Every secret flag's exposure through `ps`; where the value can go instead | The argv form warns and goes away; every secret flag has a checked file form and an environment form | [#402](https://github.com/bnsd55/openscion/pull/402); the audit of the flags is in [operations.md](operations.md) |
+| Secrets in argv | Every secret flag's exposure through `ps`; where the value can go instead | The argv form is refused at start, and the value is never echoed; every secret flag has a checked file form and an environment form | [#402](https://github.com/bnsd55/openscion/pull/402); the audit of the flags is in [operations.md](operations.md) |
 | Writes | `PutBlob` and `CreateChangeset` with hostile bytes; caps on whole objects | The decoders fuzz; the changeset stream has bounded decode; the byte cap is `MAX_OBJECT_BYTES` | the `write.rs` tests and [fuzzing.md](fuzzing.md)'s `write-decode` target |
 | Lands | Two lands sharing a request key; a replay of a landed land; a land whose call dies mid-call | The ref lock serializes moves; the audit chain (land intent, land result, ref line) now holds even when the call is cut | [#443](https://github.com/bnsd55/openscion/pull/443), and the `land_model.rs` reference model |
 | Import | A raw git date git cannot write back; a commit or tree object past the byte cap decoded whole | Both refused now: the date round-trip gate and the header-read caps (in review) | [#473](https://github.com/bnsd55/openscion/pull/473) |
@@ -93,9 +93,10 @@ git clone --depth 1 https://github.com/tokio-rs/tokio /tmp/tokio
 ```
 
 Attack it: `scn` is the client (`./target/release/scn ls main:src` and
-the rest of the README's [Try it](../README.md#try-it) steps run as
+the rest of the README's [quick start](../README.md#quick-start) steps run as
 written); the gRPC surface is behind `SCION_TOKEN=dev` on port 7878;
-the data directory `/tmp/scion` is SQLite plus blobs. The file-mode
+the data directory `/tmp/scion` is a marker plus blobs (the metadata
+lives in Postgres). The file-mode
 rules refuse a directory other accounts can write — make one and watch
 the open refuse it. The archive round trip is the fastest path to the
 archive attacks: `scion-server --data /tmp/scion export --all --out
@@ -112,7 +113,7 @@ cargo test -p open-scion-server --test access --test tickets \
 ```
 
 Postgres lanes need a scratch instance:
-`SCION_TEST_BACKEND=postgres SCION_TEST_POSTGRES_URL=postgres://...`.
+`SCION_TEST_POSTGRES_URL=postgres://...`.
 
 ## 5. The fuzz targets and their corpora
 

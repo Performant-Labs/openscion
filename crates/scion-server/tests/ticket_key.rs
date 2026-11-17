@@ -13,14 +13,15 @@ use std::process::{Command, Output};
 /// audit log lives there, and the working directory's default ACL on CI
 /// would refuse the default path.
 fn run(data: &Path, args: &[&std::ffi::OsStr]) -> Output {
-    // D25: the binary refuses a missing data directory; a test that
+    // The binary refuses a missing data directory (#578); a test that
     // wants the command to run makes the directory itself.
-    fs::create_dir_all(data).unwrap();
+    scion_proto::runtime::auth::create_private_dir_all(data).unwrap();
     Command::new(env!("CARGO_BIN_EXE_scion-server"))
         .arg("--data")
         .arg(data)
         .args(args)
         .env("NO_COLOR", "1")
+        .env("SCION_TOKEN", "t")
         .output()
         .unwrap()
 }
@@ -32,7 +33,7 @@ fn mode_of(path: &Path) -> u32 {
 
 #[test]
 fn ticket_key_prints_one_line_of_64_hex() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let data = dir.path().join("data");
     let out = run(
         &data,
@@ -60,7 +61,7 @@ fn ticket_key_prints_one_line_of_64_hex() {
 
 #[test]
 fn a_ticket_key_file_is_private_and_made_once() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let data = dir.path().join("data");
     let key = dir.path().join("ticket.key");
 
@@ -90,7 +91,7 @@ fn a_ticket_key_file_is_private_and_made_once() {
 
 #[test]
 fn serve_refuses_a_seed_that_group_or_others_can_read() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let data = dir.path().join("data");
     let key = dir.path().join("ticket.key");
     let out = run(
@@ -105,18 +106,11 @@ fn serve_refuses_a_seed_that_group_or_others_can_read() {
 
     // 0644: everyone on the machine can read the seed, so serve refuses it.
     fs::set_permissions(&key, fs::Permissions::from_mode(0o644)).unwrap();
-    let args: Vec<std::ffi::OsString> = [
-        "serve",
-        "--token",
-        "t",
-        "--listen",
-        "127.0.0.1:0",
-        "--ticket-key",
-    ]
-    .iter()
-    .map(std::ffi::OsString::from)
-    .chain(std::iter::once(key.as_os_str().to_owned()))
-    .collect();
+    let args: Vec<std::ffi::OsString> = ["serve", "--listen", "127.0.0.1:0", "--ticket-key"]
+        .iter()
+        .map(std::ffi::OsString::from)
+        .chain(std::iter::once(key.as_os_str().to_owned()))
+        .collect();
     let out = run(
         &data,
         &args
@@ -128,24 +122,28 @@ fn serve_refuses_a_seed_that_group_or_others_can_read() {
     let err = String::from_utf8_lossy(&out.stderr);
     assert!(err.contains("group or others"), "{err}");
 
-    // Back to 0600, the server starts with the key. D25: the operator
+    // Back to 0600, the server starts with the key. The operator
     // makes this data directory (0700) before the serve.
     fs::set_permissions(&key, fs::Permissions::from_mode(0o600)).unwrap();
     let data2 = dir.path().join("data2");
     fs::create_dir_all(&data2).unwrap();
     fs::set_permissions(&data2, fs::Permissions::from_mode(0o700)).unwrap();
-    let mut child = Command::new(env!("CARGO_BIN_EXE_scion-server"))
+    let child = Command::new(env!("CARGO_BIN_EXE_scion-server"))
         .args([
             "--data",
             data2.to_str().unwrap(),
             "serve",
-            "--token",
-            "t",
             "--listen",
             "127.0.0.1:0",
             "--ticket-key",
             key.to_str().unwrap(),
         ])
+        .env("SCION_TOKEN", "t")
+        // The serve opens the store: the URL rides the env, quietly.
+        .env(
+            "SCION_POSTGRES_URL",
+            scion_server::Backend::test_postgres_url(&data2).unwrap(),
+        )
         .env("NO_COLOR", "1")
         // The info lines go to stderr, and the test waits for the one that
         // says the server listens.
@@ -154,13 +152,27 @@ fn serve_refuses_a_seed_that_group_or_others_can_read() {
         .stderr(std::fs::File::create(dir.path().join("serve.log")).unwrap())
         .spawn()
         .unwrap();
-    wait_serving(&mut child, &dir.path().join("serve.log"));
+    // The guard kills and reaps on every path out of here, panics
+    // included: no wait below orphans a serving server.
+    let mut child = Guarded(child);
+    wait_serving(&mut child.0, &dir.path().join("serve.log"));
     assert!(
-        child.try_wait().unwrap().is_none(),
+        child.0.try_wait().unwrap().is_none(),
         "serve exited once it listened"
     );
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
+}
+
+/// A spawned server that cannot outlive its test: `Drop` sends SIGKILL
+/// and reaps, panics and timeouts included. Every `serve` spawn in this
+/// file hands its child to this guard before any wait.
+struct Guarded(std::process::Child);
+
+impl Drop for Guarded {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
 }
 
 /// Waits until the spawned `serve` prints that it listens, with the log to
@@ -212,8 +224,6 @@ fn public_key_of(dir: &Path) -> String {
 fn serve_with_old(dir: &Path, seed: &Path, old: &Path) -> Output {
     let args: Vec<std::ffi::OsString> = [
         "serve",
-        "--token",
-        "t",
         "--listen",
         "127.0.0.1:0",
         "--ticket-key",
@@ -235,7 +245,7 @@ fn serve_with_old(dir: &Path, seed: &Path, old: &Path) -> Output {
 
 #[test]
 fn an_old_public_key_is_readable_by_anyone_but_writable_by_its_owner_alone() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     // public_key_of makes dir/seed.key (0600) and prints its public half.
     let hex = public_key_of(dir.path());
     let seed = dir.path().join("seed.key");
@@ -244,13 +254,11 @@ fn an_old_public_key_is_readable_by_anyone_but_writable_by_its_owner_alone() {
     // 0644: a public key is not a secret. Every reader on the machine may
     // hold it, so serve starts, and stays up.
     write_with_mode(&old, &hex, 0o644);
-    let mut child = Command::new(env!("CARGO_BIN_EXE_scion-server"))
+    let child = Command::new(env!("CARGO_BIN_EXE_scion-server"))
         .args([
             "--data",
             dir.path().join("data").to_str().unwrap(),
             "serve",
-            "--token",
-            "t",
             "--listen",
             "127.0.0.1:0",
             "--ticket-key",
@@ -258,6 +266,12 @@ fn an_old_public_key_is_readable_by_anyone_but_writable_by_its_owner_alone() {
             "--ticket-key-old",
             old.to_str().unwrap(),
         ])
+        .env("SCION_TOKEN", "t")
+        // The serve opens the store: the URL rides the env, quietly.
+        .env(
+            "SCION_POSTGRES_URL",
+            scion_server::Backend::test_postgres_url(&dir.path().join("data")).unwrap(),
+        )
         .env("NO_COLOR", "1")
         // The info lines go to stderr, and the test waits for the one that
         // says the server listens.
@@ -266,13 +280,13 @@ fn an_old_public_key_is_readable_by_anyone_but_writable_by_its_owner_alone() {
         .stderr(std::fs::File::create(dir.path().join("serve.log")).unwrap())
         .spawn()
         .unwrap();
-    wait_serving(&mut child, &dir.path().join("serve.log"));
+    let mut child = Guarded(child);
+    wait_serving(&mut child.0, &dir.path().join("serve.log"));
     assert!(
-        child.try_wait().unwrap().is_none(),
+        child.0.try_wait().unwrap().is_none(),
         "serve exited once it listened"
     );
-    let _ = child.kill();
-    let _ = child.wait();
+    drop(child);
 
     // 0666: anyone on the machine can change the key, so serve refuses it.
     write_with_mode(&old, &hex, 0o666);

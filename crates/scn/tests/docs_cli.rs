@@ -130,10 +130,11 @@ fn every_scn_command_and_flag_is_in_the_reference() {
 fn help_flags_parses() {
     let text = "Usage: scn [OPTIONS] cat <SPEC>\n\
                 \x20 --server <SERVER>  Address [env: SCION_SERVER=]\n\
+                \x20 --token-file <FILE>  The token [env: SCION_TOKEN=]\n\
                 \x20 -h, --help         Print help\n\
                 \x20 -V, --version      Print version\n\
-                Or `--token TOKEN` on the command line; pass it in SCION_TOKEN.\n";
-    assert_eq!(help_flags(text), vec!["--server", "--token"]);
+                Or pass it in SCION_TOKEN.\n";
+    assert_eq!(help_flags(text), vec!["--server", "--token-file"]);
 }
 
 /// `doc_names_flag` matches whole flag names only, at any position:
@@ -148,4 +149,15 @@ fn doc_names_flag_matches_whole_names() {
     assert!(!doc_names_flag(doc, "--max-bytes"));
     assert!(!doc_names_flag(doc, "--repor"));
     assert!(!doc_names_flag(doc, "--missing"));
+}
+
+/// docs/threat-model.md says the mount states its single-user rule at
+/// start and in `--help`: the help of `scn mount` carries it.
+#[test]
+fn the_mount_help_names_its_single_user_rule() {
+    let text = scn(&["mount", "--help"]);
+    assert!(
+        text.contains("For single-user machines only"),
+        "scn mount --help does not state the single-user rule: {text}"
+    );
 }

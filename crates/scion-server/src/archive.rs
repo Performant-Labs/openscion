@@ -6,7 +6,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::fs;
-use std::io::{self, Write as _};
+use std::io::{self, Read as _, Write as _};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Path, PathBuf};
 
@@ -18,6 +18,7 @@ use crate::backend::Backend;
 use crate::deadline::Deadline;
 use crate::error::{Error, Result};
 use crate::land::LandRequest;
+use crate::meta::RepoId;
 use crate::meta::{Meta, MetaTx, PendingLand};
 use crate::tree;
 use std::time::Duration;
@@ -118,13 +119,13 @@ pub fn export(
     let mut total_refs = 0_u64;
     let mut total_lands = 0_u64;
     let mut total_members = 0_u64;
-    // The archive's root: made recursively, as before — the operator
-    // names a path whose parents may not exist, and the fold risk this
-    // module guards is between REPO names, not in the operator's own
-    // path. Each section directory below is a NON-recursive create, so
-    // a fold on the disk is an error, not a silent reuse of another
-    // repo's directory.
-    make_dir(out)?;
+    // The archive's root: made recursively and PRIVATE (mode 0700
+    // whatever the umask), as the data directory is — the archive holds
+    // every repo whole. The parents the operator's path needs
+    // are made 0700 where they were missing. Each section directory
+    // below is a NON-recursive create, so a fold on the disk is an
+    // error, not a silent reuse of another repo's directory.
+    scion_proto::runtime::auth::create_private_dir_all(out)?;
     let repos_dir = out.join("repos");
     fs::DirBuilder::new()
         .create(&repos_dir)
@@ -211,50 +212,16 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
     }
     for name in &sections {
         let dir = archive.join("repos").join(name);
-        let changesets = read_changesets(&dir.join("changesets.bin"))?;
         let members = read_members(&dir.join("members.txt"))?;
         let member_set: HashSet<BlobId> = members.iter().copied().collect();
-        let ids: HashSet<ChangesetId> = changesets.iter().map(|(id, _, _)| *id).collect();
-        let mut decoded = Vec::new();
-        for (id, generation, body) in &changesets {
-            // The ID of a changeset is the hash of its body, so the
-            // re-hash is the check the file names cannot lie about.
-            match Changeset::decode_with_id(body) {
-                Ok((cs, hashed)) if hashed == *id => decoded.push((*id, cs)),
-                Ok(_) => damages.push(format!(
-                    "repo {name}: changeset {id} does not hash to its ID"
-                )),
-                Err(error) => damages.push(format!(
-                    "repo {name}: changeset {id} does not decode: {error}"
-                )),
-            }
-            if *generation < 1 {
-                damages.push(format!(
-                    "repo {name}: changeset {id} has generation {generation}"
-                ));
-            }
-        }
-        for (id, cs) in &decoded {
-            for parent in cs.parents() {
-                if !ids.contains(parent) {
-                    damages.push(format!(
-                        "repo {name}: changeset {id} names parent {parent}, which the archive does not hold"
-                    ));
-                }
-            }
-            // The replay rebuilds every tree from the changes' blobs
-            // alone, so a changeset whose change names a blob the
-            // members.txt does not list passes here and dies mid-replay
-            // — the reader and the writer would disagree about the same
-            // archive. Name it here, where the reader reads.
-            for state in cs.changes().values().flatten() {
-                if let Some(blob) = state.blob().filter(|blob| !member_set.contains(blob)) {
-                    damages.push(format!(
-                        "repo {name}: changeset {id} names blob {blob}, which its members.txt does not list"
-                    ));
-                }
-            }
-        }
+        let mut ids: HashSet<ChangesetId> = HashSet::new();
+        check_frames(
+            &dir.join("changesets.bin"),
+            name,
+            &member_set,
+            &mut ids,
+            &mut damages,
+        )?;
         for (ref_name, target, _version) in read_refs(&dir.join("refs.json"))? {
             if !ids.contains(&target) {
                 damages.push(format!(
@@ -279,6 +246,18 @@ pub fn verify(archive: &Path) -> Result<Vec<String>> {
                     "repo {name}: the land with request key {} names input {}, which the archive does not hold",
                     land.request_key,
                     land.input_cs
+                ));
+            }
+        }
+        // The git provenance replays into the store's foreign key on
+        // the changesets it names: a row whose changeset the archive
+        // does not hold passes here and dies mid-replay, after the
+        // store is open. Name it here, where the reader reads, the way
+        // the refs and the lands name theirs.
+        for (commit, cs) in read_provenance(&dir.join("provenance.json"))? {
+            if !ids.contains(&cs) {
+                damages.push(format!(
+                    "repo {name}: the provenance row for git commit {commit} names {cs}, which the archive does not hold"
                 ));
             }
         }
@@ -336,6 +315,67 @@ fn check_section_dir(
     Ok(())
 }
 
+/// Walks one repo's frames the way the verify does: one record at a
+/// time, the ids the refs and the lands cross-reference, the body
+/// re-hash, the parents, and the changes' blobs against members.txt.
+/// The verify holds the ids it must cross-reference, never the whole
+/// history.
+fn check_frames(
+    path: &Path,
+    name: &str,
+    member_set: &HashSet<BlobId>,
+    ids: &mut HashSet<ChangesetId>,
+    damages: &mut Vec<String>,
+) -> Result<()> {
+    let mut frames = Frames::open(path)?;
+    while let Some((id, generation, body)) = frames.next()? {
+        ids.insert(id);
+        // The ID of a changeset is the hash of its body, so the
+        // re-hash is the check the file names cannot lie about.
+        let decoded = match Changeset::decode_with_id(&body) {
+            Ok((cs, hashed)) if hashed == id => Some(cs),
+            Ok(_) => {
+                damages.push(format!(
+                    "repo {name}: changeset {id} does not hash to its ID"
+                ));
+                None
+            }
+            Err(error) => {
+                damages.push(format!(
+                    "repo {name}: changeset {id} does not decode: {error}"
+                ));
+                None
+            }
+        };
+        if generation < 1 {
+            damages.push(format!(
+                "repo {name}: changeset {id} has generation {generation}"
+            ));
+        }
+        let Some(cs) = decoded else { continue };
+        for parent in cs.parents() {
+            if !ids.contains(parent) {
+                damages.push(format!(
+                    "repo {name}: changeset {id} names parent {parent}, which the archive does not hold"
+                ));
+            }
+        }
+        // The replay rebuilds every tree from the changes' blobs
+        // alone, so a changeset whose change names a blob the
+        // members.txt does not list passes here and dies mid-replay
+        // — the reader and the writer would disagree about the same
+        // archive. Name it here, where the reader reads.
+        for state in cs.changes().values().flatten() {
+            if let Some(blob) = state.blob().filter(|blob| !member_set.contains(blob)) {
+                damages.push(format!(
+                    "repo {name}: changeset {id} names blob {blob}, which its members.txt does not list"
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 /// Replays an archive into an empty store: the blob bytes go through the
 /// What a restore put back: the repositories' names and how many refs
 /// and pending lands the replay recorded again.
@@ -375,12 +415,56 @@ pub struct RestoreReport {
 pub fn restore(
     archive: &Path,
     data: &Path,
-    postgres_url: Option<&str>,
+    postgres_url: &str,
     postgres_ca: Option<&Path>,
 ) -> Result<RestoreReport> {
-    restore_impl(archive, data, postgres_url, postgres_ca, |path, url, ca| {
-        Backend::open(path, url, ca)
+    restore_impl(
+        archive,
+        data,
+        postgres_url,
+        postgres_ca,
+        DEFAULT_TX_BYTES,
+        Backend::open,
+    )
+}
+
+/// Where the replay's frames come from: the stream, one record at a
+/// time, or - the mutation lever the ceiling job flips - the whole file
+/// in memory before the first row, the whole-history read the stream
+/// replaced. The lever exists so the RSS guard can prove it is not
+/// vacuous: the job runs the ceiling test once per shape and refuses a
+/// run where both pass.
+enum ReplayFrames {
+    Stream(Frames),
+    Whole(std::vec::IntoIter<(ChangesetId, i64, Vec<u8>)>),
+}
+
+impl ReplayFrames {
+    fn next(&mut self) -> Result<Option<(ChangesetId, i64, Vec<u8>)>> {
+        match self {
+            Self::Stream(frames) => frames.next(),
+            Self::Whole(items) => Ok(items.next()),
+        }
+    }
+}
+
+/// Whether the replay's whole-file mutation lever is flipped. Test-hooks
+/// only: the ceiling job sets it to prove the guard is not vacuous. A
+/// default build has no lever: the environment is never read, and the
+/// replay always streams.
+#[cfg(any(test, feature = "test-hooks"))]
+fn mutation_whole_file() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("SCION_TEST_RESTORE_MUTATION").as_deref()
+            == Some(std::ffi::OsStr::new("whole_file"))
     })
+}
+
+/// The default build: no lever exists to flip.
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn mutation_whole_file() -> bool {
+    false
 }
 
 /// The restore with the store's opener chosen: the one seam the tests
@@ -397,11 +481,38 @@ pub fn restore(
 pub fn restore_with(
     archive: &Path,
     data: &Path,
-    postgres_url: Option<&str>,
+    postgres_url: &str,
     postgres_ca: Option<&Path>,
-    open: impl FnOnce(&Path, Option<&str>, Option<&Path>) -> Result<Backend>,
+    open: impl FnOnce(&Path, &str, Option<&Path>) -> Result<Backend>,
 ) -> Result<RestoreReport> {
-    restore_impl(archive, data, postgres_url, postgres_ca, open)
+    restore_impl(
+        archive,
+        data,
+        postgres_url,
+        postgres_ca,
+        DEFAULT_TX_BYTES,
+        open,
+    )
+}
+
+/// [`restore_with`], with the replay's transaction byte budget named:
+/// a test that must see many committed transactions sets a small one.
+/// A single record larger than the budget still gets its own
+/// transaction.
+///
+/// # Errors
+///
+/// As [`restore`].
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn restore_with_budget(
+    archive: &Path,
+    data: &Path,
+    postgres_url: &str,
+    postgres_ca: Option<&Path>,
+    tx_bytes: usize,
+    open: impl FnOnce(&Path, &str, Option<&Path>) -> Result<Backend>,
+) -> Result<RestoreReport> {
+    restore_impl(archive, data, postgres_url, postgres_ca, tx_bytes, open)
 }
 
 /// The whole restore — preflight, verify, the staging choreography, the
@@ -410,9 +521,10 @@ pub fn restore_with(
 fn restore_impl(
     archive: &Path,
     data: &Path,
-    postgres_url: Option<&str>,
+    postgres_url: &str,
     postgres_ca: Option<&Path>,
-    open: impl FnOnce(&Path, Option<&str>, Option<&Path>) -> Result<Backend>,
+    tx_bytes: usize,
+    open: impl FnOnce(&Path, &str, Option<&Path>) -> Result<Backend>,
 ) -> Result<RestoreReport> {
     for existing in ["scion.db", MARKER, "objects"] {
         if data.join(existing).exists() {
@@ -434,10 +546,39 @@ fn restore_impl(
     let staging = data.with_file_name(format!("{}.restoring", file_name.to_string_lossy()));
     if staging.exists() {
         // The scratch name is this restore's own: a leftover of a run
-        // that died mid-replay, never a store an operator made.
+        // that died mid-replay, never a store an operator made. A kill
+        // runs no failure path, so this cleanup at the START is the
+        // only one a killed restore's leftovers ever meet.
+        tracing::warn!(staging = %staging.display(), "removing a staging directory a killed restore left behind");
         fs::remove_dir_all(&staging)?;
     }
-    fs::create_dir_all(&staging)?;
+    // The staging becomes the target by one rename, so its mode is the
+    // restored store's mode: private, whatever the umask of the run.
+    scion_proto::runtime::auth::create_private_dir_all(&staging)?;
+    // The metadata of a killed restore's committed batches sits in the
+    // database the URL names: drop that schema before the replay, so
+    // the replay starts empty whatever the last run left. A live store
+    // is safe: its server holds the one-server lock the drop takes.
+    {
+        let url = postgres_url;
+        crate::pg::reset_schema(url, postgres_ca).map_err(|error| match error {
+            Error::Corrupt(why) if why.contains("names a store") => {
+                // The refusal's truth: the schema may hold a complete
+                // store a restore published to the database but never
+                // renamed into place (killed after its last
+                // transaction). The staging directory that names it
+                // sits beside this restore's target.
+                Error::Corrupt(format!(
+                    "{why}; this schema holds a complete store that no data \
+directory names: a restore may have stopped after its last transaction. \
+Rename the {}.restoring directory of the target you meant into place and \
+start a server on it, or restore into a new schema",
+                    file_name.to_string_lossy()
+                ))
+            }
+            other => other,
+        })?;
+    }
     // The CLI's audit log may already sit in the target: the restore's
     // own intent line went there before the replay, and the target must
     // hold nothing else. Carry the file into the staging store, so the
@@ -447,7 +588,14 @@ fn restore_impl(
     if audit_log.exists() {
         fs::rename(&audit_log, staging.join("audit.log"))?;
     }
-    let replayed = restore_into_with(archive, &staging, postgres_url, postgres_ca, open);
+    let replayed = restore_into_with(
+        archive,
+        &staging,
+        postgres_url,
+        postgres_ca,
+        replay_tx_bytes(tx_bytes),
+        open,
+    );
     match replayed {
         Ok(report) => {
             if let Err(error) = fs::rename(&staging, data) {
@@ -485,14 +633,11 @@ fn restore_impl(
                 )));
             }
             let _ = fs::remove_dir_all(&staging);
-            // On Postgres the store's identity was minted by this
-            // restore's open (a database that already named a store
-            // refuses a marker-less staging directory), so the failed
-            // replay leaves only that mint behind. Drop it, best
-            // effort, so the operator's retry against the same
-            // database is refused by nothing.
-            if let Err(why) = reset_postgres_identity(postgres_url, postgres_ca) {
-                tracing::warn!(error = %why, "cannot reset the restored database's identity");
+            // On Postgres the replay committed whole batches before it
+            // failed: drop the schema they sit in, best effort, so the
+            // operator's retry against the same database starts empty.
+            if let Err(why) = crate::pg::reset_own_staging(postgres_url, postgres_ca) {
+                tracing::warn!(error = %why, "cannot drop the restored database's schema");
             }
             Err(error)
         }
@@ -517,9 +662,10 @@ fn carry_back_audit(staging: &Path, data: &Path) -> bool {
 fn restore_into_with(
     archive: &Path,
     data: &Path,
-    postgres_url: Option<&str>,
+    postgres_url: &str,
     postgres_ca: Option<&Path>,
-    open: impl FnOnce(&Path, Option<&str>, Option<&Path>) -> Result<Backend>,
+    tx_bytes: usize,
+    open: impl FnOnce(&Path, &str, Option<&Path>) -> Result<Backend>,
 ) -> Result<RestoreReport> {
     let manifest = read_manifest(archive)?;
     let names = repo_names(&manifest)?;
@@ -534,58 +680,25 @@ fn restore_into_with(
         )));
     }
     let store = open(data, postgres_url, postgres_ca)?;
-    // The sections and the blobs first, all of them: the blobs are
-    // files under `data` (the staging directory the publication
-    // renames), so a failure here is the staging drop's, and no row
-    // was written yet.
-    let mut sections = Vec::new();
-    for name in &names {
-        let dir = archive.join("repos").join(name);
-        let changesets = read_changesets(&dir.join("changesets.bin"))?;
-        let members = read_members(&dir.join("members.txt"))?;
-        let refs = read_refs(&dir.join("refs.json"))?;
-        let lands = read_lands(&dir.join("lands.json"))?;
-        let provenance = read_provenance(&dir.join("provenance.json"))?;
-
-        // The blobs go through the store's own write path: a put of the
-        // raw bytes writes the file with its durability dance, and the ID
-        // is the hash of the raw bytes, so the IDs carry over.
-        for member in &members {
-            let path = blob_path(archive, member);
-            let file = fs::File::open(&path)?;
-            let raw = decode_blob(&path, file)?;
-            let stored = store.blobs().put(&raw)?;
-            if stored != *member {
-                return Err(Error::Corrupt(format!(
-                    "the archive's blob {member} holds other bytes than its name says"
-                )));
-            }
-        }
-        sections.push((name.clone(), changesets, members, refs, lands, provenance));
-    }
+    let small_sections = stage_sections(archive, &store, &names)?;
     let mut refs_put = 0u64;
     let mut lands_put = 0u64;
-    // One write transaction for the whole metadata replay, every repo:
-    // the changesets replay in generation order (a parent always has a
-    // smaller generation, so every parent is in before its child), and
-    // a failure anywhere rolls back every row, on either backend — the
-    // database a restore was replaying into comes out as it was found,
-    // not half-named. The restore opens a fresh store, so the
-    // transaction is the only writer and its length is the restore's.
-    store.write(|c| {
-        for (name, changesets, members, refs, lands, provenance) in &sections {
-            let repo_id = c.create_repo(name)?;
-            // The lens the tree building needs: the size of every member
-            // blob, read from the files the put above just made durable.
-            let mut lens = HashMap::new();
-            for member in members {
-                lens.insert(*member, store.blobs().size(*member)? as u64);
-            }
-            for (_id, _gen, body) in changesets {
-                let (cs, _) = Changeset::decode_with_id(body)
-                    .map_err(|error| Error::Corrupt(format!("a stored changeset body: {error}")))?;
-                tree::store_changeset(c, repo_id, &cs, &mut tree::lens_from(&lens))?;
-            }
+    let mut txs = 0u64;
+    // One write transaction per byte budget of changeset bodies, per
+    // repo: the frames stream off changesets.bin one record at a time,
+    // and a transaction commits when its budget is spent. The archive
+    // writes the frames in generation order (a parent always has a
+    // smaller generation), so a child's parent is committed in this or
+    // an earlier transaction; the restore is the sole writer of a fresh
+    // store, so the intermediate states are never visible. The
+    // publication - the rename of the staging directory into the target
+    // - is the restore's all-or-nothing point, and it happens after the
+    // last transaction.
+    let last_repo = small_sections.last().map(|(name, ..)| name.as_str());
+    for (name, members, refs, lands, provenance) in &small_sections {
+        let (repo_id, repo_txs) = replay_changesets(&store, archive, name, members, tx_bytes)?;
+        txs += repo_txs;
+        store.write(|c| {
             for (ref_name, target, version) in refs {
                 c.restore_ref(repo_id, ref_name, target.as_bytes(), *version)?;
                 refs_put += 1;
@@ -607,9 +720,36 @@ fn restore_into_with(
                 )?;
             }
             c.put_git_imports(repo_id, provenance)?;
+            // Publication is atomic with this transaction on Postgres:
+            // the store that answers reads must never carry the staging
+            // mark the next restore would drop it by - and only once,
+            // in the LAST repo's transaction: a mark cleared by an
+            // earlier repo's publication would leave a kill between
+            // repos with partial data and no mark, which the next
+            // restore would misread as a complete store.
+            if Some(name.as_str()) == last_repo {
+                c.clear_restore_mark()?;
+            }
+            Ok(())
+        })?;
+        txs += 1;
+        // The kill seam of the between-repos test: the process dies
+        // after this repo's publication, with no failure path, the way
+        // a kill lands. The mark is (or is not) whatever the code left.
+        #[cfg(any(test, feature = "test-hooks"))]
+        if std::env::var("SCION_TEST_RESTORE_EXIT_AFTER").as_deref() == Ok(name.as_str()) {
+            std::process::exit(9);
         }
-        Ok(())
-    })?;
+    }
+    if small_sections.is_empty() {
+        // No repos, no loop, no publication transaction to carry the
+        // clear: the mark leaves in a transaction of its own. Nothing
+        // is partial with zero repos - an empty store is a complete
+        // store, and clients will write repos into it.
+        store.write(|c| c.clear_restore_mark())?;
+        txs += 1;
+    }
+    note_restore_txs(txs);
     Ok(RestoreReport {
         repos: names,
         refs: refs_put,
@@ -617,15 +757,190 @@ fn restore_into_with(
     })
 }
 
+/// One repo's small sections as the replay holds them: the members'
+/// blob IDs, the refs with the versions the export read, the pending
+/// lands, and the git provenance.
+type SmallSections = Vec<(
+    String,
+    Vec<BlobId>,
+    Vec<(String, ChangesetId, i64)>,
+    Vec<ArchiveLand>,
+    Vec<(ObjectId, ChangesetId)>,
+)>;
+
+/// The replay's staging pass: every repo's small sections read, and
+/// every member blob put through the store's own write path (a put of
+/// the raw bytes writes the file with its durability dance, and the ID
+/// is the hash of the raw bytes, so the IDs carry over). The blobs are
+/// files under the staging directory the publication renames, so a
+/// failure here is the staging drop's, and no row was written yet.
+fn stage_sections(archive: &Path, store: &Backend, names: &[String]) -> Result<SmallSections> {
+    let mut small_sections = Vec::new();
+    for name in names {
+        let dir = archive.join("repos").join(name);
+        let members = read_members(&dir.join("members.txt"))?;
+        let refs = read_refs(&dir.join("refs.json"))?;
+        let lands = read_lands(&dir.join("lands.json"))?;
+        let provenance = read_provenance(&dir.join("provenance.json"))?;
+        for member in &members {
+            let path = blob_path(archive, member);
+            let file = fs::File::open(&path)?;
+            let raw = decode_blob(&path, file)?;
+            let stored = store.blobs().put(&raw)?;
+            if stored != *member {
+                return Err(Error::Corrupt(format!(
+                    "the archive's blob {member} holds other bytes than its name says"
+                )));
+            }
+        }
+        small_sections.push((name.clone(), members, refs, lands, provenance));
+    }
+    Ok(small_sections)
+}
+
+/// One repo's changeset replay: the repo row and its lens in one
+/// transaction, then one write transaction per byte budget of
+/// changeset bodies. The frames stream off changesets.bin one record
+/// at a time - or, when the ceiling job's mutation lever is flipped,
+/// the whole file sits in memory first, the whole-history read the
+/// stream replaced. The archive writes the frames in generation order
+/// (a parent always has a smaller generation), so a child's parent is
+/// committed in this or an earlier transaction; the restore is the
+/// sole writer of a fresh store, so the intermediate states are never
+/// visible. Returns the repo's id and the transactions it used.
+fn replay_changesets(
+    store: &Backend,
+    archive: &Path,
+    name: &str,
+    members: &[BlobId],
+    tx_bytes: usize,
+) -> Result<(RepoId, u64)> {
+    let mut txs = 0u64;
+    let repo_id = store.write(|c| c.create_repo(name))?;
+    txs += 1;
+    // The mutation lever the ceiling test flips (SCION_TEST_RESTORE_MUTATION
+    // = whole_file, test-hooks only): the replay reads the whole
+    // changesets.bin into memory before it stores a row, which is
+    // exactly the whole-history read the streaming replay replaced.
+    // The ceiling job runs the test once without the lever (it must
+    // pass) and once with it (it must fail), so a guard that a
+    // whole-file read slips under fails the run instead of the
+    // nightly's silence.
+    let mut source = if mutation_whole_file() {
+        ReplayFrames::Whole(
+            read_changesets(
+                &Path::new(archive)
+                    .join("repos")
+                    .join(name)
+                    .join("changesets.bin"),
+            )?
+            .into_iter(),
+        )
+    } else {
+        ReplayFrames::Stream(Frames::open(
+            &Path::new(archive)
+                .join("repos")
+                .join(name)
+                .join("changesets.bin"),
+        )?)
+    };
+    let mut pending = source.next()?;
+    let mut batch_no = 0u64;
+    while pending.is_some() {
+        let mut spent = 0usize;
+        let mut batch: Vec<Changeset> = Vec::new();
+        while let Some((_id, _generation, body)) = pending.take() {
+            let (cs, _) = Changeset::decode_with_id(&body)
+                .map_err(|error| Error::Corrupt(format!("a stored changeset body: {error}")))?;
+            spent += body.len();
+            batch.push(cs);
+            pending = source.next()?;
+            if spent >= tx_bytes {
+                break;
+            }
+        }
+        store.write(|c| {
+            // The lens the tree building needs: the size of every
+            // member blob, read from the files the put above just
+            // made durable.
+            let mut lens = HashMap::new();
+            for member in members {
+                lens.insert(*member, store.blobs().size(*member)? as u64);
+            }
+            for cs in &batch {
+                tree::store_changeset(c, repo_id, cs, &mut tree::lens_from(&lens))?;
+            }
+            Ok(())
+        })?;
+        txs += 1;
+        batch_no += 1;
+        restore_batch_note(name, batch_no);
+    }
+    Ok((repo_id, txs))
+}
+
+/// The default replay transaction: one transaction per 64 MiB of
+/// changeset bodies, the import batches' shape. A restore of a
+/// gigabyte-scale archive commits tens of transactions, not one, and
+/// holds one changeset in memory at a time.
+const DEFAULT_TX_BYTES: usize = 64 * 1024 * 1024;
+
+/// The replay's transaction byte budget: `SCION_TEST_RESTORE_TX_BYTES` when
+/// a test's child process names one, the caller's budget otherwise.
+/// Test-hooks only: a default build never reads the environment, so a
+/// value set around a release binary cannot change a restore.
+#[cfg(any(test, feature = "test-hooks"))]
+fn replay_tx_bytes(asked: usize) -> usize {
+    std::env::var("SCION_TEST_RESTORE_TX_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .filter(|v| *v > 0)
+        .unwrap_or(asked)
+}
+
+/// The default build: the caller's budget, and the environment unread.
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn replay_tx_bytes(asked: usize) -> usize {
+    asked
+}
+
+/// One line per committed batch when the operator asks for it: a
+/// restore's progress, and the seam a test watches before it kills the
+/// replay.
+fn restore_batch_note(name: &str, batch: u64) {
+    tracing::debug!(repo = name, batch, "restore: batch committed");
+    if batch.is_multiple_of(1000) {
+        tracing::info!(repo = name, batch, "restore: batch committed");
+    }
+    // The echo is the seam a test watches before it kills the replay:
+    // test-hooks only, so a default build's stderr is the operator's,
+    // whatever the environment says.
+    #[cfg(any(test, feature = "test-hooks"))]
+    if std::env::var_os("SCION_TEST_RESTORE_ECHO_BATCH").is_some() {
+        eprintln!("restore: {name} batch {batch} committed");
+    }
+}
+
+/// The transactions the restores of this process committed, for the
+/// tests that must see more than one.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) static RESTORE_TXS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(any(test, feature = "test-hooks"))]
+fn note_restore_txs(txs: u64) {
+    RESTORE_TXS.fetch_add(txs, std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(txs, "restore: replay committed its transactions");
+}
+
+#[cfg(not(any(test, feature = "test-hooks")))]
+fn note_restore_txs(txs: u64) {
+    tracing::info!(txs, "restore: replay committed its transactions");
+}
+
 /// Undoes the identity a failed restore's open minted in the database:
 /// a fresh store names no store, and the next open mints again. The
 /// tables the migration made stay (they are empty, and the next open's
 /// migration is idempotent); only the name goes.
-fn reset_postgres_identity(url: Option<&str>, ca: Option<&Path>) -> Result<()> {
-    let Some(url) = url else { return Ok(()) };
-    crate::pg::reset_identity(url, ca)
-}
-
 /// The archive's blob file of `id`, in the store's own fan-out shape.
 fn blob_path(archive: &Path, id: &BlobId) -> PathBuf {
     let hex = id.to_string();
@@ -657,10 +972,9 @@ fn copy_blobs(data: &Path, archive: &Path, ids: &[BlobId]) -> Result<()> {
 
 /// The metadata of `name`, as ONE read transaction holds it: the
 /// snapshot every section of an export shares. The explicit read
-/// transaction is what makes the claim true on SQLite: each statement
-/// would otherwise see its own snapshot, and a land that commits
-/// between them would leave a ref naming a changeset the archive does
-/// not hold.
+/// transaction (REPEATABLE READ) is what makes the claim true: a land
+/// that commits between the section's statements leaves the snapshot
+/// holding exactly what the section named.
 fn snapshot_section(store: &Backend, name: &str) -> Result<RepoSection> {
     store.read_snapshot(|tx| {
         let repo_id = tx.repo_id(name)?;
@@ -824,52 +1138,94 @@ fn write_changesets(path: &Path, changesets: &[(ChangesetId, i64, Vec<u8>)]) -> 
     Ok(())
 }
 
-/// Reads the changeset stream back.
-//
-// SHORTCUT: the whole stream is read into memory, so a restore holds one
-// repo's full history (bodies) in RAM. Ceiling: a repo whose history is
-// gigabytes needs gigabytes. Upgrade path: stream the frames from a
-// `BufReader`, one record at a time, into the replay transaction.
-pub(crate) fn read_changesets(path: &Path) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>> {
-    let bytes = fs::read(path)?;
-    let mut out = Vec::new();
-    let mut at = 0_usize;
-    while at < bytes.len() {
-        let end = at + 4;
-        let len = u32::from_le_bytes(
-            bytes
-                .get(at..end)
-                .ok_or_else(|| torn(path))?
-                .try_into()
-                .map_err(|_| torn(path))?,
-        );
-        let len = usize::try_from(len).map_err(|_| torn(path))?;
-        let end = end + 32;
-        let id = bytes.get(at + 4..end).ok_or_else(|| torn(path))?.to_vec();
-        let end = end + 8;
-        let generation = i64::from_le_bytes(
-            bytes
-                .get(at + 36..end)
-                .ok_or_else(|| torn(path))?
-                .try_into()
-                .map_err(|_| torn(path))?,
-        );
-        let end = end + len;
-        let body = bytes.get(at + 44..end).ok_or_else(|| torn(path))?.to_vec();
-        let id = ChangesetId::try_from(id.as_slice()).map_err(|error| {
+/// Reads the changeset stream back, one frame at a time: the verify and
+/// the restore hold one record, never the file.
+pub(crate) struct Frames {
+    inner: io::BufReader<fs::File>,
+    path: std::path::PathBuf,
+    /// The file's whole length, read once at open: a record whose
+    /// claimed body length runs past the file's end is torn, and the
+    /// claim never becomes an allocation.
+    remaining: u64,
+}
+
+impl Frames {
+    /// Opens the framed stream of `path`.
+    ///
+    /// # Errors
+    ///
+    /// Why the file cannot be opened.
+    pub(crate) fn open(path: &Path) -> Result<Self> {
+        let file = fs::File::open(path)?;
+        let remaining = file.metadata()?.len();
+        Ok(Self {
+            inner: io::BufReader::new(file),
+            path: path.to_path_buf(),
+            remaining,
+        })
+    }
+
+    /// The next frame: `(id, generation, body)`, or `None` at the end.
+    ///
+    /// # Errors
+    ///
+    /// Why the bytes are not a whole frame: the file ends inside one.
+    pub(crate) fn next(&mut self) -> Result<Option<(ChangesetId, i64, Vec<u8>)>> {
+        let mut prefix = [0_u8; 44];
+        let mut at = 0_usize;
+        loop {
+            let read = self.inner.read(&mut prefix[at..])?;
+            if read == 0 {
+                break;
+            }
+            at += read;
+        }
+        if at == 0 {
+            return Ok(None);
+        }
+        self.remaining -= at as u64;
+        if at < prefix.len() {
+            return Err(torn(&self.path));
+        }
+        let len = u32::from_le_bytes(prefix[0..4].try_into().map_err(|_| torn(&self.path))?);
+        let len = usize::try_from(len).map_err(|_| torn(&self.path))?;
+        let generation =
+            i64::from_le_bytes(prefix[36..44].try_into().map_err(|_| torn(&self.path))?);
+        // The length is a claim from the bytes: a claim past the file's
+        // own end is a torn record, and the file's tail is never read
+        // into a 4 GiB buffer of zeros to find that out.
+        if len as u64 > self.remaining {
+            return Err(torn(&self.path));
+        }
+        let mut body = vec![0_u8; len];
+        self.inner
+            .read_exact(&mut body)
+            .map_err(|_| torn(&self.path))?;
+        self.remaining -= len as u64;
+        let id = ChangesetId::try_from(&prefix[4..36]).map_err(|error| {
             Error::Corrupt(format!(
                 "{} holds a bad changeset ID: {error}",
-                path.display()
+                self.path.display()
             ))
         })?;
-        out.push((id, generation, body));
-        at = end;
+        Ok(Some((id, generation, body)))
     }
-    Ok(out)
 }
 
 fn torn(path: &Path) -> Error {
     Error::Corrupt(format!("{} ends inside a record", path.display()))
+}
+
+/// One record's bytes off the stream, for the readers that still walk a
+/// whole file at once (the golden reader of the v1 format, and the
+/// replay's whole-file mutation lever).
+pub(crate) fn read_changesets(path: &Path) -> Result<Vec<(ChangesetId, i64, Vec<u8>)>> {
+    let mut frames = Frames::open(path)?;
+    let mut out = Vec::new();
+    while let Some(frame) = frames.next()? {
+        out.push(frame);
+    }
+    Ok(out)
 }
 
 /// Writes the member list: one 64-hex-digit blob ID per line.
@@ -1070,11 +1426,10 @@ fn decode_blob(path: &Path, bytes: fs::File) -> Result<Vec<u8>> {
     Ok(out)
 }
 
-/// A local-time RFC 3339 stamp of now, to the second.
-fn snapshot_instant() -> String {
-    let secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs());
+/// A UTC RFC 3339 stamp of the given instant, to the second: the pure
+/// conversion behind [`snapshot_instant`], so the calendar's fixed
+/// points are testable without a clock.
+fn rfc3339_utc(secs: u64) -> String {
     let (days, rest) = (secs / 86_400, secs % 86_400);
     let (hour, minute, second) = (rest / 3_600, (rest / 60) % 60, rest % 60);
     // Civil-from-days, Howard Hinnant's algorithm.
@@ -1089,6 +1444,14 @@ fn snapshot_instant() -> String {
     let m = if mp < 10 { mp + 3 } else { mp - 9 };
     let y = if m <= 2 { y + 1 } else { y };
     format!("{y:04}-{m:02}-{d:02}T{hour:02}:{minute:02}:{second:02}Z")
+}
+
+/// A UTC RFC 3339 stamp of now, to the second.
+fn snapshot_instant() -> String {
+    let secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs());
+    rfc3339_utc(secs)
 }
 
 /// The (device, inode) of a directory: the disk's own answer to whether
@@ -1137,4 +1500,20 @@ fn corrupt_json(path: &Path) -> Error {
         "{} does not hold the shape the format says",
         path.display()
     ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::rfc3339_utc;
+
+    /// Fixed points of the stamp's conversion: the epoch, a leap day
+    /// (the era math's seam), and an instant with a non-zero hour,
+    /// minute and second. A mutant of the days, field or era arithmetic
+    /// moves at least one of them.
+    #[test]
+    fn the_stamp_conversion_holds_its_fixed_points() {
+        assert_eq!(rfc3339_utc(0), "1970-01-01T00:00:00Z");
+        assert_eq!(rfc3339_utc(951_782_400), "2000-02-29T00:00:00Z");
+        assert_eq!(rfc3339_utc(1_700_000_000), "2023-11-14T22:13:20Z");
+    }
 }

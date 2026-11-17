@@ -458,14 +458,11 @@ async fn get_changeset(scion: &mut Scion, id: ChangesetId) -> (Changeset, Change
 /// other and return the same land. Appends the replies.
 async fn finish_lands(scions: &[Scion], model: &mut Model) {
     let mut calls = tokio::task::JoinSet::new();
-    for idx in 0..model.recs.len() {
-        if model.recs[idx].is_final() {
+    for (idx, rec) in model.recs.iter().enumerate() {
+        if rec.is_final() {
             continue;
         }
-        let (request, scion) = {
-            let rec = &model.recs[idx];
-            (rec.request(), scions[rec.caller].clone())
-        };
+        let (request, scion) = { (rec.request(), scions[rec.caller].clone()) };
         calls.spawn(async move {
             let mut scion = scion;
             let reply = scion
@@ -475,11 +472,8 @@ async fn finish_lands(scions: &[Scion], model: &mut Model) {
             (idx, reply.into_inner())
         });
         // The twin of a cut call: in flight at the same time.
-        if model.recs[idx].replies.is_empty() {
-            let (request, scion) = {
-                let rec = &model.recs[idx];
-                (rec.request(), scions[rec.caller].clone())
-            };
+        if rec.replies.is_empty() {
+            let (request, scion) = { (rec.request(), scions[rec.caller].clone()) };
             calls.spawn(async move {
                 let mut scion = scion;
                 let reply = scion
@@ -569,6 +563,7 @@ async fn build_changes(
 async fn principal(
     url: String,
     caller: usize,
+    round: usize,
     mut rng: Rng,
     ops: u64,
     signals: Arc<Signals>,
@@ -581,7 +576,11 @@ async fn principal(
     };
     let mut bases = HashMap::new();
     for op in 0..ops {
-        let tag = format!("{name}-o{op}-{}", rng.next() % 1_000_000);
+        // The round is in the key: the store outlives the round, and the
+        // server refuses a used key for a different land - a key drawn
+        // only from the principal, the op index and a 10^6 suffix
+        // collides across rounds (the seed 1626443366 flake).
+        let tag = format!("{name}-r{round}-o{op}-{}", rng.next() % 1_000_000);
         // Retry an earlier land with its key, or poll one by ID, or land.
         if !recs.is_empty() && rng.below(5) == 0 {
             let idx = rng.below(recs.len());
@@ -702,7 +701,7 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
         now.as_secs() ^ u64::from(now.subsec_nanos()),
     );
     println!("seed {seed}; replay with SCION_LANDMODEL_SEED={seed}");
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let (data, log) = (dir.path().join("data"), dir.path().join("server.log"));
     create_repo(&data);
 
@@ -710,7 +709,14 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
     let mut rng = Rng::new(seed);
     let mut pending_kills = 0usize;
     for round in 0..rounds {
-        let server = Server::start(&data, &log);
+        // Every round's opening start follows the previous round's kill
+        // (the drop SIGKILLs the server even on a quiet round), and the
+        // restart below follows this round's: both go through
+        // start_after_kill, so the killed server's store lock - which
+        // outlives the SIGKILL by a moment on Postgres (the seed
+        // 1273923143 flake) - is waited for, bounded, instead of
+        // failing the round's start.
+        let (server, _) = start_after_kill(&data, &log);
         let signals = Arc::new(Signals::default());
         let principals: Vec<_> = (0..PRINCIPALS)
             .map(|caller| {
@@ -719,7 +725,7 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
                     Rng::new(rng.next()),
                     Arc::clone(&signals),
                 );
-                tokio::spawn(principal(url, caller, rng, OPS, signals))
+                tokio::spawn(principal(url, caller, round, rng, OPS, signals))
             })
             .collect();
         // Let the principals get to work, then kill the server under
@@ -733,14 +739,11 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
         // named a hold that never happened).
         tokio::time::sleep(Duration::from_millis(150)).await;
         if round % 3 != 0 {
-            // The read of the server's own lands table (SQLite's file, or
-            // the server's schema), so the poll sees the same rows on
-            // both backends. The per-round counts name what the check
-            // sees, so a wrong-database read cannot hide as a flake.
-            // The read of the server's own lands table: the per-round
-            // print names what the check sees, so a wrong-database read
-            // cannot hide as a flake. The reader sits in a RefCell
-            // because the wait's closure runs as `Fn`.
+            // The read of the server's own lands table, in the schema
+            // the server serves: the per-round print names what the
+            // check sees, so a wrong-database read cannot hide as a
+            // flake. The reader sits in a RefCell because the wait's
+            // closure runs as `Fn`.
             let lands = std::cell::RefCell::new(common::LandsReader::open(&data));
             let (total, pending) = lands.borrow_mut().counts();
             println!("round {round}: the lands table holds {total} rows, {pending} pending");
@@ -780,7 +783,7 @@ async fn the_model_holds_across_lands_retries_and_restarts() {
             .collect();
 
         // The restart, then the checks.
-        let server = Server::start(&data, &log);
+        let (server, _) = start_after_kill(&data, &log);
         let (scion, objects) = connect(&server.url).await.unwrap();
         let scions: Vec<Scion> = (0..PRINCIPALS).map(|_| scion.clone()).collect();
         finish_lands(&scions, &mut model).await;

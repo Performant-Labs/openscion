@@ -27,16 +27,8 @@ const REPO: &str = "r";
 /// Ends the test with one printed line when it runs on Postgres: it
 /// asserts the data directory's own mechanics, which the Postgres backend
 /// does not have. The PR body lists these tests.
-fn skip_on_postgres(why: &str) -> bool {
-    if Backend::test_is_postgres() {
-        eprintln!("skip on postgres: {why}");
-        return true;
-    }
-    false
-}
-
 fn open_store() -> (TempDir, Backend) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let store = Backend::open_test(dir.path()).unwrap();
     (dir, store)
 }
@@ -147,7 +139,7 @@ fn graph_fixture(dir: &Path) {
 
 #[test]
 fn merge_base_and_is_ancestor_match_git() {
-    let git_dir = tempfile::tempdir().unwrap();
+    let git_dir = scion_server::test_support::private_tempdir();
     let dir = git_dir.path();
     graph_fixture(dir);
     let (_data, store) = open_store();
@@ -520,7 +512,7 @@ fn diff_fixture(dir: &Path) -> (String, String) {
 
 #[test]
 fn diff_matches_git_name_status_and_resumes_after_any_path() {
-    let git_dir = tempfile::tempdir().unwrap();
+    let git_dir = scion_server::test_support::private_tempdir();
     let dir = git_dir.path();
     let (old_commit, new_commit) = diff_fixture(dir);
     let (_data, store) = open_store();
@@ -606,14 +598,67 @@ fn diff_matches_git_name_status_and_resumes_after_any_path() {
     assert_eq!(diff_all(&store, old, old, None, None), []);
 }
 
+/// A diff one entry past the page bound, all in one directory: the
+/// first page holds exactly the bound's entries and names the path to
+/// resume at, the next call answers the rest, and the pages together
+/// hold every entry once, in tree order. The walk's page break and its
+/// resume guard only reach past the bound, and the single directory
+/// puts the resume point inside it, where a seam that repeats or drops
+/// one entry shows.
+#[test]
+fn a_diff_pages_at_the_entry_bound_and_resumes_inside_the_directory() {
+    let (_data, store) = open_store();
+    let files: BTreeMap<RepoPath, Option<FileState>> = (0..=MAX_DIFF_ENTRIES)
+        .map(|i| (path(&format!("d/f{i:04}")), Some(unstored(i))))
+        .collect();
+    let ids = chain(&store, vec![BTreeMap::new(), files]);
+    let (old, new) = (ids[0], ids[1]);
+
+    let first = read::diff(&store, REPO, old, new, None, None, &later()).unwrap();
+    assert_eq!(
+        first.entries.len(),
+        MAX_DIFF_ENTRIES,
+        "the page stops at its bound"
+    );
+    let last = first.entries.last().unwrap().path.clone();
+    assert_eq!(last, path("d/f0999"), "the page ends on the bound's entry");
+    assert_eq!(first.next_after.as_ref(), Some(&last), "the walk continues");
+
+    let rest = read::diff(
+        &store,
+        REPO,
+        old,
+        new,
+        None,
+        first.next_after.as_ref(),
+        &later(),
+    )
+    .unwrap();
+    assert_eq!(
+        rest.entries
+            .iter()
+            .map(|e| e.path.clone())
+            .collect::<Vec<_>>(),
+        vec![path("d/f1000")],
+        "the next call answers the one entry after the seam"
+    );
+    assert_eq!(rest.next_after, None, "the diff ended");
+
+    let want: Vec<RepoPath> = (0..=MAX_DIFF_ENTRIES)
+        .map(|i| path(&format!("d/f{i:04}")))
+        .collect();
+    let got: Vec<RepoPath> = first
+        .entries
+        .iter()
+        .chain(rest.entries.iter())
+        .map(|e| e.path.clone())
+        .collect();
+    assert_eq!(got, want, "every entry once, in tree order, across pages");
+}
+
 #[test]
 fn diff_skips_a_subtree_with_the_same_id_on_both_sides() {
-    // Asserts the rows of the data directory's database.
-    if skip_on_postgres("asserts the rows of the data directory's database") {
-        return;
-    }
-
-    let (_data, store) = open_store();
+    let (data, store) = open_store();
     let state = |data: &[u8]| {
         Some(FileState::Regular {
             content: BlobId::of(data),
@@ -627,20 +672,33 @@ fn diff_skips_a_subtree_with_the_same_id_on_both_sides() {
             BTreeMap::from([(path("f"), state(b"2"))]),
         ],
     );
-    // Delete the shared subtree: a walk that reads it fails.
+    // The tree the walk will read, and the subtree whose row goes away:
+    // the damage the walk must answer, not a walk that never starts.
     let root = read::root_tree(&store, REPO, ids[0], &later()).unwrap();
-    store
-        .write(|c| {
-            let Some(scion_core::Entry::Dir(keep)) = tree::lookup(c, root, &path("keep"))? else {
-                panic!("keep is a directory");
-            };
-            c.sqlite()
-                .unwrap()
-                .execute("DELETE FROM trees WHERE id = ?1", [keep.as_bytes()])
-                .map_err(scion_server::test_support::error::from_sqlite)?;
-            Ok(())
+    let keep = store
+        .read(|c| match tree::lookup(c, root, &path("keep")) {
+            Ok(Some(scion_core::Entry::Dir(keep))) => Ok(keep),
+            Ok(_) => panic!("keep is a directory"),
+            Err(e) => Err(e),
         })
         .unwrap();
+    // Delete the shared subtree row: the walk that reads it must fail
+    // the diff, on the engine's own rows.
+    {
+        let schema = Backend::test_schema(data.path());
+        let url = std::env::var("SCION_TEST_POSTGRES_URL").expect("the test database's URL");
+        std::thread::spawn(move || {
+            let mut db = postgres::Client::connect(&url, postgres::NoTls)
+                .expect("the test database connects");
+            db.batch_execute(&format!("SET search_path TO {schema}"))
+                .expect("the schema is reachable");
+            let id = keep.as_bytes().to_vec();
+            db.execute("DELETE FROM trees WHERE id = $1", &[&id])
+                .expect("the tree row is deleted");
+        })
+        .join()
+        .unwrap();
+    }
     let entries = diff_all(&store, ids[0], ids[1], None, None);
     assert_eq!(entries.len(), 1);
     assert_eq!(entries[0].path, path("f"));
@@ -936,7 +994,7 @@ fn rename_fixture(dir: &Path) -> (String, String) {
 
 #[test]
 fn diff_finds_renames_as_git_diff_does() {
-    let git_dir = tempfile::tempdir().unwrap();
+    let git_dir = scion_server::test_support::private_tempdir();
     let dir = git_dir.path();
     let (old_commit, new_commit) = rename_fixture(dir);
     let (_data, store) = open_store();
@@ -1218,7 +1276,7 @@ fn the_search_for_similar_files_stops_at_its_budget() {
 
 #[test]
 fn similar_files_are_not_searched_past_git_rename_limit() {
-    let git_dir = tempfile::tempdir().unwrap();
+    let git_dir = scion_server::test_support::private_tempdir();
     let dir = git_dir.path();
     git(dir, &["init", "-q", "-b", "main"]);
     // `old.txt` becomes `new.txt` with an edit. Symlinks with targets of

@@ -39,6 +39,14 @@ pub trait Store: Send + Sync + 'static {
     /// I/O errors.
     fn size(&self, key: Key) -> io::Result<Option<usize>>;
 
+    /// The sizes of `keys`, each as [`Store::size`] answers it. One call,
+    /// so a caller that checks a window pays one round trip to the store,
+    /// not one per key. The default asks [`Store::size`] for each key; a
+    /// store whose sizes share one lookup overrides it.
+    fn sizes(&self, keys: &[Key]) -> Vec<io::Result<Option<usize>>> {
+        keys.iter().map(|key| self.size(*key)).collect()
+    }
+
     /// The stored form of an object whose size [`Store::size`] gave as
     /// `size`. Returns at most `size` bytes. `None` if it is not stored, or
     /// if the stored copy is bad (it is then dropped).
@@ -104,13 +112,12 @@ impl<V> Lru<V> {
         dropped
     }
 
-    /// Removes `key`. Returns whether it was there.
-    fn remove(&mut self, key: Key) -> bool {
+    /// Removes `key`.
+    fn remove(&mut self, key: Key) {
         let Some((_, size)) = self.entries.remove(&key) else {
-            return false;
+            return;
         };
         self.bytes -= size;
-        true
     }
 }
 
@@ -412,7 +419,6 @@ struct Version {
     /// For [`Op::Put`]: the size of the stored form.
     size: usize,
     used_at: u64,
-    seq: u64,
 }
 
 /// The state of the index that the db does not have yet, and the counters
@@ -433,8 +439,6 @@ struct Disk {
     bytes: u64,
     next_used: u64,
     next_seq: u64,
-    /// Set once a batch is due, so the next put or get commits it.
-    due: bool,
     /// The directories that dropped files left, to sync before the last
     /// commit of a stop, so no dropped file comes back after a crash.
     left: HashSet<PathBuf>,
@@ -471,6 +475,9 @@ impl Disk {
                 id BLOB NOT NULL,
                 size INTEGER NOT NULL,
                 used_at INTEGER NOT NULL,
+                -- Written as the constant 0, read by no query: no version
+                -- of this index ever read it, and the column stays so an
+                -- older daemon's INSERT keeps working.
                 seq INTEGER NOT NULL,
                 PRIMARY KEY (kind, id)
             ) WITHOUT ROWID;
@@ -486,7 +493,6 @@ impl Disk {
             bytes: 0,
             next_used: 0,
             next_seq: 1,
-            due: false,
             left: HashSet::new(),
             #[cfg(test)]
             committed: 0,
@@ -570,18 +576,12 @@ impl Disk {
 
     /// Notes one more version of `key`, and keeps the mirrors.
     fn push(&mut self, op: Op, key: Key, size: usize, used_at: u64) {
-        let seq = self.next_seq;
-        self.next_seq += 1;
         self.pending.push(Version {
             op,
             key,
             size,
             used_at,
-            seq,
         });
-        if self.pending.len() >= FLUSH_RECORDS || self.pending_bytes >= FLUSH_NEW_BYTES {
-            self.due = true;
-        }
     }
 
     /// Notes that `key` was just used, and bumps its place. The batch has
@@ -605,6 +605,87 @@ impl Disk {
         self.newest.insert(key, Some((used_at, size)));
         self.push(Op::Use, key, size, used_at);
         Ok(Some(size))
+    }
+
+    /// The sizes of `keys`, as `touch` would answer each: the batch's
+    /// `newest` first, the settled rest with one query, and every key that
+    /// answers a size marked just used, in the order of `keys`.
+    fn sizes(&mut self, keys: &[Key]) -> io::Result<Vec<Option<usize>>> {
+        // One query for the settled keys, in chunks under SQLite's
+        // parameter limit: two parameters per row value.
+        const CHUNK: usize = 500;
+        let mut answers = vec![None; keys.len()];
+        let mut misses: Vec<(usize, Key)> = Vec::new();
+        for (i, key) in keys.iter().enumerate() {
+            match self.newest.get(key).copied() {
+                Some(Some((_, size))) => answers[i] = Some(size),
+                Some(None) => {}
+                None => misses.push((i, *key)),
+            }
+        }
+        for chunk in misses.chunks(CHUNK) {
+            let values = chunk.iter().map(|_| "(?,?)").collect::<Vec<_>>().join(",");
+            let sql =
+                format!("SELECT kind, id, size FROM objects WHERE (kind, id) IN (VALUES {values})");
+            let params = chunk.iter().flat_map(|(_, key)| {
+                let kind = kind_of(*key);
+                let id = key.id();
+                [
+                    rusqlite::types::Value::Integer(kind),
+                    rusqlite::types::Value::Blob(id.to_vec()),
+                ]
+            });
+            let found: std::collections::HashMap<(i64, [u8; 32]), usize> = self
+                .conn
+                .prepare(&sql)
+                .map_err(index_error)
+                .and_then(|mut stmt| {
+                    let rows = stmt
+                        .query_map(rusqlite::params_from_iter(params), |row| {
+                            let kind: i64 = row.get(0)?;
+                            let id: Vec<u8> = row.get(1)?;
+                            let size: i64 = row.get(2)?;
+                            Ok((kind, id, size))
+                        })
+                        .map_err(index_error)?;
+                    rows.map(|row| {
+                        let (kind, id, size) = row.map_err(index_error)?;
+                        // A settled row whose id is not 32 bytes is as
+                        // corrupt as one whose read failed: name the kind
+                        // and refuse the call, the way a single key's
+                        // settled_size would.
+                        let len = id.len();
+                        let id: [u8; 32] = id.try_into().map_err(|_| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                format!(
+                                    "the index names {} object with a {len}-byte id",
+                                    if kind == 0 { "tree" } else { "blob" },
+                                ),
+                            )
+                        })?;
+                        let size = usize::try_from(size).unwrap_or(0);
+                        Ok(((kind, id), size))
+                    })
+                    .collect::<Result<std::collections::HashMap<(i64, [u8; 32]), usize>, _>>()
+                })?;
+            for (i, key) in chunk {
+                if let Some(size) = found.get(&(kind_of(*key), key.id())) {
+                    answers[*i] = Some(*size);
+                }
+            }
+        }
+        // Every answered key is just used, in the order of `keys`: the
+        // same `Use` ops one `touch` per key would push, one batch.
+        for (i, size) in answers.iter().enumerate() {
+            let Some(size) = size else { continue };
+            let key = keys[i];
+            let used_at = self.next_used;
+            self.next_used += 1;
+            self.newest.insert(key, Some((used_at, *size)));
+            self.push(Op::Use, key, *size, used_at);
+        }
+        Ok(answers)
     }
 
     /// The state of `key`: its size, or gone. The batch has the last word;
@@ -637,11 +718,13 @@ impl Disk {
     /// Adds `key` as the least recently used: what the walk adopted, which
     /// leaves first.
     fn insert_oldest(&mut self, key: Key, size: usize) {
-        let old = self.state(key).unwrap_or_default();
-        match old {
-            Some((_, old_size)) => self.bytes -= old_size as u64,
-            None => self.objects += 1,
-        }
+        // The walk only queues files the index does not name, so this is
+        // always a fresh object.
+        debug_assert!(
+            self.state(key).unwrap_or_default().is_none(),
+            "the walk queued a file the index names"
+        );
+        self.objects += 1;
         self.bytes += size as u64;
         self.newest.insert(key, Some((0, size)));
         self.pending_bytes += size;
@@ -672,8 +755,7 @@ impl Disk {
         }
         #[cfg(test)]
         let count = self.pending.len();
-        let mark = self.next_seq - 1;
-        let committed = self.commit_batch(mark);
+        let committed = self.commit_batch();
         if committed.is_ok() {
             self.pending = Vec::new();
             self.pending_bytes = 0;
@@ -714,7 +796,7 @@ impl Disk {
 
     /// The transaction of [`Disk::commit`]: every row version, then the
     /// counters and the mark. One transaction: all of it lands, or none.
-    fn commit_batch(&mut self, mark: u64) -> io::Result<()> {
+    fn commit_batch(&mut self) -> io::Result<()> {
         let tx = self.conn.transaction().map_err(index_error)?;
         // Sizes and counters of stored bytes, far below i64::MAX.
         #[allow(clippy::cast_possible_wrap)]
@@ -724,25 +806,19 @@ impl Disk {
             match version.op {
                 Op::Use => {
                     tx.execute(
-                        "UPDATE objects SET used_at = ?3, seq = ?4
+                        "UPDATE objects SET used_at = ?3, seq = 0
                          WHERE kind = ?1 AND id = ?2",
-                        rusqlite::params![kind, id, version.used_at as i64, version.seq as i64],
+                        rusqlite::params![kind, id, version.used_at as i64],
                     )
                     .map_err(index_error)?;
                 }
                 Op::Put => {
                     tx.execute(
                         "INSERT INTO objects(kind, id, size, used_at, seq)
-                         VALUES(?1, ?2, ?3, ?4, ?5)
+                         VALUES(?1, ?2, ?3, ?4, 0)
                          ON CONFLICT(kind, id) DO UPDATE
-                         SET size = ?3, used_at = ?4, seq = ?5",
-                        rusqlite::params![
-                            kind,
-                            id,
-                            version.size as i64,
-                            version.used_at as i64,
-                            version.seq as i64
-                        ],
+                         SET size = ?3, used_at = ?4, seq = 0",
+                        rusqlite::params![kind, id, version.size as i64, version.used_at as i64],
                     )
                     .map_err(index_error)?;
                 }
@@ -762,7 +838,8 @@ impl Disk {
             ("bytes", self.bytes as i64),
             ("next_used", self.next_used as i64),
             ("next_seq", self.next_seq as i64),
-            ("mark", mark as i64),
+            // Read by no query: written as the constant 0, like seq.
+            ("mark", 0),
         ] {
             tx.execute(
                 "INSERT INTO meta(k, v) VALUES(?1, ?2)
@@ -1491,8 +1568,6 @@ impl DiskStore {
         }
         if took > 0 {
             walk.room.notify_all();
-            // The batch that counts them is due.
-            disk.due = true;
         }
     }
 
@@ -1588,10 +1663,6 @@ impl DiskStore {
                 self.stray.store(false, Ordering::Relaxed);
             }
         }
-        if !disk.due {
-            return;
-        }
-        disk.due = false;
         if disk.pending.len() < FLUSH_RECORDS && disk.pending_bytes < FLUSH_NEW_BYTES {
             return;
         }
@@ -1741,6 +1812,17 @@ impl Store for DiskStore {
         Ok(size)
     }
 
+    fn sizes(&self, keys: &[Key]) -> Vec<io::Result<Option<usize>>> {
+        let answers = lock(&self.disk).sizes(keys);
+        self.flush();
+        match answers {
+            Ok(answers) => answers.into_iter().map(Ok).collect(),
+            Err(error) => (0..keys.len())
+                .map(|_| Err(io::Error::new(error.kind(), error.to_string())))
+                .collect(),
+        }
+    }
+
     fn get(&self, key: Key, size: usize) -> io::Result<Option<Bytes>> {
         // A row that names more than any object holds is a corrupt index,
         // not a size to size the buffer for: refuse it, naming the object.
@@ -1860,7 +1942,7 @@ mod tests {
     /// which reports the store was dropped under its feet.
     #[test]
     fn a_dropped_store_leaves_no_walk_thread_behind() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let data = dir.path().join("data");
         let (a, frame) = blob(b"aaaa");
         // The walk must be owed: a clean stop leaves none, so the first
@@ -2031,7 +2113,7 @@ mod tests {
 
     #[test]
     fn the_disk_store_stays_under_its_limit_across_restarts() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let data = dir.path().join("data");
         let (a, b, c) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"cccc"));
         let n = a.1.len();
@@ -2070,7 +2152,7 @@ mod tests {
 
     #[test]
     fn the_disk_store_drops_bad_copies() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let data = dir.path().join("data");
         let store = DiskStore::open(&data, 1 << 20).unwrap();
 
@@ -2145,7 +2227,7 @@ mod tests {
 
     #[test]
     fn a_row_that_names_more_than_an_object_holds_is_refused_not_sized() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let data = dir.path().join("data");
         let (key, frame) = blob(b"aaaa");
         let store = DiskStore::open(&data, 1 << 20).unwrap();
@@ -2180,7 +2262,7 @@ mod tests {
 
     #[test]
     fn a_put_of_an_object_that_was_just_dropped_keeps_its_new_file() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let (a, b) = (blob(b"aaaa"), blob(b"bbbb"));
         let n = a.1.len();
         // Room for one object.
@@ -2209,7 +2291,7 @@ mod tests {
         if rustix::process::geteuid().as_raw() == 0 {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let data = dir.path().join("data");
         let (a, b) = (blob(b"aaaa"), blob(b"bbbb"));
         let n = a.1.len();
@@ -2309,7 +2391,7 @@ mod tests {
 
     #[test]
     fn a_start_after_a_clean_stop_trusts_the_index_and_a_crash_walks() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let data = dir.path().join("data");
         let (a, stray) = (blob(b"aaaa"), blob(b"not in the index"));
         let stray_path = {
@@ -2357,7 +2439,7 @@ mod tests {
 
     #[test]
     fn the_order_of_use_survives_a_restart() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let data = dir.path().join("data");
         let (a, b, c, d) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"cccc"), blob(b"dddd"));
         let len = a.1.len();
@@ -2386,7 +2468,7 @@ mod tests {
 
     #[test]
     fn a_crash_keeps_what_was_committed_and_loses_only_its_last_uses() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let data = dir.path().join("data");
         let (a, b, c) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"cccc"));
         let n = a.1.len();
@@ -2431,7 +2513,7 @@ mod tests {
 
     #[test]
     fn the_index_file_of_the_previous_format_is_imported_in_order() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let data = dir.path().join("data");
         let (a, b, c) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"cccc"));
         {
@@ -2458,7 +2540,7 @@ mod tests {
 
     #[test]
     fn a_dirty_file_of_the_previous_format_gives_its_order_before_the_scan() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let data = dir.path().join("data");
         let (a, b, c) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"cccc"));
         {
@@ -2485,7 +2567,7 @@ mod tests {
 
     #[test]
     fn a_damaged_file_of_the_previous_format_is_not_trusted() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let data = dir.path().join("data");
         let (a, b, stray) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"not in the index"));
         let stray_path = {
@@ -2525,7 +2607,7 @@ mod tests {
 
     #[test]
     fn a_damaged_index_db_is_set_aside_and_the_files_are_scanned() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let data = dir.path().join("data");
         let (a, stray) = (blob(b"aaaa"), blob(b"not in the index"));
         let stray_path = {
@@ -2553,7 +2635,7 @@ mod tests {
         if rustix::process::geteuid().as_raw() == 0 {
             return;
         }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let data = dir.path().join("data");
         let a = blob(b"aaaa");
         DiskStore::open(&data, 1 << 20)
@@ -2570,7 +2652,7 @@ mod tests {
 
     #[test]
     fn the_memory_of_the_index_stays_bounded_as_objects_grow() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let data = dir.path().join("data");
         let store = DiskStore::open(&data, 1 << 30).unwrap();
         // The rows of the db grow with the objects; the batch that waits in
@@ -2605,7 +2687,7 @@ mod tests {
 
     #[test]
     fn an_eviction_reads_only_what_it_drops() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let data = dir.path().join("data");
         let (a, b) = (blob(b"aaaa"), blob(b"bbbb"));
         let n = a.1.len();
@@ -2639,7 +2721,7 @@ mod tests {
     #[test]
     #[allow(clippy::many_single_char_names)]
     fn a_walk_adopts_the_files_that_a_crash_left_and_the_limit_counts_them() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let data = dir.path().join("data");
         let (a, b, c, d, e) = (
             blob(b"aaaa"),
@@ -2704,7 +2786,7 @@ mod tests {
     #[test]
     #[allow(clippy::many_single_char_names)]
     fn a_commit_that_fails_keeps_the_rows_the_truth() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let data = dir.path().join("data");
         let (a, b, c) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"cccc"));
         let n = a.1.len();
@@ -2760,7 +2842,7 @@ mod tests {
 
     #[test]
     fn a_torn_file_found_at_start_is_dropped_when_read() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let data = dir.path().join("data");
         let (key, bytes) = blob(b"a whole object\n");
         let path = {
@@ -2790,7 +2872,7 @@ mod tests {
     fn a_data_directory_that_others_can_reach_is_refused() {
         use std::os::unix::fs::PermissionsExt as _;
 
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::private_tempdir();
         let open = dir.path().join("open");
         fs::create_dir(&open).unwrap();
         fs::set_permissions(&open, fs::Permissions::from_mode(0o777)).unwrap();
@@ -2847,5 +2929,685 @@ mod tests {
         })
         .unwrap()
             != 0
+    }
+
+    /// The snapshot keeps the most recent objects the limit names: two of
+    /// three fit, and a store that records nothing records nothing.
+    #[test]
+    fn a_snapshot_keeps_the_recent_objects_the_limit_names() {
+        let (a, b, c) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"cccc"));
+        let n = a.1.len();
+        let store = MemoryStore::new(1 << 20).recording(&["r".to_owned()]);
+        for (key, bytes) in [&a, &b, &c] {
+            store.put(*key, bytes).unwrap();
+        }
+        store.served("r", c.0);
+        store.served("r", b.0);
+        store.served("r", a.0);
+        // Room for two of the three, most recent first: `c` does not fit.
+        let snap = store.snapshot("r", 2 * n + 1);
+        assert_eq!(snap.len(), 2, "{snap:?}");
+        assert_eq!(snap[0].0, b.0, "least recently used first");
+        assert_eq!(snap[1].0, a.0);
+        assert_eq!(store.snapshot("other", 1 << 20).len(), 0);
+        let plain = MemoryStore::new(1 << 20);
+        plain.put(a.0, &a.1).unwrap();
+        plain.served("r", a.0);
+        assert_eq!(plain.snapshot("r", 1 << 20).len(), 0);
+    }
+
+    /// Replacing the object that fills the limit drops nothing: the
+    /// store is at its limit, not over it.
+    #[test]
+    fn a_replace_at_the_exact_limit_drops_nothing() {
+        let (a, b) = (blob(b"aaaa"), blob(b"bbbb"));
+        let n = a.1.len();
+        let store = MemoryStore::new(2 * n);
+        store.put(a.0, &a.1).unwrap();
+        store.put(b.0, &b.1).unwrap();
+        // The replace leaves the store at exactly its limit.
+        store.put(a.0, &a.1).unwrap();
+        assert_eq!(
+            store.get(b.0, n).unwrap(),
+            Some(b.1.clone()),
+            "the limit's own byte keeps its object"
+        );
+        assert_eq!(store.get(a.0, n).unwrap(), Some(a.1.clone()));
+    }
+
+    /// A drop record in the old index drops the object and its bytes:
+    /// the imported store counts only what it kept.
+    #[test]
+    fn a_drop_record_in_the_old_index_drops_its_bytes() {
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        let (a, b) = (blob(b"aaaa"), blob(b"bbbb"));
+        let n = a.1.len();
+        {
+            let store = DiskStore::open(&data, 1 << 20).unwrap();
+            store.put(a.0, &a.1).unwrap();
+            store.put(b.0, &b.1).unwrap();
+            set_written_in_order(&store, &[a.0, b.0]);
+        }
+        remove_db(&data);
+        // The file names `a`, then `b`, then drops `a`.
+        let mut rows = Vec::new();
+        push_record(&mut rows, a.0, Some(a.1.len()));
+        push_record(&mut rows, b.0, Some(b.1.len()));
+        push_record(&mut rows, a.0, None);
+        put_old_back(&data, &old_index(CLEAN, &rows));
+        let store = reopen(&data, 1 << 20);
+        assert_eq!(store.size(a.0).unwrap(), None, "the drop record dropped it");
+        assert_eq!(store.size(b.0).unwrap(), Some(n));
+        assert_eq!(order(&store), [b.0]);
+        // The dropped bytes left the count with the object.
+        assert_eq!(
+            usize::try_from(lock(&store.disk).bytes).unwrap(),
+            n,
+            "the store counts only the kept object"
+        );
+    }
+
+    /// A start whose walk finds a tree file knows it as a tree, and its
+    /// order names the tree: the kinds of the rows are the keys'.
+    #[test]
+    fn a_walk_knows_a_tree_by_its_kind() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        let tree = Key::Tree(TreeId::from_bytes([7_u8; 32]));
+        let strayed = Key::Blob(BlobId::from_bytes([9_u8; 32]));
+        fs::create_dir_all(&data).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        // A crashed stop asks the next start to walk.
+        DiskStore::open(&data, 1 << 20).unwrap().crash();
+        for (key, bytes) in [(tree, b"tree bytes".to_vec()), (strayed, b"blob".to_vec())] {
+            let path = object_path(&data.join("objects"), key);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, bytes).unwrap();
+        }
+        let store = reopen(&data, 1 << 20);
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        store.flush();
+        assert_eq!(store.size(tree).unwrap(), Some(10));
+        assert_eq!(store.size(strayed).unwrap(), Some(4));
+        // Both keys come back through the db with their own kinds.
+        let mut names = order(&store);
+        names.sort_by_key(|key| key.id());
+        let mut wanted = vec![tree, strayed];
+        wanted.sort_by_key(|key| key.id());
+        assert_eq!(names, wanted, "both kinds read back as their keys");
+    }
+
+    /// A start that scans (the old index is dirty) knows a tree file by
+    /// its kind too.
+    #[test]
+    fn a_scan_knows_a_tree_by_its_kind() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        let tree = Key::Tree(TreeId::from_bytes([7_u8; 32]));
+        let strayed = Key::Blob(BlobId::from_bytes([9_u8; 32]));
+        fs::create_dir_all(&data).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        for (key, bytes) in [(tree, b"tree bytes".to_vec()), (strayed, b"blob".to_vec())] {
+            let path = object_path(&data.join("objects"), key);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, bytes).unwrap();
+        }
+        remove_db(&data);
+        put_old_back(&data, &old_index(DIRTY, b""));
+        let store = reopen(&data, 1 << 20);
+        assert_eq!(store.size(tree).unwrap(), Some(10));
+        assert_eq!(store.size(strayed).unwrap(), Some(4));
+        let mut names = order(&store);
+        names.sort_by_key(|key| key.id());
+        let mut wanted = vec![tree, strayed];
+        wanted.sort_by_key(|key| key.id());
+        assert_eq!(names, wanted);
+    }
+
+    /// An old index that cannot be read refuses the start: a damaged
+    /// file is not silently treated as no file.
+    #[test]
+    fn an_unreadable_old_index_refuses_the_start() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if rustix::process::geteuid().as_raw() == 0 {
+            return;
+        }
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        let a = blob(b"aaaa");
+        {
+            let store = DiskStore::open(&data, 1 << 20).unwrap();
+            store.put(a.0, &a.1).unwrap();
+            set_written_in_order(&store, &[a.0]);
+        }
+        remove_db(&data);
+        let mut rows = Vec::new();
+        push_record(&mut rows, a.0, Some(a.1.len()));
+        put_old_back(&data, &old_index(CLEAN, &rows));
+        fs::set_permissions(data.join(OLD_INDEX), fs::Permissions::from_mode(0o0)).unwrap();
+        let opened = DiskStore::open(&data, 1 << 20);
+        assert!(opened.is_err(), "an unreadable index is not a missing one");
+    }
+
+    /// A stray of exactly the top encoded size is adopted; one byte more
+    /// is no copy any object can hold, so the walk removes it.
+    #[test]
+    fn a_walk_leaves_the_file_that_no_object_can_be() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        DiskStore::open(&data, 1 << 30).unwrap().crash();
+        let exact = Key::Blob(BlobId::from_bytes([3_u8; 32]));
+        let over = Key::Blob(BlobId::from_bytes([4_u8; 32]));
+        for (key, len) in [(exact, MAX_ENCODED_BYTES), (over, MAX_ENCODED_BYTES + 1)] {
+            let path = object_path(&data.join("objects"), key);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::File::create(&path)
+                .unwrap()
+                .set_len(len as u64)
+                .unwrap();
+        }
+        let store = reopen(&data, 1 << 30);
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        store.flush();
+        assert_eq!(
+            store.size(exact).unwrap(),
+            Some(MAX_ENCODED_BYTES),
+            "the top encoded size is an object like any other"
+        );
+        assert_eq!(store.size(over).unwrap(), None);
+        assert!(!store.path(over).exists(), "the oversized file is removed");
+    }
+
+    /// A start that scans leaves the oversized file too.
+    #[test]
+    fn a_scan_leaves_the_file_that_no_object_can_be() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        DiskStore::open(&data, 1 << 30).unwrap().crash();
+        let exact = Key::Blob(BlobId::from_bytes([3_u8; 32]));
+        let over = Key::Blob(BlobId::from_bytes([4_u8; 32]));
+        for (key, len) in [(exact, MAX_ENCODED_BYTES), (over, MAX_ENCODED_BYTES + 1)] {
+            let path = object_path(&data.join("objects"), key);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::File::create(&path)
+                .unwrap()
+                .set_len(len as u64)
+                .unwrap();
+        }
+        remove_db(&data);
+        put_old_back(&data, &old_index(DIRTY, b""));
+        let store = reopen(&data, 1 << 30);
+        assert_eq!(store.size(exact).unwrap(), Some(MAX_ENCODED_BYTES));
+        assert_eq!(store.size(over).unwrap(), None);
+        assert!(!store.path(over).exists());
+    }
+
+    /// A stray of exactly the store's limit is adopted: the limit is a
+    /// keep, not a refuse.
+    #[test]
+    fn a_stray_of_exactly_the_limit_is_adopted() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        DiskStore::open(&data, 1 << 20).unwrap().crash();
+        let stray = Key::Blob(BlobId::from_bytes([5_u8; 32]));
+        let path = object_path(&data.join("objects"), stray);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::File::create(&path).unwrap().set_len(1 << 20).unwrap();
+        let store = reopen(&data, 1 << 20);
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        store.flush();
+        assert_eq!(
+            store.size(stray).unwrap(),
+            Some(1 << 20),
+            "a file of the limit exactly fits"
+        );
+    }
+
+    /// A row at the top encoded size is a size to read, not a corrupt
+    /// row: the buffer bound refuses above it, not at it.
+    #[test]
+    fn a_row_at_the_top_of_the_encoding_is_a_size_to_read() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        DiskStore::open(&data, 1 << 30).unwrap().crash();
+        let top = Key::Blob(BlobId::from_bytes([8_u8; 32]));
+        let path = object_path(&data.join("objects"), top);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_ENCODED_BYTES as u64)
+            .unwrap();
+        let store = reopen(&data, 1 << 30);
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        store.flush();
+        assert_eq!(store.size(top).unwrap(), Some(MAX_ENCODED_BYTES));
+        // The bytes are not the object they would have to be: the store
+        // answers, and drops the bad copy.
+        assert!(
+            store.get(top, MAX_ENCODED_BYTES).is_ok(),
+            "the top encoded size is read, not refused"
+        );
+    }
+
+    /// An object file that cannot be opened is an error, not a miss: the
+    /// store does not drop what it cannot look at.
+    #[test]
+    fn an_unreadable_object_file_is_an_error_not_a_miss() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if rustix::process::geteuid().as_raw() == 0 {
+            return;
+        }
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        let a = blob(b"aaaa");
+        let store = DiskStore::open(&data, 1 << 20).unwrap();
+        store.put(a.0, &a.1).unwrap();
+        drop(store);
+        fs::set_permissions(
+            object_path(&data.join("objects"), a.0),
+            fs::Permissions::from_mode(0o0),
+        )
+        .unwrap();
+        let store = reopen(&data, 1 << 20);
+        assert!(
+            store.get(a.0, a.1.len()).is_err(),
+            "an unreadable file is not an empty answer"
+        );
+    }
+
+    /// A fan directory that cannot be read refuses the start that scans:
+    /// skipping it silently would lose objects.
+    #[test]
+    fn a_fan_dir_of_kinds_that_cannot_be_read_refuses_the_scan() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if rustix::process::geteuid().as_raw() == 0 {
+            return;
+        }
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        let a = blob(b"aaaa");
+        let store = DiskStore::open(&data, 1 << 20).unwrap();
+        store.put(a.0, &a.1).unwrap();
+        drop(store);
+        remove_db(&data);
+        put_old_back(&data, &old_index(DIRTY, b""));
+        fs::set_permissions(
+            data.join("objects").join("blob"),
+            fs::Permissions::from_mode(0o0),
+        )
+        .unwrap();
+        let opened = DiskStore::open(&data, 1 << 20);
+        assert!(opened.is_err(), "an unreadable fan is not an empty one");
+    }
+
+    /// An oversized file that cannot be removed refuses the start that
+    /// scans: leaving it uncounted would hide bytes.
+    #[test]
+    fn a_file_that_cannot_leave_refuses_the_scan() {
+        use std::os::unix::fs::PermissionsExt as _;
+        if rustix::process::geteuid().as_raw() == 0 {
+            return;
+        }
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        DiskStore::open(&data, 1 << 20).unwrap().crash();
+        let over = Key::Blob(BlobId::from_bytes([4_u8; 32]));
+        let path = object_path(&data.join("objects"), over);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(MAX_ENCODED_BYTES as u64 + 1)
+            .unwrap();
+        remove_db(&data);
+        put_old_back(&data, &old_index(DIRTY, b""));
+        fs::set_permissions(path.parent().unwrap(), fs::Permissions::from_mode(0o500)).unwrap();
+        let opened = DiskStore::open(&data, 1 << 20);
+        assert!(
+            opened.is_err(),
+            "an unremovable oversized file is not silence"
+        );
+    }
+
+    /// A queue that stays full holds the walk: the walk neither gives up
+    /// nor runs ahead, until the store takes the files.
+    #[test]
+    fn a_full_queue_holds_the_walk_until_the_store_takes() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        DiskStore::open(&data, 1 << 20).unwrap().crash();
+        for i in 0_u32..300 {
+            let key = Key::Blob(BlobId::from_bytes(
+                i.to_le_bytes().repeat(8).as_slice().try_into().unwrap(),
+            ));
+            let path = object_path(&data.join("objects"), key);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"stray").unwrap();
+        }
+        let store = reopen(&data, 1 << 20);
+        // The queue holds `WALK_QUEUE` files and no more come in: the
+        // walk waits for the store to take some, which this test never
+        // does. A walk that gave up instead would be done.
+        until(|| {
+            store
+                .walk_state()
+                .is_some_and(|(found, _, _)| found >= WALK_QUEUE as u64)
+        });
+        let deadline = Instant::now() + Duration::from_secs(1);
+        while Instant::now() < deadline && !store.walk_state().is_some_and(|(_, _, done)| done) {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(
+            !store.walk_state().is_some_and(|(_, _, done)| done),
+            "the walk waits while its queue is full, it does not give up"
+        );
+    }
+
+    /// Uses gather in a batch that commits at the record count: a crash
+    /// after the whole batch keeps every use, in the order of the uses.
+    #[test]
+    fn a_use_batch_past_the_record_count_commits() {
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        let frame = vec![7_u8; 60 << 10];
+        let keys = (0..1024_u32)
+            .map(|i| {
+                Key::Blob(BlobId::from_bytes(
+                    i.to_le_bytes().repeat(8).as_slice().try_into().unwrap(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let store = DiskStore::open(&data, 1 << 30).unwrap();
+        for key in &keys {
+            store.put(*key, &Bytes::from(frame.clone())).unwrap();
+        }
+        // The uses go in the reverse of the puts, and the batch commits
+        // at the 1024th use.
+        for key in keys.iter().rev() {
+            store.size(*key).unwrap();
+        }
+        store.crash();
+        let store = reopen(&data, 1 << 30);
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        store.flush();
+        assert_eq!(
+            order(&store)[0],
+            keys[1023],
+            "the uses committed, last used first"
+        );
+    }
+
+    /// A crash in the middle of a use batch keeps the puts' order: the
+    /// uncommitted uses are gone.
+    #[test]
+    fn a_crash_in_the_middle_of_a_use_batch_keeps_the_put_order() {
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        let frame = vec![7_u8; 60 << 10];
+        let keys = (0..1024_u32)
+            .map(|i| {
+                Key::Blob(BlobId::from_bytes(
+                    i.to_le_bytes().repeat(8).as_slice().try_into().unwrap(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let store = DiskStore::open(&data, 1 << 30).unwrap();
+        for key in &keys {
+            store.put(*key, &Bytes::from(frame.clone())).unwrap();
+        }
+        // Half the uses: their batch is under the record count, so the
+        // crash takes it.
+        for key in keys.iter().rev().take(512) {
+            store.size(*key).unwrap();
+        }
+        store.crash();
+        let store = reopen(&data, 1 << 30);
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        store.flush();
+        assert_eq!(
+            order(&store)[600],
+            keys[600],
+            "the uncommitted uses left the puts' order"
+        );
+    }
+
+    /// A use batch at both thresholds commits: the record count and the
+    /// byte count trip together.
+    #[test]
+    fn a_use_batch_at_both_thresholds_commits() {
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        let frame = vec![7_u8; 65536];
+        let keys = (0..1024_u32)
+            .map(|i| {
+                Key::Blob(BlobId::from_bytes(
+                    i.to_le_bytes().repeat(8).as_slice().try_into().unwrap(),
+                ))
+            })
+            .collect::<Vec<_>>();
+        let store = DiskStore::open(&data, 1 << 30).unwrap();
+        for key in &keys {
+            store.put(*key, &Bytes::from(frame.clone())).unwrap();
+        }
+        for key in keys.iter().rev() {
+            store.size(*key).unwrap();
+        }
+        store.crash();
+        let store = reopen(&data, 1 << 30);
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        store.flush();
+        assert_eq!(
+            order(&store)[0],
+            keys[1023],
+            "the batch at both thresholds committed"
+        );
+    }
+
+    /// An adoption past the byte count commits at its flush: a crash
+    /// after it keeps the adopted file's row.
+    #[test]
+    fn an_adoption_past_the_byte_count_commits_at_its_flush() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        DiskStore::open(&data, 1 << 30).unwrap().crash();
+        let stray = Key::Blob(BlobId::from_bytes([6_u8; 32]));
+        let path = object_path(&data.join("objects"), stray);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::File::create(&path).unwrap().set_len(70 << 20).unwrap();
+        let store = reopen(&data, 1 << 30);
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        // The adoption's batch is past the byte count: this flush
+        // commits it.
+        store.flush();
+        store.crash();
+        let store = reopen(&data, 1 << 30);
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        let (found, _, _) = store.walk_state().unwrap();
+        store.flush();
+        assert_eq!(found, 0, "the adopted file's row was committed");
+        assert_eq!(store.size(stray).unwrap(), Some(70 << 20));
+        assert_eq!(
+            usize::try_from(lock(&store.disk).bytes).unwrap(),
+            70 << 20,
+            "the adoption's bytes are counted"
+        );
+        assert_eq!(
+            lock(&store.disk).objects,
+            1,
+            "the adoption's object is counted"
+        );
+    }
+
+    /// An adoption under both thresholds does not commit at its flush:
+    /// its batch waits for the next one, so a crash re-adopts it.
+    #[test]
+    fn a_small_adoption_waits_for_the_next_batch() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        DiskStore::open(&data, 1 << 30).unwrap().crash();
+        let stray = Key::Blob(BlobId::from_bytes([6_u8; 32]));
+        let path = object_path(&data.join("objects"), stray);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"stray").unwrap();
+        let store = reopen(&data, 1 << 30);
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        // The adoption's batch is under both thresholds: this flush
+        // leaves it uncommitted.
+        store.flush();
+        store.crash();
+        let store = reopen(&data, 1 << 30);
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        let (found, _, _) = store.walk_state().unwrap();
+        store.flush();
+        assert_eq!(found, 1, "the small adoption's row was not committed yet");
+    }
+
+    /// An adoption at the byte count exactly commits at its flush: the
+    /// count is a keep, not a refuse.
+    #[test]
+    fn an_adoption_at_the_byte_count_exactly_commits() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        DiskStore::open(&data, 1 << 30).unwrap().crash();
+        let stray = Key::Blob(BlobId::from_bytes([6_u8; 32]));
+        let path = object_path(&data.join("objects"), stray);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::File::create(&path)
+            .unwrap()
+            .set_len(FLUSH_NEW_BYTES as u64)
+            .unwrap();
+        let store = reopen(&data, 1 << 30);
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        // The adoption's batch is at the byte count: this flush commits.
+        store.flush();
+        store.crash();
+        let store = reopen(&data, 1 << 30);
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        let (found, _, _) = store.walk_state().unwrap();
+        store.flush();
+        assert_eq!(found, 0, "the batch at the byte count was committed");
+        assert_eq!(store.size(stray).unwrap(), Some(FLUSH_NEW_BYTES));
+    }
+
+    /// A run that stranded a file stops unclean, whatever its flags say:
+    /// the next start walks and finds the file.
+    #[test]
+    fn a_stranded_run_stops_unclean_and_the_next_start_walks() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        fs::create_dir_all(&data).unwrap();
+        fs::set_permissions(&data, fs::Permissions::from_mode(0o700)).unwrap();
+        DiskStore::open(&data, 1 << 20).unwrap().crash();
+        // Many files keep the walk busy while the run strands one more.
+        for i in 0_u32..200 {
+            let key = Key::Blob(BlobId::from_bytes(
+                i.to_le_bytes().repeat(8).as_slice().try_into().unwrap(),
+            ));
+            let path = object_path(&data.join("objects"), key);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(&path, b"stray").unwrap();
+        }
+        let store = reopen(&data, 1 << 20);
+        // The index cannot take a write: the put's file lands, its row
+        // does not, and the run is marked strayed while its walk runs.
+        lock(&store.disk)
+            .conn
+            .execute_batch("PRAGMA query_only = ON")
+            .unwrap();
+        let c = blob(b"cccc");
+        assert!(store.put(c.0, &c.1).is_err());
+        lock(&store.disk)
+            .conn
+            .execute_batch("PRAGMA query_only = OFF")
+            .unwrap();
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        store.flush();
+        drop(store);
+        // The next start walks: `c`'s file has no row.
+        let store = reopen(&data, 1 << 20);
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        store.flush();
+        assert_eq!(
+            store.size(c.0).unwrap(),
+            Some(c.1.len()),
+            "the stray was adopted"
+        );
+    }
+
+    /// The uses keep their turns: every use takes the next number, so
+    /// the store can order what was used when.
+    #[test]
+    fn the_uses_keep_their_turns_in_the_order() {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = crate::private_tempdir();
+        let data = dir.path().join("data");
+        let (a, b, c) = (blob(b"aaaa"), blob(b"bbbb"), blob(b"cccc"));
+        let store = reopen(&data, 1 << 20);
+        for (key, bytes) in [&a, &b, &c] {
+            store.put(*key, bytes).unwrap();
+        }
+        // Pending uses take the next two numbers.
+        store.size(b.0).unwrap();
+        store.size(c.0).unwrap();
+        assert_eq!(lock(&store.disk).next_used, 5, "two uses after three puts");
+        // Settled uses take the next two.
+        lock(&store.disk).commit().unwrap();
+        store.size(b.0).unwrap();
+        store.size(c.0).unwrap();
+        assert_eq!(lock(&store.disk).next_used, 7, "two settled uses");
+        // The batch form takes them in one go.
+        lock(&store.disk).commit().unwrap();
+        store.sizes(&[b.0, c.0]);
+        assert_eq!(lock(&store.disk).next_used, 9, "two batched uses");
+        drop(store);
+        // A use of an adopted file, still in the batch's newest, takes
+        // the next number after the adoption's zero.
+        let dir2 = crate::private_tempdir();
+        let data2 = dir2.path().join("data");
+        fs::create_dir_all(&data2).unwrap();
+        fs::set_permissions(&data2, fs::Permissions::from_mode(0o700)).unwrap();
+        DiskStore::open(&data2, 1 << 20).unwrap().crash();
+        let stray = Key::Blob(BlobId::from_bytes([6_u8; 32]));
+        let path = object_path(&data2.join("objects"), stray);
+        fs::create_dir_all(path.parent().unwrap()).unwrap();
+        fs::write(&path, b"stray").unwrap();
+        let store = reopen(&data2, 1 << 20);
+        until(|| store.walk_state().is_some_and(|(_, _, done)| done));
+        store.flush();
+        store.size(stray).unwrap();
+        assert_eq!(
+            lock(&store.disk).next_used,
+            1,
+            "the adoption's use took the first number"
+        );
     }
 }

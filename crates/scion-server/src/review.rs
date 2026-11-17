@@ -384,16 +384,31 @@ pub fn mark_merged<T: MetaTx + ?Sized>(
     result: ChangesetId,
     now: i64,
 ) -> Result<()> {
-    while let Some(number) = c.open_proposal_with_head(repo, target_ref, changeset)? {
-        let mut row = c
-            .proposal(repo, number)?
-            .ok_or_else(|| Error::Corrupt(format!("proposal #{number} vanished")))?;
-        row.state = ProposalStatus::Merged;
-        row.merged = Some(result);
-        row.updated_at = now;
-        c.put_proposal(repo, &row)?;
-    }
+    c.merge_open_proposals(repo, target_ref, changeset, result, now)?;
     Ok(())
+}
+
+/// The review part of the transaction that moves a ref: the gate of a
+/// protected ref again (a review that blocked the proposal after the land
+/// was recorded stops the move, and the land stays pending), then every
+/// open proposal of the ref whose head this land moved is marked merged,
+/// protected ref or not.
+///
+/// # Errors
+///
+/// [`Error::PermissionDenied`] from the gate; store errors.
+pub fn settle<T: MetaTx + ?Sized>(
+    c: &mut T,
+    repo: RepoId,
+    target_ref: &str,
+    changeset: ChangesetId,
+    result: ChangesetId,
+    rules: Option<&RepoRules>,
+) -> Result<()> {
+    if let Some(rules) = rules {
+        check_land(c, repo, target_ref, changeset, rules)?;
+    }
+    mark_merged(c, repo, target_ref, changeset, result, now())
 }
 
 /// One proposal with everything `GetProposal` answers.

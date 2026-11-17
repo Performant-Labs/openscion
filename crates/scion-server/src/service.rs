@@ -1,6 +1,6 @@
 //! The gRPC front end. Parses requests, runs the work on a blocking thread
-//! (`SQLite` and the object folder are synchronous), and maps errors to status
-//! codes.
+//! (the database and the object folder are synchronous), and maps errors
+//! to status codes.
 
 // Every pub item of this module is re-exported by the test seam
 // (`test_support` in lib.rs), and unreachable_pub does not see
@@ -44,7 +44,7 @@ use crate::auth::Caller;
 use crate::backend::Backend;
 use crate::deadline::Deadline;
 use crate::error::Result;
-use crate::land::{self, LandOutcome, LandState, Lands};
+use crate::land::{self, LandOutcome, LandRejectReason, LandState, Lands};
 use crate::meta::{Meta as _, MetaTx as _};
 use crate::objects::ObjectsService;
 use crate::quotas::{Call, Quotas};
@@ -57,7 +57,7 @@ use crate::{blame, names, read, views, write};
 const MAX_BLOCKING: usize = 256;
 /// Most uploads read at once. Each holds one request message in memory, of up
 /// to `MAX_MESSAGE_BYTES`, and a spool file of up to `MAX_OBJECT_BYTES`.
-const MAX_UPLOADS: usize = 16;
+pub(crate) const MAX_UPLOADS: usize = 16;
 /// Most `Blame` calls running at once. One call can diff for seconds, and
 /// a call that waits for its memory budget holds one of the `MAX_BLOCKING`
 /// permits that writes and lands share for the rest of its deadline. Four
@@ -67,7 +67,7 @@ const MAX_BLAMES: usize = 4;
 /// The bytes of memory that all `Blame` calls share: a call takes the bytes
 /// of every version it reads, and `memory::BYTES_PER_LINE` per line of the
 /// blamed file, so together they hold no more than this.
-const BLAME_MEMORY_BUDGET: usize = 1 << 30;
+pub(crate) const BLAME_MEMORY_BUDGET: usize = 1 << 30;
 /// Most `MergeBase`, `IsAncestor` and `Log` calls with a path running at
 /// once. A call has no bound on its reads, only its deadline: a walk, or the
 /// first derivation of path history on a database from before it. So these
@@ -79,12 +79,12 @@ const _: () = assert!(MAX_GRAPH_QUERIES < crate::store::READERS);
 /// Most `Diff` calls running at once. One call can read and compare files
 /// for about a second to find renames (`read::MAX_RENAME_CHUNKS`), so diffs
 /// never take more than this many of the `MAX_BLOCKING` permits either.
-const MAX_DIFFS: usize = 4;
+pub(crate) const MAX_DIFFS: usize = 4;
 /// Longest a request may take before the server gives up on it.
 pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// Most bytes that all `ReadFile` replies together hold: the parts read and
 /// not yet sent, and the readers of files of more than one part.
-const READ_BUDGET_BYTES: usize = 256 << 20;
+pub(crate) const READ_BUDGET_BYTES: usize = 256 << 20;
 /// A `ReadFile` reply ends when its client takes no part for this long, and
 /// frees its share, so a client that stops reading does not hold budget.
 /// The parts that it leaves in its channel and in HTTP/2 stay outside the
@@ -100,7 +100,7 @@ const TX_AGE_PERIOD: Duration = Duration::from_secs(5);
 
 /// Keeps the `scion_pg_tx_age_seconds` gauge current: the age of the
 /// oldest open Postgres read transaction, sampled every [`TX_AGE_PERIOD`]
-/// until `stop` resolves. On SQLite the sample is always zero.
+/// until `stop` resolves.
 async fn pg_tx_age_sample(store: Backend, metrics: Arc<Metrics>, mut stop: watch::Receiver<()>) {
     let mut tick = tokio::time::interval(TX_AGE_PERIOD);
     loop {
@@ -121,6 +121,43 @@ async fn pg_tx_age_sample(store: Backend, metrics: Arc<Metrics>, mut stop: watch
 /// gauge. The latest poll is the value; a failed stat keeps the last
 /// good value and logs once a poll. The poll stops when the server
 /// does.
+/// The wait one free-space sample may take: a statvfs that hangs (a
+/// lost network mount) must not stop the poll or stack parked threads.
+/// Test-only override, the rename-cache override's shape.
+fn free_space_stat_bound() -> Duration {
+    #[cfg(test)]
+    {
+        let small = FREE_SPACE_STAT_BOUND_OVERRIDE.load(Ordering::Relaxed);
+        if small > 0 {
+            return Duration::from_millis(small);
+        }
+    }
+    FREE_SPACE_STAT_BOUND
+}
+
+#[cfg(test)]
+static FREE_SPACE_STAT_BOUND_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// The poll's period, with the test override the small clocks need.
+fn free_space_poll_period() -> Duration {
+    #[cfg(test)]
+    {
+        let small = FREE_SPACE_POLL_OVERRIDE.load(Ordering::Relaxed);
+        if small > 0 {
+            return Duration::from_millis(small);
+        }
+    }
+    FREE_SPACE_POLL
+}
+
+#[cfg(test)]
+static FREE_SPACE_POLL_OVERRIDE: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+/// One free-space sample: both reads, as the blocking job answers them.
+type FreeSample = (std::io::Result<u64>, std::io::Result<Option<u64>>);
+
 fn spawn_free_space_poll(
     data: std::path::PathBuf,
     metrics: Arc<Metrics>,
@@ -128,18 +165,108 @@ fn spawn_free_space_poll(
 ) {
     tokio::spawn(async move {
         let mut stop = stop;
+        // One sample in flight at a time: a statvfs that hangs holds
+        // its blocking thread, and the poll waits it out instead of
+        // parking a new thread per tick.
+        let mut in_flight: Option<tokio::task::JoinHandle<FreeSample>> = None;
+        // When the last good sample landed. Before it, the age counts
+        // from the poll's own start, so the gauge arms on the first
+        // tick and a statvfs that never lands a first sample still
+        // grows the age — the never-landed case the alert exists for.
+        let armed_at = std::time::Instant::now();
+        let mut last_good: Option<std::time::Instant> = None;
         loop {
-            let data = data.clone();
-            let free = tokio::task::spawn_blocking(move || crate::store::free_bytes(&data));
-            match free.await {
-                Ok(Ok(bytes)) => metrics.data_free_bytes(bytes),
-                Ok(Err(e)) => {
-                    tracing::warn!(error = %e, "cannot stat the data directory's free space");
+            if in_flight.is_none() {
+                let data = data.clone();
+                in_flight = Some(tokio::task::spawn_blocking(move || {
+                    (
+                        crate::store::free_bytes(&data),
+                        crate::store::free_inodes(&data),
+                    )
+                }));
+            }
+            let sample = in_flight.as_mut().expect("the sample was just set");
+            match tokio::time::timeout(free_space_stat_bound(), sample).await {
+                Ok(Ok((bytes, inodes))) => {
+                    in_flight = None;
+                    last_good = Some(std::time::Instant::now());
+                    // The bytes value stands on its own: an inode failure
+                    // must not drop it (the same one-failure-per-gauge
+                    // policy both gauges share).
+                    match bytes {
+                        Ok(bytes) => metrics.data_free_bytes(bytes),
+                        Err(e) => {
+                            tracing::warn!(error = %e, "cannot stat the data directory's free space");
+                        }
+                    }
+                    match inodes {
+                        // A filesystem without an inode table exports no
+                        // gauge, so the inode alerts stay quiet there.
+                        Ok(Some(inodes)) => metrics.data_free_inodes(inodes),
+                        Ok(None) => {}
+                        Err(e) => {
+                            tracing::warn!(error = %e, "cannot stat the data directory's free inodes");
+                        }
+                    }
                 }
-                Err(e) => tracing::warn!(error = %e, "the free-space poll failed"),
+                Ok(Err(e)) => {
+                    in_flight = None;
+                    tracing::warn!(error = %e, "the free-space poll failed");
+                }
+                Err(_) => {
+                    tracing::warn!(
+                        bound_secs = free_space_stat_bound().as_secs(),
+                        "the free-space sample is stuck; keeping the last values"
+                    );
+                }
+            }
+            let at = last_good.unwrap_or(armed_at);
+            let age = at.elapsed().as_secs();
+            metrics.data_free_sample_age(age);
+            tokio::select! {
+                () = tokio::time::sleep(free_space_poll_period()) => {}
+                _ = stop.changed() => break,
+            }
+        }
+    });
+}
+
+/// Refreshes the blob-count gauge from the metadata, one bounded
+/// query per tick. The latest refresh is the value; a failed query
+/// keeps the last good value and logs once per tick. The poll stops
+/// when the server does.
+fn spawn_blob_count_poll(
+    store: Backend,
+    metrics: Arc<Metrics>,
+    stop: tokio::sync::watch::Receiver<()>,
+) {
+    tokio::spawn(async move {
+        let mut stop = stop;
+        loop {
+            let started = std::time::Instant::now();
+            let counted = tokio::task::spawn_blocking({
+                let store = store.clone();
+                move || store.read(|c| c.blob_count())
+            })
+            .await;
+            // The spacing counts the failed attempt's time too: a slow
+            // or failing refresh backs off the same way, and the gauge
+            // keeps its last good value meanwhile.
+            let took = started.elapsed();
+            // u128 -> u64: a refresh that runs past 584 million years
+            // has bigger problems than its gauge.
+            #[allow(clippy::cast_possible_truncation)]
+            let took_ms = took.as_millis() as u64;
+            metrics.set_blob_count_refresh_ms(took_ms);
+            match counted {
+                Ok(Ok(blobs)) => metrics.set_blob_count(blobs),
+                Ok(Err(e)) => {
+                    tracing::warn!(error = %e, "the blob-count refresh failed");
+                }
+                Err(e) => tracing::warn!(error = %e, "the blob-count poll failed"),
             }
             tokio::select! {
-                () = tokio::time::sleep(FREE_SPACE_POLL) => {}
+                () = tokio::time::sleep(blob_count_next_wait(took)) => {}
                 _ = stop.changed() => break,
             }
         }
@@ -207,6 +334,34 @@ const _: () = assert!(READ_BUDGET_BYTES <= u32::MAX as usize);
 /// How often the free-space gauge of the data directory is refreshed.
 const FREE_SPACE_POLL: Duration = Duration::from_secs(30);
 
+/// The wait one free-space sample may take: a fifth of the poll's
+/// period, so a stuck sample warns once before the next tick and the
+/// poll still runs. A real statvfs answers in microseconds.
+const FREE_SPACE_STAT_BOUND: Duration = Duration::from_secs(6);
+
+/// How often the blob-count gauge is refreshed from the metadata: one
+/// bounded query per tick, never a scrape-time walk, and never a
+/// directory listing. The refresh spaces itself by its own cost (see
+/// [`blob_count_next_wait`]), so this is the floor, not the period.
+const BLOB_COUNT_POLL: Duration = Duration::from_secs(60);
+
+/// How many of its own durations the blob-count refresh waits before
+/// the next one: the scan's cost grows with the store (a DISTINCT over
+/// every `repo_blobs` row), and 100 caps the scan near 1% of one read
+/// connection at any size. At 1,000,000 blobs (a ~0.6 s scan) the
+/// floor keeps the 60 s period; a 3 s scan at 5,000,000 waits 5 min.
+const BLOB_COUNT_REFRESH_SPACE: u32 = 100;
+
+/// The wait before the next blob-count refresh: the poll's floor, or
+/// 100 x the last refresh's own duration, whichever is longer. The
+/// last duration counts on a failure too, so a slow or failing refresh
+/// backs off instead of retrying at the floor; the count keeps its
+/// last good value meanwhile, as the free-space poll's gauges do.
+fn blob_count_next_wait(last_refresh: Duration) -> Duration {
+    let spaced = last_refresh.saturating_mul(BLOB_COUNT_REFRESH_SPACE);
+    spaced.max(BLOB_COUNT_POLL)
+}
+
 /// What a server serves with, besides the data directory and the access
 /// rules: its limits, its per-principal quotas, its TLS, and its metrics.
 pub struct ServeOptions {
@@ -231,6 +386,10 @@ pub struct ServeOptions {
     /// The audit log. Every server has one; the caller opens it (or
     /// passes the off handle of the tests) and records its start line.
     pub audit: crate::audit::Audit,
+    /// The bytes of unary replies the server holds at once. The tests
+    /// shrink it, so a small store can exercise the budget; the default
+    /// is the shipped [`crate::reply::REPLY_MEMORY_BUDGET`].
+    pub reply_memory_budget: usize,
 }
 
 /// Serves the API on `listener` within `options`, until `shutdown` resolves,
@@ -245,7 +404,9 @@ pub struct ServeOptions {
 /// # Errors
 ///
 /// Transport errors.
-#[allow(clippy::too_many_lines)] // the server's wiring: one block per service
+// The service wiring reads best inline: the layers wrap one another in
+// the order a reply travels, and splitting it hides that order.
+#[allow(clippy::too_many_lines)]
 pub async fn serve(
     store: Backend,
     listener: TcpListener,
@@ -261,33 +422,44 @@ pub async fn serve(
         land_stale_secs,
         tls,
         metrics,
+        reply_memory_budget,
         data,
         audit,
     } = options;
     let access = Arc::new(access.into());
-    let auth = access.auth();
-    let fence = store.fence_flag();
     // The backend records into the registry: the Postgres pool's wait,
     // busy readers and tx age (which this task keeps fresh), and on both
     // backends the blob full flushes, the derive-walk gauges and the
     // collector-key wait.
     store.set_metrics(Arc::clone(&metrics));
+    let fence = store.fence_flag();
     let worker = Worker::new(store);
     let lands = Arc::new(Lands::new(pending_lands, Some(Arc::clone(&metrics))));
     let (stop_tx, stop_rx) = watch::channel(());
-    // The fence of a Postgres server that lost its database to another
-    // process: it resolves the same shutdown the operator's signal does,
-    // so the health service answers NOT_SERVING and tonic finishes the
-    // open calls; a short grace later the process exits, and a supervisor
-    // restart either takes the lock back or is refused at open. SQLite
-    // has no fence (None), so this task never runs.
-    let fence_stop = fence.clone().map(|fence| (fence, stop_tx.clone()));
+    let stop_fence = stop_tx.clone();
+    // The fence of a server that lost its database to another process:
+    // it resolves the same shutdown the operator's signal does, so the
+    // health service answers NOT_SERVING and tonic finishes the open
+    // calls; a short grace later the process exits, and a supervisor
+    // restart either takes the lock back or is refused at open.
     tokio::spawn(async move {
         shutdown.await;
         let _ = stop_tx.send(());
     });
     // The free space of the data directory's filesystem, so the operator
     // sees a full drive before the server hits it.
+    // What the host has against the process's memory floor: both numbers
+    // as gauges, and one error line when the host is under the floor.
+    // Off this task: the probe is sync work, and a probe that waits
+    // would hold the accept loop with it - the listener is already
+    // bound, so a client's connect succeeds from the backlog while
+    // nothing serves it (#795).
+    {
+        let metrics = Arc::clone(&metrics);
+        tokio::task::spawn_blocking(move || {
+            crate::floor::check_startup_memory(&metrics, &crate::floor::production_paths());
+        });
+    }
     spawn_free_space_poll(data, Arc::clone(&metrics), stop_rx.clone());
     // Refused authentication is counted per peer and flushed as one
     // line per peer, so a stranger who spams bad tokens cannot fill the
@@ -298,18 +470,76 @@ pub async fn serve(
         audit.clone(),
         stop_rx.clone(),
     ));
+    // The one auth of the server, with the meter as its refusal sink:
+    // every refused token - the interceptor's and the Objects service's
+    // handler-side `caller_of` alike - counts here and flushes as one
+    // counted line per peer. A new service cannot skip the recording:
+    // it is inside the auth itself.
+    let auth = {
+        let meter = Arc::clone(&meter);
+        access
+            .auth()
+            .on_refusal(Arc::new(move |peer: Option<std::net::SocketAddr>| {
+                let key = peer
+                    .map(|addr| crate::audit::meter_key(&addr))
+                    .unwrap_or_default();
+                meter.count(&key);
+            }))
+    };
     tokio::spawn(pg_tx_age_sample(
         worker.store(),
         Arc::clone(&metrics),
         stop_rx.clone(),
     ));
+    // The audit's failed-reopen count, into
+    // `scion_audit_reopens_failed_total`: a failed reopen is rare, so a
+    // slow sample is enough to see it move.
+    tokio::spawn({
+        let audit = audit.clone();
+        let metrics = Arc::clone(&metrics);
+        let mut stop = stop_rx.clone();
+        async move {
+            let mut tick = tokio::time::interval(std::time::Duration::from_secs(30));
+            loop {
+                metrics.audit_reopens_failed(audit.reopens_failed());
+                metrics.audit_reopen_failing(audit.reopen_failing());
+                tokio::select! {
+                    _ = tick.tick() => {}
+                    _ = stop.changed() => break,
+                }
+            }
+        }
+    });
+    // SIGHUP asks the audit to reopen its file: the operator's
+    // logrotate renamed it, the rotation is rename-then-signal, and a
+    // refused reopen keeps the old file recording (#970).
+    #[cfg(unix)]
+    tokio::spawn({
+        let audit = audit.clone();
+        async move {
+            let mut hangup = match tokio::signal::unix::signal(
+                tokio::signal::unix::SignalKind::hangup(),
+            ) {
+                Ok(hangup) => hangup,
+                Err(why) => {
+                    tracing::warn!(reason = %why, "no SIGHUP handler: the audit file cannot be rotated by signal");
+                    return;
+                }
+            };
+            while hangup.recv().await.is_some() {
+                audit.request_reopen();
+            }
+        }
+    });
+    spawn_blob_count_poll(worker.store(), Arc::clone(&metrics), stop_rx.clone());
     let shutdown = {
         let mut stopped = stop_rx.clone();
         async move {
             let _ = stopped.changed().await;
         }
     };
-    if let Some((fence, stop_tx)) = fence_stop {
+    {
+        let stop_tx = stop_fence;
         tokio::spawn(async move {
             while !fence.load(std::sync::atomic::Ordering::SeqCst) {
                 tokio::time::sleep(Duration::from_millis(100)).await;
@@ -330,40 +560,50 @@ pub async fn serve(
         audit.clone(),
         stop_rx,
     ));
+    let reply_memory =
+        crate::reply::ReplyMemoryLayer::with_budget(reply_memory_budget, Arc::clone(&metrics));
     // A protected ref's lands check its proposals against these rules.
     lands.set_access(Arc::clone(&access));
     // The review calls authenticate as the Scion calls do, and are counted
-    // the same way.
-    let review = MetricsLayer::new(Arc::clone(&metrics)).layer(InterceptedService::new(
-        crate::review_service::ReviewService::new(
-            worker.clone(),
-            Arc::clone(&access),
-            quotas.clone(),
-            audit.clone(),
-        )
-        .into_server(),
-        crate::audit::AuditedAuth::new(auth.clone(), Arc::clone(&meter)),
-    ));
-    // Outside the access rules, so a refused call counts too. The layer
-    // only wraps replies in a counting body; the handlers stay as they are.
-    let scion = MetricsLayer::new(Arc::clone(&metrics)).layer(InterceptedService::new(
-        ScionService::new(
-            worker.clone(),
-            Arc::clone(&access),
-            lands,
-            quotas.clone(),
-            Arc::clone(&metrics),
-            audit.clone(),
-        )
-        .into_server(),
-        crate::audit::AuditedAuth::new(auth.clone(), Arc::clone(&meter)),
-    ));
-    // No token interceptor on `objects`: `GetObjects` authenticates by
-    // ticket alone, and the service's other calls check the token
-    // themselves. So a tier needs no token of the server to fetch objects.
-    // The counting layer wraps it all the same, outside the ticket checks.
-    let objects = MetricsLayer::new(Arc::clone(&metrics)).layer(
-        ObjectsService::new(worker, access, quotas, tickets, Arc::clone(&metrics)).into_server(),
+    // and bounded the same way.
+    let review = reply_memory.clone().layer(
+        MetricsLayer::new(Arc::clone(&metrics)).layer(InterceptedService::new(
+            crate::review_service::ReviewService::new(
+                worker.clone(),
+                Arc::clone(&access),
+                quotas.clone(),
+                audit.clone(),
+            )
+            .into_server(),
+            auth.clone(),
+        )),
+    );
+    let scion = reply_memory.clone().layer(
+        MetricsLayer::new(Arc::clone(&metrics)).layer(InterceptedService::new(
+            ScionService::new(
+                worker.clone(),
+                Arc::clone(&access),
+                lands,
+                quotas.clone(),
+                Arc::clone(&metrics),
+                audit.clone(),
+            )
+            .into_server(),
+            auth.clone(),
+        )),
+    );
+    let objects = reply_memory.layer(
+        MetricsLayer::new(Arc::clone(&metrics)).layer(
+            ObjectsService::new(
+                worker,
+                access,
+                quotas,
+                tickets,
+                Arc::clone(&metrics),
+                auth.clone(),
+            )
+            .into_server(),
+        ),
     );
     // The health service answers `grpc.health.v1.Check` and `Watch` on the
     // same port, without a token: a probe carries none. The store opens
@@ -488,19 +728,30 @@ impl Drop for LandAnswer {
 impl ScionService {
     /// Sends `data` in parts of up to `CHUNK_BYTES`, as `ReadFile` sends a
     /// file. Holds the whole bytes, so the share is their size.
-    async fn stream_whole<T: Send + 'static>(
-        &self,
+    /// The budget share a whole-object reply needs: the object's own
+    /// bytes, taken BEFORE the object is read and built, so the count
+    /// of replies in flight bounds the memory they hold. An object over
+    /// the cap is refused here, before any of its bytes are read.
+    async fn whole_share_of(&self, size: usize) -> Result<OwnedSemaphorePermit, Status> {
+        if size > MAX_OBJECT_BYTES {
+            return Err(Status::resource_exhausted(format!(
+                "the object is {size} bytes, over the {MAX_OBJECT_BYTES}-byte reply cap"
+            )));
+        }
+        Arc::clone(&self.reads)
+            .acquire_many_owned(u32::try_from(size).expect("the cap asserts u32 fit"))
+            .await
+            .map_err(|_| Status::unavailable("server is shutting down"))
+    }
+
+    /// Sends `data` in parts, holding `share` for the whole reply.
+    fn stream_whole_holding<T: Send + 'static>(
         call: Call,
         data: Vec<u8>,
+        share: OwnedSemaphorePermit,
         stalled: Option<scion_proto::runtime::listen::Stalled>,
         make: fn(Vec<u8>) -> T,
-    ) -> Result<Response<ReceiverStream<Part<T>>>, Status> {
-        // Taken after the bytes are read, so a call that waits holds a
-        // budget share for memory that another reply may need sooner.
-        let share = Arc::clone(&self.reads)
-            .acquire_many_owned(whole_share(data.len()))
-            .await
-            .map_err(|_| Status::unavailable("server is shutting down"))?;
+    ) -> Response<ReceiverStream<Part<T>>> {
         let (tx, rx) = mpsc::channel(2);
         tokio::spawn(send_parts(
             Parts::Whole {
@@ -514,7 +765,7 @@ impl ScionService {
             stalled,
             make,
         ));
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Response::new(ReceiverStream::new(rx))
     }
 
     fn new(
@@ -710,12 +961,21 @@ impl ScionService {
 /// protocol: a message over them fails the call on whichever side finds it
 /// first (section 2 of protocol-v1).
 ///
-/// SHORTCUT: a unary reply's bytes stay in HTTP/2 uncounted until the
-/// client reads them or the connection closes; the largest one left is
-/// `Diff` (about 120 KB), so a client that never reads holds at most its
-/// connections x streams of those. Every reply that can grow with its
-/// input streams; a new unary RPC must stream, or bound its reply, before
-/// it ships.
+/// SHORTCUT: the reply-memory budget (#586) bounds the unary replies
+/// parked in HTTP/2, so a client that never reads holds the budget -
+/// `REPLY_MEMORY_BUDGET`, 128 MiB across every connection - not the
+/// server's memory. The residual: the count is the reply's encoded
+/// length set by its handler, not the wire bytes (the 5-byte gRPC
+/// frame prefix of each parked reply stays uncounted), and a
+/// committed write's reply goes out uncounted by design. A
+/// whole-object reply (`ListDir`, `GetChangeset`; `ReadFile` streams
+/// part by part and takes the read budget per part) is bounded twice:
+/// its built body takes the read budget (`READ_BUDGET_BYTES`) before
+/// the body is built, and the parts it has sent ride the
+/// per-connection stalled-bytes cap, whose connection is closed over
+/// the cap. A new unary RPC must still mark its reply, or stream,
+/// before it ships: the layer's test seam fails the handler that
+/// forgets.
 pub fn into_server<S: Scion + Send + 'static>(service: S) -> ScionServer<S> {
     ScionServer::new(service)
         .max_decoding_message_size(MAX_MESSAGE_BYTES)
@@ -774,6 +1034,40 @@ impl Worker {
         })?
         .map_err(Status::from)
     }
+}
+
+/// Marks a unary reply so the reply-memory layer counts its
+/// parked bytes: the handler knows the encoded size here, before
+/// the response returns, which the encoded body never reveals.
+pub(crate) fn count_reply<M: prost::Message>(response: Response<M>) -> Response<M> {
+    let mut response = response;
+    let size = response.get_ref().encoded_len();
+    response
+        .extensions_mut()
+        .insert(crate::reply::ReplySize(size));
+    response
+}
+
+/// Marks a committed write's reply so the reply-memory layer never
+/// refuses it: the write has landed, and the client must read the
+/// truth, not a retryable error. The layer sends it uncounted when
+/// the budget is spent, with a warn line.
+pub(crate) fn count_committed_reply<M: prost::Message>(response: Response<M>) -> Response<M> {
+    let mut response = count_reply(response);
+    response
+        .extensions_mut()
+        .insert(crate::reply::ReplyMustDeliver);
+    response
+}
+
+/// Marks a streaming reply so the reply-memory layer knows its bytes
+/// are counted elsewhere: the read-budget share it took before the
+/// object was built. The layer's test seam panics on a reply with
+/// neither mark, so a new handler that forgets both fails a test.
+pub(crate) fn mark_stream<T>(response: Response<T>) -> Response<T> {
+    let mut response = response;
+    response.extensions_mut().insert(crate::reply::ReplyStreams);
+    response
 }
 
 pub(crate) use scion_proto::runtime::check::id as parse_id;
@@ -895,12 +1189,25 @@ pub(crate) fn caller<T>(request: &Request<T>) -> Result<Caller, Status> {
 }
 
 fn land_response(outcome: LandOutcome) -> LandResponse {
-    use scion_proto::v1::LandState as Wire;
+    use scion_proto::v1::{LandRejectReason as WireReason, LandState as Wire};
     let state = match outcome.state {
         LandState::Pending => Wire::Pending,
         LandState::Landed => Wire::Landed,
         LandState::Conflict => Wire::Conflict,
         LandState::Rejected => Wire::Rejected,
+    };
+    // Only a rejected land names a reason. The other states force
+    // UNSPECIFIED whatever the outcome holds, so a stored row's reason
+    // cannot leak onto a state that must not carry one.
+    let reason = match outcome.state {
+        LandState::Rejected => match outcome.reject_reason {
+            LandRejectReason::Unspecified => WireReason::Unspecified,
+            LandRejectReason::NeedsOneParent => WireReason::NeedsOneParent,
+            LandRejectReason::MissingRef => WireReason::MissingRef,
+            LandRejectReason::BaseNotOnHistory => WireReason::BaseNotOnHistory,
+            LandRejectReason::Abandoned => WireReason::Abandoned,
+        },
+        _ => WireReason::Unspecified,
     };
     LandResponse {
         land_id: outcome.land_id.to_string(),
@@ -912,6 +1219,7 @@ fn land_response(outcome: LandOutcome) -> LandResponse {
             .into_iter()
             .map(|p| p.as_bytes().to_vec())
             .collect(),
+        reject_reason: reason as i32,
     }
 }
 
@@ -938,18 +1246,6 @@ const fn read_share(size: usize) -> usize {
     } else {
         READER_BYTES + 2 * CHUNK_BYTES
     }
-}
-
-/// The share of `READ_BUDGET_BYTES` that a reply holds for `size` bytes that
-/// are all in memory at once, as a `ListDir` or `GetChangeset` reply's object
-/// is. `ReadFile` reads its blob part by part, but these replies have the
-/// whole object in one buffer, so the share is its whole size.
-// SHORTCUT: a reply holds its object even when its share is capped at the
-// budget, so a directory whose bytes are over the budget holds what the
-// budget cannot pay for. The budget bounds how many such replies run at
-// once, not their size. Cap the encoded size if that ever matters.
-fn whole_share(size: usize) -> u32 {
-    u32::try_from(size.clamp(1, READ_BUDGET_BYTES)).unwrap_or(u32::MAX)
 }
 
 /// Where a reply's parts come from.
@@ -1509,9 +1805,9 @@ impl Scion for ScionService {
             })
             .await;
         let id = written??;
-        Ok(Response::new(PutBlobResponse {
+        Ok(count_committed_reply(Response::new(PutBlobResponse {
             blob_id: id.as_bytes().to_vec(),
-        }))
+        })))
     }
 
     async fn create_changeset(
@@ -1607,9 +1903,11 @@ impl Scion for ScionService {
             })
             .await;
         let id = outcome??;
-        Ok(Response::new(CreateChangesetResponse {
-            changeset_id: id.as_bytes().to_vec(),
-        }))
+        Ok(count_committed_reply(Response::new(
+            CreateChangesetResponse {
+                changeset_id: id.as_bytes().to_vec(),
+            },
+        )))
     }
 
     async fn land(
@@ -1736,7 +2034,7 @@ impl Scion for ScionService {
             })
             .await;
         match ran {
-            Ok(Ok(outcome)) => Ok(Response::new(land_response(outcome))),
+            Ok(Ok(outcome)) => Ok(count_committed_reply(Response::new(land_response(outcome)))),
             Ok(Err(status)) => {
                 self.metrics.land(code_label(status.code()));
                 Err(status)
@@ -1762,7 +2060,7 @@ impl Scion for ScionService {
             .worker
             .run(move |store| land::get_land(&store, &caller, &repo, land_id))
             .await?;
-        Ok(Response::new(land_response(outcome)))
+        Ok(count_reply(Response::new(land_response(outcome))))
     }
 
     async fn resolve_ref(
@@ -1771,7 +2069,7 @@ impl Scion for ScionService {
     ) -> Result<Response<ResolveRefResponse>, Status> {
         resolve_ref(&self.worker, &self.access, &self.quotas, request)
             .await
-            .map(Response::new)
+            .map(|r| count_reply(Response::new(r)))
     }
 
     async fn get_changeset(
@@ -1785,15 +2083,37 @@ impl Scion for ScionService {
         let stalled = scion_proto::runtime::listen::Stalled::of(&request);
         let req = request.into_inner();
         check_whole_reader(&self.access, &caller, &req.repo)?;
-        let id = parse_id(&req.changeset_id, "changeset_id")?;
+        let id: ChangesetId = parse_id(&req.changeset_id, "changeset_id")?;
+        // The share is taken before the object is built, sized from the
+        // stored body's length: the count of replies in flight bounds
+        // the memory they hold, and an over-cap object is refused
+        // before any of its bytes are read.
+        let size = self
+            .worker
+            .run(move |store| {
+                let stored =
+                    store.read(|c| c.stored_changeset_body_lengths(&[id.as_bytes().to_vec()]))?;
+                let len = stored
+                    .iter()
+                    .find(|(stored_id, _)| *stored_id == id.as_bytes())
+                    .map_or(0, |(_, len)| usize::try_from(*len).unwrap_or(0));
+                // A missing object surfaces in the build below, with
+                // its real error.
+                Ok(len)
+            })
+            .await?;
+        let share = self.whole_share_of(size).await?;
         let data = self
             .worker
             .run(move |store| Ok(read::get_changeset(&store, &req.repo, id)?.encode()))
             .await?;
-        self.stream_whole(call, data, stalled, |data| GetChangesetResponse {
-            changeset: data,
-        })
-        .await
+        Ok(mark_stream(Self::stream_whole_holding(
+            call,
+            data,
+            share,
+            stalled,
+            |data| GetChangesetResponse { changeset: data },
+        )))
     }
 
     type ReadFileStream = ReadFileStream;
@@ -1816,8 +2136,12 @@ impl Scion for ScionService {
         // apart: the reply counts what it leaves in HTTP/2 on it.
         let stalled = scion_proto::runtime::listen::Stalled::of(&request);
         // The derivation of a first view walks the real tree, under the
-        // call's deadline.
+        // call's deadline. A client that cancels drops this call; the
+        // guard says so to the job's loop checks, so its cold derive
+        // stops at its next step and frees its reader, instead of
+        // running on to the deadline.
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
+        let _call_gone = deadline.guard();
         let metrics = Arc::clone(&self.metrics);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
@@ -1874,7 +2198,7 @@ impl Scion for ScionService {
             )
             .instrument(tracing::Span::current()),
         );
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(mark_stream(Response::new(ReceiverStream::new(rx))))
     }
 
     async fn list_dir(
@@ -1887,8 +2211,12 @@ impl Scion for ScionService {
         // apart: the reply counts what it leaves in HTTP/2 on it.
         let stalled = scion_proto::runtime::listen::Stalled::of(&request);
         // The derivation of a first view walks the real tree, under the
-        // call's deadline.
+        // call's deadline. A client that cancels drops this call; the
+        // guard says so to the job's loop checks, so its cold derive
+        // stops at its next step and frees its reader, instead of
+        // running on to the deadline.
         let deadline = Deadline::of_call(&request, REQUEST_TIMEOUT);
+        let _call_gone = deadline.guard();
         let metrics = Arc::clone(&self.metrics);
         let req = request.into_inner();
         check_reader(&self.access, &caller, &req.repo)?;
@@ -1907,24 +2235,51 @@ impl Scion for ScionService {
             }
             None => None,
         };
-        let data = self
+        // One worker pass resolves the root and the path (a view root
+        // is not cheap, so it is resolved once), and returns the
+        // directory's id with its stored body's length: the body IS
+        // the reply's bytes, so the length is exact. The share is
+        // taken from that length, before the build reads the row it
+        // already named; a changeset-pinned tree cannot change between
+        // the two reads.
+        let (dir_id, size) = self
             .worker
             .run(move |store| {
-                let tree = match &view {
+                let root = match &view {
                     Some((digest, prefixes, live)) => {
                         let repo_id = store.read(|c| c.repo_id(&req.repo))?;
-                        let root = views::view_root(
+                        views::view_root(
                             &store, repo_id, digest, id, prefixes, live, &metrics, &deadline,
-                        )?;
-                        read::list_dir_at(&store, root, path.as_ref())?
+                        )?
                     }
-                    None => read::list_dir(&store, &req.repo, id, path.as_ref(), &deadline)?,
+                    None => read::root_tree(&store, &req.repo, id, &deadline)?,
                 };
-                Ok(tree.encode())
+                let dir_id = store.read(|c| match path.as_ref() {
+                    None => Ok(root),
+                    Some(path) => match crate::tree::lookup(c, root, path)? {
+                        Some(scion_core::Entry::Dir(dir_id)) => Ok(dir_id),
+                        Some(scion_core::Entry::File(_)) => {
+                            Err(crate::Error::InvalidArgument(format!("{path:?} is a file")))
+                        }
+                        None => Err(crate::Error::NotFound(format!("path {path:?}"))),
+                    },
+                })?;
+                let size = store.read(|c| c.tree_size(dir_id))?;
+                Ok((dir_id, size))
             })
             .await?;
-        self.stream_whole(call, data, stalled, |data| ListDirResponse { tree: data })
-            .await
+        let share = self.whole_share_of(size).await?;
+        let data = self
+            .worker
+            .run(move |store| Ok(store.read(|c| c.get_tree(dir_id))?.encode()))
+            .await?;
+        Ok(mark_stream(Self::stream_whole_holding(
+            call,
+            data,
+            share,
+            stalled,
+            |data| ListDirResponse { tree: data },
+        )))
     }
 
     async fn log(&self, request: Request<LogRequest>) -> Result<Response<LogStream>, Status> {
@@ -1967,7 +2322,7 @@ impl Scion for ScionService {
         };
         let (tx, rx) = mpsc::channel(2);
         tokio::spawn(log_parts(walk, page, tx).instrument(tracing::Span::current()));
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(mark_stream(Response::new(ReceiverStream::new(rx))))
     }
 
     async fn blame(&self, request: Request<BlameRequest>) -> Result<Response<BlameStream>, Status> {
@@ -2015,8 +2370,9 @@ impl Scion for ScionService {
                     )?;
                     (resume, Some(hold))
                 };
+                let held = cursor.as_ref().map_or(0, crate::memory::Held::len);
                 let _cursor = cursor;
-                blame::blame(&store, &repo, id, &walk_path, &resume, &memory, until)
+                blame::blame(&store, &repo, id, &walk_path, &resume, held, &memory, until)
             })
             .await?;
         let ranges = blame
@@ -2056,7 +2412,7 @@ impl Scion for ScionService {
         };
         let (tx, rx) = mpsc::channel(2);
         tokio::spawn(blame_parts(send, tx).instrument(tracing::Span::current()));
-        Ok(Response::new(ReceiverStream::new(rx)))
+        Ok(mark_stream(Response::new(ReceiverStream::new(rx))))
     }
 
     async fn merge_base(
@@ -2075,9 +2431,9 @@ impl Scion for ScionService {
                 read::merge_base(store, &req.repo, a, b, deadline)
             })
             .await?;
-        Ok(Response::new(MergeBaseResponse {
+        Ok(count_reply(Response::new(MergeBaseResponse {
             changeset_ids: bases.iter().map(|id| id.as_bytes().to_vec()).collect(),
-        }))
+        })))
     }
 
     async fn is_ancestor(
@@ -2096,7 +2452,9 @@ impl Scion for ScionService {
                 read::is_ancestor(store, &req.repo, ancestor, descendant, deadline)
             })
             .await?;
-        Ok(Response::new(IsAncestorResponse { is_ancestor }))
+        Ok(count_reply(Response::new(IsAncestorResponse {
+            is_ancestor,
+        })))
     }
 
     async fn diff(&self, request: Request<DiffRequest>) -> Result<Response<DiffResponse>, Status> {
@@ -2131,12 +2489,23 @@ impl Scion for ScionService {
             })
             .await?;
         let entries = page.entries.into_iter().map(diff_entry).collect();
-        Ok(Response::new(DiffResponse {
+        Ok(count_reply(Response::new(DiffResponse {
             entries,
             next_after: path_bytes(page.next_after),
             renames_incomplete: page.renames_incomplete,
-        }))
+        })))
     }
+}
+
+/// An optional changeset ID on the wire: empty for `None`.
+fn id_bytes(id: Option<ChangesetId>) -> Vec<u8> {
+    id.map(|id| id.as_bytes().to_vec()).unwrap_or_default()
+}
+
+/// An optional path on the wire: empty for `None`.
+fn path_bytes(path: Option<RepoPath>) -> Vec<u8> {
+    path.map(|path| path.as_bytes().to_vec())
+        .unwrap_or_default()
 }
 
 /// One path of a diff on the wire. The other path of a rename goes in
@@ -2157,17 +2526,6 @@ pub(crate) fn diff_entry(entry: read::DiffEntry) -> DiffEntry {
     }
 }
 
-/// An optional changeset ID on the wire: empty for `None`.
-fn id_bytes(id: Option<ChangesetId>) -> Vec<u8> {
-    id.map(|id| id.as_bytes().to_vec()).unwrap_or_default()
-}
-
-/// An optional path on the wire: empty for `None`.
-fn path_bytes(path: Option<RepoPath>) -> Vec<u8> {
-    path.map(|path| path.as_bytes().to_vec())
-        .unwrap_or_default()
-}
-
 pub(crate) fn file_state(state: FileState) -> v1::FileState {
     let (kind, id, executable) = match state {
         FileState::Regular {
@@ -2185,16 +2543,217 @@ pub(crate) fn file_state(state: FileState) -> v1::FileState {
 }
 
 #[cfg(test)]
+pub(crate) use tests::{test_init_log, test_log_text};
+#[cfg(test)]
 mod tests {
     use crate::backend::Backend;
-    use crate::db;
-    use crate::store::Store;
+    use crate::meta::testing;
+    use scion_proto::v1::objects_server::Objects as _;
+    use std::sync::atomic::Ordering;
     use std::time::Instant;
 
     use scion_core::{Changeset, FileState, IdentityTime};
     use tonic::Code;
 
     use super::*;
+
+    /// The free-space tests' shared slot: both tests drive the one
+    /// process-global park (`TEST_FREE_STAT_PARKED` holds a single
+    /// directory) and the one pair of poll overrides, so a second
+    /// test's park steals the first's — its statvfs answers, its
+    /// samples land, and its age freezes at 0, which is the red the
+    /// CI's one-process run caught. Each test holds the slot for its
+    /// whole body; tests in separate processes share nothing. The
+    /// tokio mutex, not a std one: the async tests hold the guard
+    /// across awaits, which a std guard forbids.
+    static FREE_SPACE_POLL_SLOT: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Takes the free-space tests' slot for the caller's whole body.
+    async fn free_space_poll_slot() -> tokio::sync::MutexGuard<'static, ()> {
+        FREE_SPACE_POLL_SLOT.lock().await
+    }
+
+    /// A statvfs that never answers does not stop the poll: the stuck
+    /// sample warns, the age gauge counts from the last good sample on
+    /// every tick, and the next sample still lands once the stat
+    /// answers. The park is the statvfs's test hook.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_stuck_free_space_sample_does_not_stop_the_poll() {
+        const PERIOD: u64 = 50;
+        let _slot = free_space_poll_slot().await;
+        let dir = crate::test_support::private_tempdir();
+        let metrics = Arc::new(Metrics::default());
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(());
+        FREE_SPACE_POLL_OVERRIDE.store(PERIOD, Ordering::Relaxed);
+        FREE_SPACE_STAT_BOUND_OVERRIDE.store(2 * PERIOD, Ordering::Relaxed);
+        spawn_free_space_poll(
+            std::path::PathBuf::from(dir.path()),
+            Arc::clone(&metrics),
+            stop_rx,
+        );
+        // The first sample lands, and arms the age gauge at 0.
+        let mut spins = 0;
+        let mut text = metrics.render();
+        while !text.contains("scion_data_free_sample_age_seconds 0") {
+            spins += 1;
+            assert!(spins < 10_000, "the first sample never landed");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+            text = metrics.render();
+        }
+        // The stat parks: the samples stop, the poll does not. The
+        // stuck window runs whole seconds, because the age gauge
+        // counts seconds and a stuck poll must show in it.
+        let park = crate::store::ParkFreeStat::now(dir.path().to_path_buf());
+        tokio::time::sleep(Duration::from_millis(PERIOD * 44)).await;
+        // The age counts from the last good sample, on the poll's own
+        // ticks, while nothing new lands: about two seconds here.
+        let stuck = metrics
+            .render()
+            .lines()
+            .find(|line| line.starts_with("scion_data_free_sample_age_seconds "))
+            .unwrap()
+            .to_owned();
+        let stuck_age: u64 = stuck
+            .rsplit(' ')
+            .next()
+            .unwrap()
+            .parse()
+            .expect("the age gauge renders a number");
+        assert!(
+            stuck_age >= 2,
+            "the age gauge froze while the sample was stuck: {stuck}"
+        );
+        // The stat answers again: the next sample lands, so the poll
+        // was alive the whole time, and the age resets to 0.
+        drop(park);
+        let mut spins = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(PERIOD)).await;
+            let text = metrics.render();
+            if text.contains("scion_data_free_sample_age_seconds 0\n") {
+                break;
+            }
+            spins += 1;
+            assert!(spins < 100, "the poll never took another sample");
+        }
+    }
+
+    /// The age gauge exists before any sample lands: a statvfs that
+    /// hangs from the poll's first tick grows the age from the poll's
+    /// start while the free gauges stay absent, so the stuck alert can
+    /// fire in the never-landed case. Before the boot-arming, the gauge
+    /// armed only with the first good sample and this read had no
+    /// series — the red proof on main.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_age_gauge_counts_from_boot_while_no_sample_lands() {
+        const PERIOD: u64 = 50;
+        let _slot = free_space_poll_slot().await;
+        let dir = crate::test_support::private_tempdir();
+        let metrics = Arc::new(Metrics::default());
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(());
+        FREE_SPACE_POLL_OVERRIDE.store(PERIOD, Ordering::Relaxed);
+        FREE_SPACE_STAT_BOUND_OVERRIDE.store(2 * PERIOD, Ordering::Relaxed);
+        // The statvfs hangs before the poll's first sample: the park is
+        // armed before the poll starts.
+        let park = crate::store::ParkFreeStat::now(dir.path().to_path_buf());
+        spawn_free_space_poll(
+            std::path::PathBuf::from(dir.path()),
+            Arc::clone(&metrics),
+            stop_rx,
+        );
+        let mut spins = 0;
+        let mut first: Option<u64> = None;
+        loop {
+            tokio::time::sleep(Duration::from_millis(PERIOD)).await;
+            let text = metrics.render();
+            let line = text
+                .lines()
+                .find(|l| l.starts_with("scion_data_free_sample_age_seconds "));
+            let Some(line) = line else {
+                spins += 1;
+                assert!(
+                    spins < 100,
+                    "the age gauge never armed before a sample landed"
+                );
+                continue;
+            };
+            let age: u64 = line
+                .rsplit(' ')
+                .next()
+                .unwrap()
+                .parse()
+                .expect("the age gauge renders a number");
+            let Some(before) = first else {
+                assert!(
+                    !text.contains("scion_data_free_bytes "),
+                    "no sample landed, so the free gauge must be absent: {text}"
+                );
+                first = Some(age);
+                continue;
+            };
+            if age > before {
+                break;
+            }
+            // The gauge counts whole seconds: a tick at the same second
+            // reads equal, so the wait runs a few real seconds.
+            spins += 1;
+            assert!(
+                spins < 300,
+                "the age froze while nothing landed: {before} -> {age}"
+            );
+        }
+        drop(park);
+    }
+
+    /// The blob-count refresh spaces itself by its own cost: the wait
+    /// before the next refresh is the poll's floor, or 100x the last
+    /// scan's duration, whichever is longer. The floor keeps a small
+    /// store's minute cadence; the space keeps the scan near 1% of one
+    /// read connection at any size.
+    #[test]
+    fn the_blob_count_refresh_spaces_itself_by_its_own_cost() {
+        // The floor: a cheap scan keeps the poll's period. The edge is
+        // exact: 100 x 0.6 s is the floor itself.
+        assert_eq!(blob_count_next_wait(Duration::ZERO), BLOB_COUNT_POLL);
+        assert_eq!(
+            blob_count_next_wait(Duration::from_millis(600)),
+            BLOB_COUNT_POLL
+        );
+        // The curve: an expensive scan waits 100x.
+        assert_eq!(
+            blob_count_next_wait(Duration::from_secs(3)),
+            Duration::from_secs(300)
+        );
+        // Monotone: a longer scan never waits less.
+        assert!(
+            blob_count_next_wait(Duration::from_secs(10))
+                > blob_count_next_wait(Duration::from_secs(5))
+        );
+    }
+
+    /// The refresh reports its own duration: the gauge renders after
+    /// one refresh. On main the poll exported no duration, so this
+    /// read had no series - the red proof on main.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_blob_count_refresh_reports_its_own_duration() {
+        let dir = crate::test_support::private_tempdir();
+        let metrics = Arc::new(Metrics::default());
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(());
+        let store = Backend::open_test(dir.path()).unwrap();
+        spawn_blob_count_poll(store, Arc::clone(&metrics), stop_rx);
+        let mut spins = 0;
+        loop {
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if metrics
+                .render()
+                .contains("scion_blob_count_refresh_seconds ")
+            {
+                break;
+            }
+            spins += 1;
+            assert!(spins < 1_000, "the refresh never reported its duration");
+        }
+    }
 
     /// Receives one step's go signal, or panics naming the step: a
     /// release that never comes fails the test in seconds, not the
@@ -2228,6 +2787,18 @@ mod tests {
                 .finish();
             tracing::subscriber::set_global_default(subscriber).unwrap();
         });
+    }
+
+    /// The shared log's text, for a test module whose line a worker
+    /// thread logs: the subscriber is one and global, so the readers
+    /// share it.
+    pub(crate) fn test_log_text() -> String {
+        log_text()
+    }
+
+    /// Sets the shared subscriber once.
+    pub(crate) fn test_init_log() {
+        init_log();
     }
 
     /// A service whose one principal may do everything.
@@ -2297,8 +2868,8 @@ mod tests {
     }
 
     fn file_store(content: &[u8]) -> (tempfile::TempDir, Backend, ChangesetId, BlobId) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
         let blob = store.blobs().put(content).unwrap();
         let state = FileState::Regular {
             content: blob,
@@ -2389,7 +2960,7 @@ mod tests {
     #[tokio::test]
     async fn a_whole_reply_splits_at_chunk_bytes_and_stays_whole() {
         let data = content(3);
-        let budget = whole_share(data.len()) as usize;
+        let budget = data.len();
         let (task, mut rx, reads) =
             whole_reply(data.clone(), budget, Duration::from_secs(60)).await;
         let mut sent = Vec::new();
@@ -2409,7 +2980,7 @@ mod tests {
     #[tokio::test]
     async fn a_whole_reply_whose_client_stops_mid_reply_frees_its_share() {
         let data = content(3);
-        let budget = whole_share(data.len()) as usize;
+        let budget = data.len();
         let (task, mut rx, reads) =
             whole_reply(data.clone(), budget, Duration::from_secs(60)).await;
 
@@ -2441,6 +3012,51 @@ mod tests {
         let caller = Caller(scion_proto::runtime::auth::DEFAULT_PRINCIPAL.into());
         request.extensions_mut().insert(caller);
         request
+    }
+
+    /// A request the objects service's own auth answers: the token the
+    /// fixture's `Access::single` knows.
+    fn as_bearer<T>(message: T) -> Request<T> {
+        let mut request = as_default(message);
+        request.metadata_mut().insert(
+            "authorization",
+            "Bearer t".parse().expect("the header fits the format"),
+        );
+        request
+    }
+
+    #[test]
+    fn land_response_maps_every_reason_and_forces_unspecified_off_rejected() {
+        use scion_proto::v1::{LandRejectReason as WireReason, LandState as Wire};
+        let outcome = |state: LandState, reason: LandRejectReason| LandOutcome {
+            land_id: 1,
+            state,
+            result: None,
+            previous: None,
+            moved: false,
+            detail: String::new(),
+            conflict_paths: vec![],
+            reject_reason: reason,
+        };
+        let wire = [
+            (LandRejectReason::Unspecified, WireReason::Unspecified),
+            (LandRejectReason::NeedsOneParent, WireReason::NeedsOneParent),
+            (LandRejectReason::MissingRef, WireReason::MissingRef),
+            (
+                LandRejectReason::BaseNotOnHistory,
+                WireReason::BaseNotOnHistory,
+            ),
+            (LandRejectReason::Abandoned, WireReason::Abandoned),
+        ];
+        for (reason, want) in wire {
+            let reply = land_response(outcome(LandState::Rejected, reason));
+            assert_eq!(reply.state(), Wire::Rejected);
+            assert_eq!(reply.reject_reason(), want, "{reason:?}");
+        }
+        // A reason on a state that must not carry one does not leak.
+        let reply = land_response(outcome(LandState::Landed, LandRejectReason::Abandoned));
+        assert_eq!(reply.state(), Wire::Landed);
+        assert_eq!(reply.reject_reason(), WireReason::Unspecified);
     }
 
     #[test]
@@ -2543,6 +3159,140 @@ mod tests {
         assert!(lines[0].contains("rpc=\"GetLand\""), "{}", lines[0]);
     }
 
+    /// A `get_changeset` whose stored body cannot fit what is left of the
+    /// read pool is not served: the whole reply's share is taken before
+    /// the object is read, and a take that can never fit parks the call,
+    /// instead of building a reply that holds memory it did not pay for.
+    /// Kills the mutant whose length find misses (len 0, no share,
+    /// served at once). With the pool freed, the same call is served:
+    /// contention, not absence.
+    #[test]
+    fn a_changeset_whose_body_does_not_fit_the_read_pool_is_not_served() {
+        let (_dir, store, _, _) = file_store(b"x");
+        let big = Changeset::new(
+            vec![],
+            IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0)
+                .expect("identity fits the format"),
+            None,
+            vec![b'b'; 2_000],
+            [].into(),
+        )
+        .expect("changeset fits the format");
+        let id = store
+            .write(|c| {
+                let repo = c.repo_id("r")?;
+                c.insert_changeset(repo, &big)
+            })
+            .unwrap();
+        let stored = store
+            .read(|c| c.stored_changeset_body_lengths(&[id.as_bytes().to_vec()]))
+            .unwrap();
+        let len = stored.first().map(|(_, len)| *len).unwrap_or_default();
+        assert!(len >= 2_000, "the seeded body's stored length: {stored:?}");
+        let service = test_service(store);
+        let reads = Arc::clone(&service.reads);
+        let hold = block_on(reads.acquire_many(u32::try_from(READ_BUDGET_BYTES - 1_000).unwrap()))
+            .expect("the pool is whole");
+        let request = as_default(GetChangesetRequest {
+            repo: "r".to_owned(),
+            changeset_id: id.as_bytes().to_vec(),
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let got = block_on(service.get_changeset(request));
+            let _ = tx.send(got.is_ok());
+        });
+        std::thread::sleep(Duration::from_secs(2));
+        assert!(
+            rx.try_recv().is_err(),
+            "an over-pool body is not served: {rx:?}"
+        );
+        drop(hold);
+        let served = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the reply lands once the pool frees");
+        assert!(served, "the body is served once the pool frees");
+    }
+
+    /// A `get_changeset` whose stored body is over the object cap is
+    /// refused, not served: the reply's share is checked against the cap
+    /// before any of the object's bytes are read.
+    #[test]
+    fn a_changeset_at_the_object_cap_is_served() {
+        let (_dir, store, _, _) = file_store(b"x");
+        // The cap bounds the STORED body, and the encoding adds its own
+        // overhead, so pad the message until the stored length is the
+        // cap exactly: the refusal starts one byte past it, and a body
+        // at the cap is served.
+        let mut message_len = MAX_OBJECT_BYTES - 128;
+        let mut id = None;
+        for _ in 0..8 {
+            let big = Changeset::new(
+                vec![],
+                IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0)
+                    .expect("identity fits the format"),
+                None,
+                vec![b'b'; message_len],
+                [].into(),
+            )
+            .expect("changeset fits the format");
+            let seeded = store
+                .write(|c| {
+                    let repo = c.repo_id("r")?;
+                    c.insert_changeset(repo, &big)
+                })
+                .unwrap();
+            let stored = store
+                .read(|c| c.stored_changeset_body_lengths(&[seeded.as_bytes().to_vec()]))
+                .unwrap();
+            let len = stored.first().map(|(_, len)| *len).unwrap_or_default();
+            match usize::try_from(len).unwrap_or(0) {
+                l if l == MAX_OBJECT_BYTES => {
+                    id = Some(seeded);
+                    break;
+                }
+                l if l < MAX_OBJECT_BYTES => message_len += MAX_OBJECT_BYTES - l,
+                l => message_len -= l - MAX_OBJECT_BYTES,
+            }
+        }
+        let id = id.expect("a body sized to the cap exists");
+        let service = test_service(store);
+        let request = as_default(GetChangesetRequest {
+            repo: "r".to_owned(),
+            changeset_id: id.as_bytes().to_vec(),
+        });
+        // The cap itself is legal: the reply opens and streams.
+        let reply = block_on(service.get_changeset(request));
+        assert!(reply.is_ok(), "a body at the cap is served: {reply:?}");
+    }
+
+    #[test]
+    fn a_changeset_over_the_object_cap_is_refused() {
+        let (_dir, store, _, _) = file_store(b"x");
+        let big = Changeset::new(
+            vec![],
+            IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0)
+                .expect("identity fits the format"),
+            None,
+            vec![b'b'; MAX_OBJECT_BYTES + 1],
+            [].into(),
+        )
+        .expect("changeset fits the format");
+        let id = store
+            .write(|c| {
+                let repo = c.repo_id("r")?;
+                c.insert_changeset(repo, &big)
+            })
+            .unwrap();
+        let service = test_service(store);
+        let request = as_default(GetChangesetRequest {
+            repo: "r".to_owned(),
+            changeset_id: id.as_bytes().to_vec(),
+        });
+        let status = block_on(service.get_changeset(request)).expect_err("over the cap");
+        assert_eq!(status.code(), Code::ResourceExhausted, "{status:?}");
+    }
+
     #[tokio::test]
     async fn a_read_file_reply_of_many_parts_stays_exactly_the_file() {
         let data = content(3);
@@ -2626,7 +3376,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn a_damaged_blob_ends_the_reply_with_internal_before_its_last_part() {
+    async fn a_damaged_blob_ends_the_reply_with_data_loss_before_its_last_part() {
         let data = content(3);
         for flip in [10, data.len() / 2, data.len() - 10] {
             let (_dir, store, _, blob) = file_store(&data);
@@ -2646,7 +3396,7 @@ mod tests {
                     Err(status) => break status,
                 }
             };
-            assert_eq!(status.code(), Code::Internal, "bit {flip}: {status:?}");
+            assert_eq!(status.code(), Code::DataLoss, "bit {flip}: {status:?}");
             assert_eq!(parts, 2, "bit {flip}: every part but the last");
             assert!(rx.recv().await.is_none());
             task.await.unwrap();
@@ -2658,8 +3408,8 @@ mod tests {
     /// changeset on root, below the floor of a new path index at B, so
     /// the land's plan walks back.
     fn dropped_call_fixture() -> (tempfile::TempDir, Backend, ChangesetId, ChangesetId) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
         let blob = store.blobs().put(b"x").unwrap();
         let put = |parents, path: &str| {
             Changeset::new(
@@ -2787,16 +3537,19 @@ mod tests {
             assert!(started.elapsed() < Duration::from_secs(10), "the job ends");
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
-        let sql = "SELECT state FROM lands WHERE request_key = 'claim-wait'";
-        let state: String = store
-            .read(|c| {
-                c.sqlite()
-                    .unwrap()
-                    .query_row(sql, [], |row| row.get(0))
-                    .map_err(crate::error::from_sqlite)
-            })
-            .unwrap();
-        assert_eq!(state, "pending");
+        // The land is pending: its row answers `pending_lands`, the
+        // metadata trait both backends serve.
+        assert!(
+            store
+                .read(|c| {
+                    let repo = c.repo_id("r")?;
+                    Ok(c.pending_lands(repo)?
+                        .iter()
+                        .any(|l| l.request_key == "claim-wait"))
+                })
+                .unwrap(),
+            "the land row is not pending"
+        );
         let main = store.read(|c| {
             let repo = c.repo_id("r")?;
             c.get_ref(repo, "main")
@@ -2841,6 +3594,87 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
         (gates, parked)
+    }
+
+    /// The measurement #868 asks for, before any fix: N long calls take
+    /// all permits and cancel at once; their jobs detach and run on, as
+    /// a client's cancel leaves them - a job with no deadline check in
+    /// its current phase (one long statement, a large tree store) holds
+    /// its permit to the phase's end. A live call then times its wait
+    /// A job that answers an error returns its permit when its closure
+    /// ends: the land's deadline stop rides this, so a cancelled land
+    /// that gave up at its fill's deadline holds nothing back.
+    #[tokio::test]
+    async fn an_errored_job_returns_its_permit() {
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
+        let worker = Worker::new(store);
+        let status = worker
+            .run(|_| -> Result<(), crate::Error> {
+                Err(crate::Error::DeadlineExceeded("the test's job".into()))
+            })
+            .await
+            .unwrap_err();
+        assert_eq!(status.code(), tonic::Code::DeadlineExceeded, "{status}");
+        assert_eq!(
+            worker.permits.available_permits(),
+            MAX_BLOCKING,
+            "the errored job held its permit"
+        );
+    }
+
+    /// for a permit. The numbers land in the CI log; the mail to the
+    /// lead carries them.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_cancelled_calls_keep_their_permits_until_their_work_ends() {
+        const LONG: Duration = Duration::from_millis(1000);
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
+        let worker = Arc::new(Worker::new(store));
+        // The baseline: a fast call with no load.
+        let started = std::time::Instant::now();
+        worker.run(|_| Ok(())).await.unwrap();
+        let baseline = started.elapsed();
+        // MAX_BLOCKING long calls: a job that sleeps past any check.
+        let tasks: Vec<tokio::task::JoinHandle<()>> = (0..MAX_BLOCKING)
+            .map(|_| {
+                tokio::spawn({
+                    let worker = Arc::clone(&worker);
+                    async move {
+                        let _ = worker
+                            .run(move |_| {
+                                std::thread::sleep(LONG);
+                                Ok(())
+                            })
+                            .await;
+                    }
+                })
+            })
+            .collect();
+        while worker.permits.available_permits() > 0 {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+        // The cancels, at once: dropping the await detaches the jobs.
+        for task in &tasks {
+            task.abort();
+        }
+        // A live call times its wait for a permit.
+        let started = std::time::Instant::now();
+        worker.run(|_| Ok(())).await.unwrap();
+        let waited = started.elapsed();
+        eprintln!(
+            "#868: baseline {baseline:?}; after {MAX_BLOCKING} cancelled calls              of {LONG:?} with no check, the live call waited {waited:?}"
+        );
+        // A phase with no check keeps its permit to its end: the wait
+        // is about one phase, the ceiling this PR documents.
+        assert!(
+            waited >= Duration::from_millis(800),
+            "a phase with no check gave up its permit early: {waited:?}"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "the live call never got a permit: {waited:?}"
+        );
     }
 
     /// A call aborted while its job could not claim it: the intent is
@@ -2910,18 +3744,17 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(1)).await;
         }
 
-        let sql = "SELECT state FROM lands WHERE request_key = 'k'";
-        let row = store
-            .read(|c| {
-                c.sqlite()
-                    .unwrap()
-                    .query_row(sql, [], |row| row.get::<_, String>(0))
-                    .map_err(crate::error::from_sqlite)
-            })
-            .unwrap_err();
+        // No land was recorded: no pending row answers for the key. (The
+        // metadata trait reads pending lands; a row in a final state would
+        // have shown in the audit, whose failed line is asserted below.)
         assert!(
-            format!("{row:?}").contains("QueryReturnedNoRows"),
-            "no land was recorded: {row:?}"
+            !store
+                .read(|c| {
+                    let repo = c.repo_id("r")?;
+                    Ok(c.pending_lands(repo)?.iter().any(|l| l.request_key == "k"))
+                })
+                .unwrap(),
+            "a land row was recorded"
         );
         let text = std::fs::read_to_string(&audit_path).unwrap();
         assert_eq!(
@@ -2943,6 +3776,437 @@ mod tests {
             c.get_ref(repo, "main")
         });
         assert_eq!(main.unwrap().unwrap().target, b, "main did not move");
+    }
+
+    /// A repo of `depth` changesets stored with no root trees, so a first
+    /// read derives, and the walk needs several steps (the test STEP is
+    /// 2). The service runs over a store whose reader pool holds exactly
+    /// `readers` connections, so the test can hold them all and release
+    /// them one at a time. Returns the dir, the store, the service, the
+    /// head changeset, and the file the head's own change puts.
+    fn cold_derive_fixture(
+        depth: usize,
+        readers: usize,
+    ) -> (
+        tempfile::TempDir,
+        Backend,
+        Arc<ScionService>,
+        Arc<crate::objects::ObjectsService>,
+        ChangesetId,
+        Vec<u8>,
+    ) {
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test_with_readers(dir.path(), readers).unwrap();
+        let blob = store.blobs().put(b"x").unwrap();
+        let (head, last) = store
+            .write(|c| {
+                let repo = c.create_repo("r")?;
+                let mut parent: Option<ChangesetId> = None;
+                let mut last: Vec<u8> = Vec::new();
+                for i in 0..depth {
+                    let name = format!("p{i}");
+                    let cs = Changeset::new(
+                        parent.iter().copied().collect(),
+                        IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0)
+                            .expect("identity fits the format"),
+                        None,
+                        name.clone().into_bytes(),
+                        [(
+                            RepoPath::new(name.as_bytes()).unwrap(),
+                            Some(FileState::Regular {
+                                content: blob,
+                                executable: false,
+                            }),
+                        )]
+                        .into(),
+                    )
+                    .expect("changeset fits the format");
+                    let id = c.insert_changeset(repo, &cs)?;
+                    parent = Some(id);
+                    last = name.into_bytes();
+                }
+                let head = parent.expect("a fixture with at least one changeset");
+                assert!(c.cas_ref(repo, "main", None, head)?);
+                Ok((head, last))
+            })
+            .unwrap();
+        let service = Arc::new(ScionService::new(
+            Worker::new(store.clone()),
+            Arc::new(Access::single("t")),
+            Arc::default(),
+            Quotas::off(),
+            Arc::default(),
+            crate::audit::Audit::open(&dir.path().join("audit.log")).unwrap(),
+        ));
+        let objects = Arc::new(crate::objects::ObjectsService::new(
+            Worker::new(store.clone()),
+            Arc::new(Access::single("t")),
+            Quotas::off(),
+            None,
+            Arc::default(),
+            Access::single("t").auth(),
+        ));
+        (dir, store, service, objects, head, last)
+    }
+
+    /// Holds every reader of the store's pool until its gate is dropped.
+    /// Each holder answers one signal once it holds its reader, so the
+    /// caller knows the pool is full before it starts the call.
+    fn hold_readers(
+        store: &Backend,
+        readers: usize,
+    ) -> (
+        Vec<std::sync::mpsc::Sender<()>>,
+        Vec<std::thread::JoinHandle<()>>,
+    ) {
+        let taken = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let mut gates = Vec::new();
+        let mut holders = Vec::new();
+        for _ in 0..readers {
+            let (free_tx, free_rx) = std::sync::mpsc::channel::<()>();
+            gates.push(free_tx);
+            let taken = Arc::clone(&taken);
+            let store = store.clone();
+            holders.push(std::thread::spawn(move || {
+                let _ = store.read(|_c| {
+                    taken.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let _ = free_rx.recv();
+                    Ok(())
+                });
+            }));
+        }
+        let started = Instant::now();
+        while taken.load(std::sync::atomic::Ordering::Relaxed) < readers {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "every holder took its reader"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        (gates, holders)
+    }
+
+    /// The one worker permit the call's job holds, once it claimed it:
+    /// the job is in flight, parked on the reader wait.
+    async fn wait_job_claimed(worker: &Worker) {
+        let started = Instant::now();
+        while worker.permits.available_permits() != MAX_BLOCKING - 1 {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the call's job claimed its permit"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    /// Every worker permit is back: the job ended, and with it the
+    /// reader it held.
+    async fn wait_job_ended(worker: &Worker) {
+        let started = Instant::now();
+        while worker.permits.available_permits() != MAX_BLOCKING {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the job ended and freed its reader"
+            );
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_read_file_stops_its_derive_and_frees_its_reader() {
+        let readers = crate::store::READERS;
+        let (_dir, store, service, _objects, head, path) = cold_derive_fixture(6, readers);
+        let (mut gates, holders) = hold_readers(&store, readers);
+        let call = tokio::spawn({
+            let service = Arc::clone(&service);
+            let path = path.clone();
+            async move {
+                service
+                    .read_file(as_default(scion_proto::v1::ReadFileRequest {
+                        repo: "r".into(),
+                        changeset_id: head.as_bytes().to_vec(),
+                        path,
+                    }))
+                    .await
+            }
+        });
+        // The job claimed its permit and parks on the reader wait: the
+        // window the abort lands in.
+        wait_job_claimed(&service.worker).await;
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        // One reader back: the job takes it, and the guard the dropped
+        // call left behind stops its walk at the first step boundary.
+        drop(gates.remove(0));
+        wait_job_ended(&service.worker).await;
+        // The walk never wrote the root tree: the cancelled call did not
+        // do its work anyway.
+        assert!(
+            store
+                .read(
+                    |c| crate::derived::load::<crate::tree::RootTree>(c, head).map(|v| v.is_none())
+                )
+                .unwrap(),
+            "the cancelled call derived the root tree"
+        );
+        // The reader is serving again, well before the call's deadline
+        // could have passed: a fresh call reads the same file, deriving
+        // the root tree now.
+        for gate in gates.drain(..) {
+            drop(gate);
+        }
+        for holder in holders {
+            holder.join().unwrap();
+        }
+        let mut got = service
+            .read_file(as_default(scion_proto::v1::ReadFileRequest {
+                repo: "r".into(),
+                changeset_id: head.as_bytes().to_vec(),
+                path,
+            }))
+            .await
+            .unwrap()
+            .into_inner();
+        let part = tokio_stream::StreamExt::next(&mut got)
+            .await
+            .unwrap()
+            .expect("the file streams");
+        assert_eq!(part.data, b"x", "the file's content comes back");
+        assert!(
+            store
+                .read(
+                    |c| crate::derived::load::<crate::tree::RootTree>(c, head).map(|v| v.is_some())
+                )
+                .unwrap(),
+            "the fresh call derived the root tree"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_list_dir_stops_its_derive_and_frees_its_reader() {
+        let readers = crate::store::READERS;
+        let (_dir, store, service, _objects, head, _path) = cold_derive_fixture(6, readers);
+        let (mut gates, holders) = hold_readers(&store, readers);
+        let call = tokio::spawn({
+            let service = Arc::clone(&service);
+            async move {
+                service
+                    .list_dir(as_default(scion_proto::v1::ListDirRequest {
+                        repo: "r".into(),
+                        changeset_id: head.as_bytes().to_vec(),
+                        path: Vec::new(),
+                    }))
+                    .await
+            }
+        });
+        wait_job_claimed(&service.worker).await;
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        drop(gates.remove(0));
+        wait_job_ended(&service.worker).await;
+        assert!(
+            store
+                .read(
+                    |c| crate::derived::load::<crate::tree::RootTree>(c, head).map(|v| v.is_none())
+                )
+                .unwrap(),
+            "the cancelled call derived the root tree"
+        );
+        for gate in gates.drain(..) {
+            drop(gate);
+        }
+        for holder in holders {
+            holder.join().unwrap();
+        }
+        service
+            .list_dir(as_default(scion_proto::v1::ListDirRequest {
+                repo: "r".into(),
+                changeset_id: head.as_bytes().to_vec(),
+                path: Vec::new(),
+            }))
+            .await
+            .expect("the fresh call lists, deriving now");
+    }
+
+    #[tokio::test]
+    async fn a_cancelled_get_root_tree_stops_its_derive_and_frees_its_reader() {
+        let readers = crate::store::READERS;
+        let (_dir, store, _service, objects, head, _path) = cold_derive_fixture(6, readers);
+        let (mut gates, holders) = hold_readers(&store, readers);
+        let call = tokio::spawn({
+            let objects = Arc::clone(&objects);
+            async move {
+                objects
+                    .get_root_tree(as_bearer(scion_proto::v1::GetRootTreeRequest {
+                        repo: "r".into(),
+                        changeset_id: head.as_bytes().to_vec(),
+                    }))
+                    .await
+            }
+        });
+        wait_job_claimed(objects.worker()).await;
+        call.abort();
+        assert!(call.await.unwrap_err().is_cancelled());
+        drop(gates.remove(0));
+        wait_job_ended(objects.worker()).await;
+        assert!(
+            store
+                .read(
+                    |c| crate::derived::load::<crate::tree::RootTree>(c, head).map(|v| v.is_none())
+                )
+                .unwrap(),
+            "the cancelled call derived the root tree"
+        );
+        for gate in gates.drain(..) {
+            drop(gate);
+        }
+        for holder in holders {
+            holder.join().unwrap();
+        }
+        objects
+            .get_root_tree(as_bearer(scion_proto::v1::GetRootTreeRequest {
+                repo: "r".into(),
+                changeset_id: head.as_bytes().to_vec(),
+            }))
+            .await
+            .expect("the fresh call answers, deriving now");
+    }
+
+    /// The proof #868 asks for, on a real long phase: a large tree's
+    /// store parks mid-build, its call cancels, and a live call times
+    /// its wait for the permit. With the per-path check in the build,
+    /// the cancelled job stops at the next path and the wait is a check
+    /// interval, not the rest of the build; the number lands in the CI
+    /// log.
+    #[allow(clippy::too_many_lines)] // the large changeset's fixture is the length
+    #[tokio::test(flavor = "multi_thread")]
+    async fn a_cancelled_large_tree_store_frees_its_permit_at_the_next_path() {
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
+        let repo_id = store.write(|c| c.create_repo("r")).unwrap();
+        // A large changeset: 2,000 paths, two blobs alternating, so the
+        // build runs long enough to park mid-way.
+        let one = store.blobs().put(b"one\n").unwrap();
+        let two = store.blobs().put(b"two\n").unwrap();
+        let state = |blob| {
+            Some(FileState::Regular {
+                content: blob,
+                executable: false,
+            })
+        };
+        let root = Changeset::new(
+            vec![],
+            IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0)
+                .expect("changeset fits the format"),
+            None,
+            b"root".to_vec(),
+            [(RepoPath::new("seed").unwrap(), state(one))].into(),
+        )
+        .expect("changeset fits the format");
+        let root = store
+            .write(|c| {
+                let root = c.insert_changeset(repo_id, &root)?;
+                assert!(c.cas_ref(repo_id, "main", None, root)?);
+                c.add_repo_blobs(repo_id, &[one, two])?;
+                Ok(root)
+            })
+            .unwrap();
+        let changes: std::collections::BTreeMap<RepoPath, Option<FileState>> = (0..2000)
+            .map(|i| {
+                (
+                    RepoPath::new(format!("cancel-proof/{i:04}")).unwrap(),
+                    state(if i % 2 == 0 { one } else { two }),
+                )
+            })
+            .collect();
+        let cs = Changeset::new(
+            vec![root],
+            IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0)
+                .expect("changeset fits the format"),
+            None,
+            b"a large tree".to_vec(),
+            changes,
+        )
+        .expect("changeset fits the format");
+        let bytes = cs.encode();
+        let service = Arc::new(test_service(store.clone()));
+        // The build parks at the end of its first put's path; the call
+        // cancels while it waits, and the park then lets the job reach
+        // the next path's check, which reads the cancel and stops.
+        let hooks = dir.path().join("hooks");
+        std::fs::create_dir_all(&hooks).unwrap();
+        write::PARK_APPLY.arm(&hooks);
+        // The park's id is the path: this test's paths name no other
+        // build, so no other job parks on the armed seam.
+        std::fs::write(hooks.join("park-cancel-proof_0000"), b"").unwrap();
+        let call = tokio::spawn({
+            let service = Arc::clone(&service);
+            let bytes = bytes.clone();
+            async move {
+                service
+                    .create_changeset(as_default(scion_proto::v1::CreateChangesetRequest {
+                        repo: "r".into(),
+                        changeset: bytes,
+                    }))
+                    .await
+            }
+        });
+        let parked = hooks.join("parked-cancel-proof_0000");
+        let started = Instant::now();
+        while !parked.exists() {
+            assert!(
+                started.elapsed() < Duration::from_secs(10),
+                "the build never parked"
+            );
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        call.abort();
+        // Joining puts the guard's drop (the cancel) before the lift.
+        assert!(call.await.unwrap_err().is_cancelled());
+        // The next path's park stands ready before the lift: a job with
+        // no put-path check reaches path 1 and parks there; the check
+        // stops it before that. The arm stays up for this window.
+        std::fs::write(hooks.join("park-cancel-proof_0001"), b"").unwrap();
+        std::fs::remove_file(hooks.join("park-cancel-proof_0000")).unwrap();
+        // A window for the job to reach path 1 if its check is gone:
+        // the window closes after 500 ms, and a job that parked in it
+        // fails the assert below; the checked job never parks.
+        let started = Instant::now();
+        while !hooks.join("parked-cancel-proof_0001").exists()
+            && started.elapsed() < Duration::from_millis(500)
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(
+            !hooks.join("parked-cancel-proof_0001").exists(),
+            "the cancelled job walked past its next path's check and \
+             parked within {:?}",
+            started.elapsed()
+        );
+        std::fs::remove_file(hooks.join("park-cancel-proof_0001")).unwrap();
+        write::PARK_APPLY.lift();
+        // The live call times its wait for the permit the parked job
+        // held. The job's next path check stops it first.
+        let started = Instant::now();
+        service.worker.run(|_| Ok(())).await.unwrap();
+        let waited = started.elapsed();
+        eprintln!(
+            "#868 real phase: the live call waited {waited:?} for the permit \
+             of a cancelled large tree's store"
+        );
+        assert!(
+            waited < Duration::from_secs(5),
+            "the live call waited past a check interval: {waited:?}"
+        );
+        // The build rolled back: no changeset row, no tree rows.
+        let id = write::decode(&bytes).unwrap().1;
+        let stored = store
+            .read(|c| c.stored_changeset_body_lengths(&[id.as_bytes().to_vec()]))
+            .unwrap();
+        assert!(
+            stored.iter().all(|(_, len)| *len == 0),
+            "the cancelled build wrote nothing"
+        );
     }
 
     /// A call cut while its `CreateChangeset` hashed blobs: the job stops
@@ -3036,8 +4300,8 @@ mod tests {
         Vec<u8>,
         scion_core::BlobId,
     ) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
         let one = store.blobs().put(b"one\n").unwrap();
         let two = store.blobs().put(b"two\n").unwrap();
         let state = |blob| {
@@ -3111,8 +4375,8 @@ mod tests {
     async fn a_land_whose_call_failed_moves_its_counter() {
         // main moved past the changeset's parent, so the land's plan has
         // a walk to make: the spent deadline stops it at its first check.
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
         let blob = store.blobs().put(b"x").unwrap();
         let put = |parents, path: &str| {
             Changeset::new(
@@ -3164,81 +4428,6 @@ mod tests {
         assert!(!text.contains("outcome=\"landed\""), "{text}");
     }
 
-    /// A land whose call fails on a full disk moves the land counter for
-    /// the class the caller read: the server is out of space, so the
-    /// reply is `resource_exhausted`, and the operator sees the failed
-    /// land.
-    #[tokio::test]
-    async fn a_land_that_hits_a_full_disk_moves_its_counter() {
-        let (_dir, store, cs) = landed_store();
-        if Backend::test_is_postgres() {
-            // The page cap is a data-directory hook; the Postgres disk
-            // full is the SQLSTATE 53100 arm of the pg mapping, a unit
-            // test of pg.rs, and it feeds the same counter code.
-            return;
-        }
-        let store = store
-            .as_sqlite()
-            .expect("the page cap is a data-directory test");
-        // The land's own changeset must grow the file past its cap: two
-        // thousand files, far past any space the setup left free.
-        store.cap_database_pages(0);
-        let metrics = Arc::new(Metrics::default());
-        let service = counting_service(&Backend::sqlite(store.clone()), &metrics);
-        let request = as_default(scion_proto::v1::LandRequest {
-            repo: "r".into(),
-            changeset_id: cs.as_bytes().to_vec(),
-            target_ref: "main".into(),
-            request_key: "k".into(),
-        });
-        let status = service.land(request).await.expect_err("out of space");
-        assert_eq!(status.code(), Code::ResourceExhausted);
-        let text = metrics.render();
-        assert!(
-            text.contains("scion_lands_total{outcome=\"resource_exhausted\"} 1\n"),
-            "{text}"
-        );
-    }
-
-    /// A repo with a root changeset under `main`, and a child changeset
-    /// ready to land: two thousand files, so its landed changeset must
-    /// grow the metadata file.
-    fn landed_store() -> (tempfile::TempDir, Backend, ChangesetId) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
-        let blob = store.blobs().put(b"x").unwrap();
-        let mut files = Vec::new();
-        for i in 0..2000 {
-            files.push((
-                RepoPath::new(format!("f{i:04}").into_bytes()).unwrap(),
-                Some(FileState::Regular {
-                    content: blob,
-                    executable: false,
-                }),
-            ));
-        }
-        let changeset = |parents, changes| {
-            Changeset::new(
-                parents,
-                IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0)
-                    .expect("identity fits the format"),
-                None,
-                vec![],
-                changes,
-            )
-            .expect("changeset fits the format")
-        };
-        let cs = store
-            .write(|c| {
-                let repo = c.create_repo("r")?;
-                let root = c.insert_changeset(repo, &changeset(vec![], [].into()))?;
-                assert!(c.cas_ref(repo, "main", None, root)?);
-                c.insert_changeset(repo, &changeset(vec![root], files.into_iter().collect()))
-            })
-            .unwrap();
-        (dir, store, cs)
-    }
-
     #[tokio::test]
     async fn a_read_file_call_waits_for_its_share_before_it_reads() {
         let data = content(2);
@@ -3278,6 +4467,519 @@ mod tests {
         assert!(read_all(second).await == data, "the second reply");
     }
 
+    /// The three shapes a wrong `read_share` can take, each killed on
+    /// the pool every reply shares: a smaller long-file share (the reply
+    /// serves where the true share parks), a bigger one (the reply parks
+    /// where the true share serves), and the branch flipped (a short
+    /// file's measured share replaced by the reader's, which a pool
+    /// sized for the measured share cannot grant). Each test holds the
+    /// service's one pool - the one every call shares - the way a
+    /// busy server holds it.
+    #[tokio::test]
+    async fn a_long_file_whose_share_does_not_fit_the_pool_is_not_served() {
+        let data = content(2);
+        let (_dir, store, cs, _) = file_store(&data);
+        let service = test_service(store);
+        // One permit short of the reply's whole share, spelled from the
+        // constants and not from read_share: a test that measures its
+        // hold with the function under test measures with the mutant.
+        // The true share of a two-part file is READER_BYTES plus two
+        // parts; the mutant's every smaller answer fits the pool and
+        // serves at once, which is the lie this test refuses.
+        let true_share = READER_BYTES + 2 * CHUNK_BYTES;
+        let reads = Arc::clone(&service.reads);
+        let hold = reads
+            .acquire_many(u32::try_from(READ_BUDGET_BYTES - true_share + 1).unwrap())
+            .await
+            .expect("the pool is whole");
+        let request = as_default(ReadFileRequest {
+            repo: "r".into(),
+            changeset_id: cs.as_bytes().to_vec(),
+            path: b"f".to_vec(),
+        });
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let got = block_on(service.read_file(request));
+            let _ = tx.send(got.is_ok());
+        });
+        tokio::time::sleep(Duration::from_secs(2)).await;
+        assert!(
+            rx.try_recv().is_err(),
+            "a share the pool cannot pay is not served"
+        );
+        drop(hold);
+        let served = rx
+            .recv_timeout(Duration::from_secs(30))
+            .expect("the reply lands once the pool frees");
+        assert!(served, "the body is served once the pool frees");
+    }
+
+    #[tokio::test]
+    async fn a_short_file_is_served_from_the_share_its_size_measures() {
+        let data = b"short file".to_vec();
+        let (_dir, store, cs, _) = file_store(&data);
+        // Room for the measured share of this file - its own size - and
+        // not one reader-window more.
+        let service = Arc::new(ScionService {
+            reads: Arc::new(Semaphore::new(data.len())),
+            ..test_service(store)
+        });
+        let mut reply = tokio::time::timeout(
+            Duration::from_secs(30),
+            service.read_file(as_default(ReadFileRequest {
+                repo: "r".into(),
+                changeset_id: cs.as_bytes().to_vec(),
+                path: b"f".to_vec(),
+            })),
+        )
+        .await
+        .expect("a short file's measured share fits the pool")
+        .unwrap()
+        .into_inner();
+        let part = tokio::time::timeout(Duration::from_secs(30), reply.next())
+            .await
+            .expect("the part reads")
+            .expect("the file streams")
+            .expect("the part reads");
+        assert_eq!(part.data, data, "the file's content comes back");
+    }
+
+    /// A log entry whose encoded body is `want` bytes: the message is
+    /// padded until the encoding lands on the size, so a test speaks in
+    /// exact part sizes whatever the encoding's own overhead is.
+    fn an_entry(id: u8, want: usize) -> (ChangesetId, Changeset) {
+        let mut message = vec![b'm'; want];
+        let build = |message: &[u8]| {
+            Changeset::new(
+                vec![],
+                IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0)
+                    .expect("identity fits the format"),
+                None,
+                message.to_vec(),
+                [].into(),
+            )
+            .expect("the changeset fits the format")
+        };
+        let mut changeset = build(&message);
+        while changeset.encode().len() > want {
+            message.pop();
+            changeset = build(&message);
+        }
+        while changeset.encode().len() < want {
+            message.push(b'x');
+            changeset = build(&message);
+        }
+        (ChangesetId::try_from(&[id; 32][..]).unwrap(), changeset)
+    }
+
+    /// A walk whose `left` covers the page and whose continuation is
+    /// some id: `log_page_parts` reads only these two.
+    fn a_walk(store: Backend) -> LogWalk {
+        LogWalk {
+            worker: Worker::new(store),
+            repo: "r".to_owned(),
+            graph_queries: Arc::new(Semaphore::new(1)),
+            _call: Call::default(),
+            next: Some(ChangesetId::try_from(&[9_u8; 32][..]).unwrap()),
+            left: 10,
+            path: None,
+            deadline: Deadline::new(std::time::Instant::now() + Duration::from_secs(600)),
+            stalled: None,
+        }
+    }
+
+    /// The page splitter groups entries so a part's encoded bytes stay
+    /// within one chunk: an entry too big for a whole part is its own
+    /// part, an entry that would fill the part exactly stays, and an
+    /// entry that would pass the bound starts the next part. The bound
+    /// is what keeps one streamed part under the message cap, and a
+    /// wrong grouping is a reply the client cannot take.
+    #[test]
+    fn a_log_page_splits_at_the_chunk_bound() {
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
+        let over = CHUNK_BYTES + 1_000;
+        let mut walk = a_walk(store);
+        let entries = vec![
+            an_entry(b'a', over),
+            an_entry(b'b', CHUNK_BYTES - 2_000),
+            an_entry(b'c', 2_000),
+            an_entry(b'd', 1_000),
+        ];
+        let parts = log_page_parts(entries, &mut walk);
+        // The walk spends its `left` on the whole page: four entries in,
+        // four out, and the sizes are the entries' own encodings - the
+        // entry that would pass the bound starts a part of its own.
+        assert_eq!(walk.left, 6, "the walk still owes after the page");
+        // The entries' real encodings decide the grouping; the test
+        // reads the sizes back out of the parts and checks the rule on
+        // them, so the encoder's own overhead cannot flatter it.
+        let part_of = |name: u8| {
+            parts
+                .iter()
+                .position(|p| p.entries.iter().any(|e| e.changeset_id[0] == name))
+                .unwrap_or_else(|| panic!("the entry {} is in a part", name as char))
+        };
+        let size_of = |name: u8| {
+            parts[part_of(name)]
+                .entries
+                .iter()
+                .find(|e| e.changeset_id[0] == name)
+                .map(|e| e.changeset.len())
+                .unwrap()
+        };
+        assert!(size_of(b'a') > CHUNK_BYTES, "a alone is over the chunk");
+        assert_eq!(part_of(b'a'), 0, "a is the first part");
+        assert_eq!(
+            parts[1]
+                .entries
+                .iter()
+                .map(|e| e.changeset.len())
+                .sum::<usize>(),
+            CHUNK_BYTES,
+            "b and c fill their part exactly: the bound is met, not passed"
+        );
+        assert_eq!(
+            parts[0].entries.len(),
+            1,
+            "the over-chunk entry shares its part with nobody"
+        );
+        assert_eq!(part_of(b'b'), 1, "b starts its own part: a's part is over");
+        assert_eq!(
+            part_of(b'c'),
+            1,
+            "c fills b's part exactly: the bound is not passed, so it stays"
+        );
+        assert_eq!(
+            part_of(b'd'),
+            2,
+            "d starts the next part: adding it would pass the bound"
+        );
+        assert_eq!(parts.len(), 3, "the page splits into three parts");
+
+        // The last part carries where the walk continues; none before
+        // it does.
+        assert_eq!(
+            parts.last().unwrap().next_changeset_id,
+            vec![9_u8; 32],
+            "the last part carries the walk's continuation"
+        );
+        for part in &parts[..parts.len() - 1] {
+            assert!(
+                part.next_changeset_id.is_empty(),
+                "only the last part carries the continuation"
+            );
+        }
+    }
+
+    /// The blame splitter groups ranges so each part's encoded bytes -
+    /// the ranges plus the changesets they name that no earlier part
+    /// carried - stay within one chunk. The first part here fills the
+    /// bound exactly: the splitter keeps an exact fill and splits only
+    /// past it. A named changeset rides the first part that names it,
+    /// once, and the walk's cursor rides only the last part.
+    #[test]
+    fn a_blame_page_splits_at_the_chunk_bound() {
+        let big = |name: u8, want: usize| BlameChangeset {
+            changeset_id: vec![name; 32],
+            author_name: vec![b'n'; want],
+            author_email: b"e@x".to_vec(),
+            author_unix_secs: 0,
+            author_tz_offset_minutes: 0,
+            path: b"f".to_vec(),
+        };
+        let range = |name: u8| BlameRange {
+            start_line: 1,
+            line_count: 1,
+            changeset_id: vec![name; 32],
+            origin_line: 1,
+        };
+        let named = range(b'z');
+        let range_bytes = named.encoded_len();
+        // Size the changeset's body so two ranges with it fill a part
+        // exactly and three pass the bound: the splitter must split
+        // between the second and the third. The author-name padding
+        // tunes the body to the byte, but the encoding's own length
+        // field steps as the padding crosses a varint boundary, so scan
+        // down for a name whose encode lands exactly on the target.
+        let base = big(b'z', 0).encoded_len();
+        let target = CHUNK_BYTES - 2 * range_bytes;
+        let cs = (0..8)
+            .map(|down| big(b'z', target - base - down))
+            .find(|c| c.encoded_len() == target)
+            .expect("a body sized to the byte exists near the target");
+        let cs_bytes = cs.encoded_len();
+        let mut send = BlameSend {
+            // Three ranges naming the same changeset: its body rides the
+            // first part only, the second range fills the part exactly,
+            // and the third passes the bound and starts the next part.
+            ranges: vec![named.clone(), named.clone(), named],
+            changesets: vec![cs],
+            cursor: b"cursor".to_vec(),
+            _call: Call::default(),
+            stalled: None,
+        };
+        let parts = blame_page_parts(&mut send);
+        assert_eq!(parts.len(), 2, "the third range passes the bound");
+        assert_eq!(
+            parts[0]
+                .ranges
+                .iter()
+                .map(prost::Message::encoded_len)
+                .sum::<usize>()
+                + parts[0]
+                    .changesets
+                    .iter()
+                    .map(prost::Message::encoded_len)
+                    .sum::<usize>(),
+            CHUNK_BYTES,
+            "the first part is exactly full: the exact fill is kept, not split"
+        );
+        assert_eq!(
+            parts[1]
+                .ranges
+                .iter()
+                .map(prost::Message::encoded_len)
+                .sum::<usize>(),
+            range_bytes,
+            "the second part holds the third range alone"
+        );
+        let carried: Vec<usize> = parts
+            .iter()
+            .map(|p| p.changesets.iter().map(prost::Message::encoded_len).sum())
+            .collect();
+        assert_eq!(
+            carried,
+            vec![cs_bytes, 0],
+            "the named changeset rides the first part that names it, once"
+        );
+        for (i, part) in parts.iter().enumerate() {
+            let total: usize = part
+                .ranges
+                .iter()
+                .map(prost::Message::encoded_len)
+                .sum::<usize>()
+                + part
+                    .changesets
+                    .iter()
+                    .map(prost::Message::encoded_len)
+                    .sum::<usize>();
+            assert!(
+                total <= CHUNK_BYTES,
+                "part {i} stays within the chunk: {total}"
+            );
+        }
+        assert_eq!(
+            parts.last().unwrap().next_cursor,
+            b"cursor".to_vec(),
+            "the last part carries the walk's cursor"
+        );
+        for part in &parts[..parts.len() - 1] {
+            assert!(
+                part.next_cursor.is_empty(),
+                "only the last part carries the cursor"
+            );
+        }
+    }
+
+    /// A streamed `Log` walks page after page until the history ends or
+    /// the call has served its `limit`: the reply carries every entry
+    /// once, in order, and stops there. The stop's own condition is what
+    /// the unit run's misses at 1579 break: one stops the reply at the
+    /// first page (a history past one scan page loses its tail), the
+    /// other keeps walking past the limit and dies mid-page.
+    #[tokio::test]
+    async fn a_log_walks_to_its_limit_and_no_further() {
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
+        // A history of one scan page plus a tail: the first page ends
+        // before the limit, so the walk must fetch the second page.
+        let count = read::MAX_SCAN + 5;
+        let (_repo, tip) = store
+            .write(|c| {
+                let repo = c.create_repo("r")?;
+                let mut parent = None;
+                for i in 0..count {
+                    let cs = Changeset::new(
+                        parent.iter().copied().collect(),
+                        IdentityTime::new(b"t".to_vec(), b"t@x".to_vec(), 0, 0)
+                            .expect("identity fits the format"),
+                        None,
+                        format!("cs {i}\n").into_bytes(),
+                        [].into(),
+                    )
+                    .expect("changeset fits the format");
+                    let (id, _) = crate::tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?;
+                    parent = Some(id);
+                }
+                Ok((repo, parent.unwrap()))
+            })
+            .unwrap();
+        let service = test_service(store);
+        let mut reply = service
+            .log(as_default(LogRequest {
+                repo: "r".to_owned(),
+                changeset_id: tip.as_bytes().to_vec(),
+                limit: u32::try_from(count).expect("the count fits a u32"),
+                path: Vec::new(),
+            }))
+            .await
+            .expect("the reply opens")
+            .into_inner();
+        let mut seen: Vec<Vec<u8>> = Vec::new();
+        while let Some(part) = tokio::time::timeout(Duration::from_secs(30), reply.next())
+            .await
+            .expect("the reply keeps moving")
+        {
+            let part = part.expect("the reply streams");
+            for entry in part.entries {
+                seen.push(entry.changeset_id);
+            }
+        }
+        assert_eq!(seen.len(), count, "every entry of the history arrives");
+        let mut sorted = seen.clone();
+        sorted.sort();
+        sorted.dedup();
+        assert_eq!(sorted.len(), count, "no entry repeats: {sorted:?}");
+
+        // A limit the history runs past: the reply ends at the limit,
+        // its last part carries the walk's continuation, and no part
+        // without entries follows - a walk that runs past its limit
+        // serves an entry-less part and stops one page later.
+        let head = tip.as_bytes().to_vec();
+        let mut reply = service
+            .log(as_default(LogRequest {
+                repo: "r".to_owned(),
+                changeset_id: head,
+                limit: 5,
+                path: Vec::new(),
+            }))
+            .await
+            .expect("the reply opens")
+            .into_inner();
+        let mut parts = 0;
+        let mut served = 0;
+        while let Some(part) = tokio::time::timeout(Duration::from_secs(30), reply.next())
+            .await
+            .expect("the reply keeps moving")
+        {
+            let part = part.expect("the reply streams");
+            parts += 1;
+            served += part.entries.len();
+            assert!(!part.entries.is_empty(), "an entry-less part arrives");
+        }
+        assert_eq!(served, 5, "the reply serves exactly the limit");
+        assert_eq!(parts, 1, "the five small entries ride one part");
+    }
+
+    /// The overrides are off unless a test arms them: the production
+    /// path returns the real constants, and a run that never armed the
+    /// overrides must poll and bound the statvfs with them. A mutant
+    /// that breaks the override's own comparison answers zero millis
+    /// here - a poll that ticks flat out and a stat bound of no time.
+    #[tokio::test]
+    async fn the_free_space_overrides_off_leave_the_real_constants() {
+        // The overrides are the stuck tests' globals: hold their slot,
+        // so this test's zeroing cannot race a running poll.
+        let _slot = free_space_poll_slot().await;
+        FREE_SPACE_POLL_OVERRIDE.store(0, Ordering::Relaxed);
+        FREE_SPACE_STAT_BOUND_OVERRIDE.store(0, Ordering::Relaxed);
+        assert_eq!(free_space_poll_period(), FREE_SPACE_POLL);
+        assert_eq!(free_space_stat_bound(), FREE_SPACE_STAT_BOUND);
+    }
+
+    /// A request's `x-request-id` names the call's audit lines, and a
+    /// call that sent none still gets one the server made, so every
+    /// line it leaves carries a `request_id` its pair can be found by.
+    #[test]
+    fn a_request_id_names_the_call_and_one_is_made_when_none_sent() {
+        let mut request = as_default(CreateChangesetRequest::default());
+        request.metadata_mut().insert(
+            scion_proto::runtime::request_id::REQUEST_ID,
+            "abc-123".parse().expect("a visible-ascii id parses"),
+        );
+        assert_eq!(request_id_of(&request), "abc-123");
+        let made = request_id_of(&as_default(CreateChangesetRequest::default()));
+        assert!(
+            !made.is_empty() && made != "xyzzy",
+            "a call without an id gets one the server made: {made:?}"
+        );
+        // The server-made id is not a constant either: two calls that
+        // send none do not share one.
+        let again = request_id_of(&as_default(CreateChangesetRequest::default()));
+        assert_ne!(made, again, "two made ids differ");
+    }
+
+    /// The audit's ref values are the content ids' lowercase hex: a
+    /// reader that pairs a line's `old` and `new` with a ref it knows
+    /// reads the same spelling the ids print in.
+    #[test]
+    fn a_hex_id_is_the_bytes_lowercase_hex() {
+        let mut bytes = [0xff_u8; 32];
+        bytes[0] = 0x0a;
+        let id = ChangesetId::try_from(&bytes[..]).unwrap();
+        let hex = hex_id(id.as_bytes());
+        assert_eq!(hex.len(), 64, "a 32-byte id prints 64 hex digits");
+        assert!(hex.starts_with("0aff"), "the bytes print in order: {hex}");
+        assert!(
+            hex.bytes().all(|b| b.is_ascii_hexdigit()),
+            "only hex digits: {hex}"
+        );
+        assert_eq!(hex, hex.to_lowercase(), "the digits are lowercase");
+        assert_eq!(hex_id(&[]), "", "an empty id prints nothing");
+    }
+
+    /// The tx-age gauge samples the oldest open Postgres read
+    /// transaction: a read parked across the sample's period shows in
+    /// the gauge, so a stuck oldest read is visible to a scrape.
+    #[tokio::test(flavor = "multi_thread")]
+    async fn the_pg_tx_age_gauge_samples_the_oldest_open_read() {
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
+        let (blockers, arrived) = hold_read_connections(&store);
+        let metrics = Arc::new(Metrics::default());
+        let (_stop_tx, stop_rx) = tokio::sync::watch::channel(());
+        tokio::spawn(pg_tx_age_sample(
+            store.clone(),
+            Arc::clone(&metrics),
+            stop_rx,
+        ));
+        assert!(
+            arrived.recv_timeout(Duration::from_secs(10)).is_ok(),
+            "the read parked"
+        );
+        // The gauge moves on the sample's own ticks: poll it, every
+        // 200 ms, until the parked read's age crosses a second - a
+        // sample that never runs would answer zero for ever.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(30);
+        let age = loop {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the gauge never showed the parked read's age"
+            );
+            let text = metrics.render();
+            let line = text
+                .lines()
+                .find(|l| l.starts_with("scion_pg_tx_age_seconds "))
+                .expect("the gauge renders");
+            let age: f64 = line
+                .rsplit(' ')
+                .next()
+                .unwrap()
+                .parse()
+                .expect("the gauge renders a number");
+            if age >= 1.0 {
+                break age;
+            }
+        };
+        assert!(age >= 1.0, "the oldest open read's age shows: {age}");
+        for (blocker, release) in blockers {
+            let _ = release.send(());
+            let _ = blocker.join();
+        }
+    }
+
     type Blocker = (
         std::thread::JoinHandle<Result<(), crate::error::Error>>,
         std::sync::mpsc::Sender<()>,
@@ -3311,14 +5013,24 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread")]
+    // The guard is the suite's gate: it must span the whole test, awaits
+    // included, or two backends run at once and the database runs out
+    // of connections (E53300).
+    #[allow(clippy::await_holding_lock)]
     async fn at_most_max_graph_queries_run_at_once() {
-        // root ─ a, and root ─ b.
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        // root ─ a, and root ─ b. The pool is the server's size: the test
+        // holds every read connection, so the cap's wait is visible. The
+        // gate keeps it alone among the suite's backends, or the database
+        // runs out of connections (E53300).
+        let _pool = crate::pg::pool_tests::SERVER_SIZED_POOL
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test_with_readers(dir.path(), crate::store::READERS).unwrap();
         let ids = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
-                db::testing::insert_graph(c.sqlite().unwrap(), repo, &[vec![], vec![0], vec![0]])
+                testing::insert_graph(c, repo, &[vec![], vec![0], vec![0]])
             })
             .unwrap();
         let bytes = |i: usize| ids[i].as_bytes().to_vec();
@@ -3419,8 +5131,8 @@ mod tests {
 
     #[tokio::test]
     async fn a_worker_panic_does_not_reach_the_client() {
-        let dir = tempfile::tempdir().unwrap();
-        let worker = Worker::new(Backend::sqlite(Store::open(dir.path()).unwrap()));
+        let dir = crate::test_support::private_tempdir();
+        let worker = Worker::new(Backend::open_test(dir.path()).unwrap());
         let status = worker
             .run(|_| -> Result<()> { panic!("secret detail") })
             .await
