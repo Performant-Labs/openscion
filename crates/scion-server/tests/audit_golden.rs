@@ -79,6 +79,8 @@ impl Interceptor for WriteCall {
 }
 
 type Writer = ScionClient<InterceptedService<Channel, WriteCall>>;
+type ReviewWriter =
+    scion_proto::v1::review_client::ReviewClient<InterceptedService<Channel, WriteCall>>;
 
 fn hex(name: &str) -> String {
     blake3::Hash::from(token_digest(name)).to_hex().to_string()
@@ -226,6 +228,19 @@ async fn writer(url: &str, request_id: &str) -> Writer {
     ScionClient::with_interceptor(channel, WriteCall(request_id.to_owned()))
 }
 
+/// A review call with an `x-request-id`, so the pairs join.
+async fn review_writer(url: &str, request_id: &str) -> ReviewWriter {
+    let channel = Channel::from_shared(url.to_owned())
+        .unwrap()
+        .connect()
+        .await
+        .unwrap();
+    scion_proto::v1::review_client::ReviewClient::with_interceptor(
+        channel,
+        WriteCall(request_id.to_owned()),
+    )
+}
+
 /// A changeset with one parent that deletes `path`.
 /// A changeset with one parent that puts `path`.
 fn changeset(
@@ -260,7 +275,7 @@ fn changeset(
 /// A writer's access: the `ci` token may change every path of `main`.
 fn write_access() -> Access {
     let text = format!(
-        "token\tci\t{}\nwrite\tci\t{REPO}\nread\tci\t{REPO}\n",
+        "token\tci\t{}\nwrite\tci\t{REPO}\nread\tci\t{REPO}\nreview\tci\t{REPO}\n",
         hex("ci")
     );
     Access::parse(&text).expect("the access file parses")
@@ -367,6 +382,9 @@ fn the_audit_census_of_the_source_is_complete() {
             "land/failed",
             "land/ok",
             "ref/ok",
+            "review/failed",
+            "review/intent",
+            "review/ok",
             "write/failed",
             "write/ok",
         ],
@@ -542,6 +560,43 @@ async fn write_derive_migrate_ticket_lines(audit: &Audit) {
     }
 }
 
+/// A review change that goes through, and one its job refuses: an
+/// author does not approve its own proposal. Leaves a write pair, a
+/// review intent and ok, and a review intent and failed.
+async fn review_lines(url: &str, root: scion_core::ChangesetId, blob: scion_core::BlobId) {
+    let (bytes, proposed) = changeset(vec![root], "docs/proposed", blob).encode_with_id();
+    let mut ci = writer(url, "t-create-p").await;
+    ci.create_changeset(CreateChangesetRequest {
+        repo: REPO.into(),
+        changeset: bytes,
+    })
+    .await
+    .expect("the create is allowed");
+    let mut reviewer = review_writer(url, "t-propose").await;
+    let p = reviewer
+        .create_proposal(scion_proto::v1::CreateProposalRequest {
+            repo: REPO.into(),
+            target_ref: "main".into(),
+            changeset_id: proposed.as_bytes().to_vec(),
+            title: "docs".into(),
+            description: String::new(),
+        })
+        .await
+        .expect("the proposal is allowed")
+        .into_inner();
+    let mut reviewer = review_writer(url, "t-review").await;
+    reviewer
+        .submit_review(scion_proto::v1::SubmitReviewRequest {
+            repo: REPO.into(),
+            number: p.number,
+            verdict: scion_proto::v1::Verdict::Approve.into(),
+            changeset_id: proposed.as_bytes().to_vec(),
+            body: String::new(),
+        })
+        .await
+        .expect_err("an author does not approve its own proposal");
+}
+
 async fn exercise() -> (tempfile::TempDir, std::path::PathBuf) {
     use scion_proto::v1::{PutBlobRequest, ResolveRefRequest};
     use tokio_stream::once;
@@ -610,6 +665,8 @@ async fn exercise() -> (tempfile::TempDir, std::path::PathBuf) {
     .await
     .expect("the land is allowed");
 
+    review_lines(&url, root, blob).await;
+
     // A land whose job stalls past its own deadline. The setup: a
     // changeset that can land cleanly, main moved past the land's
     // index so its walk has steps, and a blocker that holds the
@@ -629,7 +686,7 @@ async fn exercise() -> (tempfile::TempDir, std::path::PathBuf) {
     stop.send(()).unwrap();
     wait_for_kind(&audit_path, "auth", "refused").await;
     wait_for_kind(&audit_path, "land", "failed").await;
-    wait_for_lines(&audit_path, 15).await;
+    wait_for_lines(&audit_path, 21).await;
 
     // The collector's own admin lines: one run of the gc subcommand,
     // against its own empty store, appending to this same audit file.
@@ -659,7 +716,7 @@ async fn exercise() -> (tempfile::TempDir, std::path::PathBuf) {
     let audit = Audit::open(&audit_path).unwrap();
     write_import_restore_lines(&audit).await;
     write_derive_migrate_ticket_lines(&audit).await;
-    wait_for_lines(&audit_path, 26).await;
+    wait_for_lines(&audit_path, 32).await;
     (dir, audit_path)
 }
 

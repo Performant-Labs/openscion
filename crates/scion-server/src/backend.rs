@@ -1131,6 +1131,167 @@ impl MetaTx for BackendTx<'_> {
             Self::Postgres(pg) => pg.imported_commits(repo),
         }
     }
+
+    // Proposals and their review (review.rs).
+
+    fn insert_proposal(&mut self, repo: RepoId, row: &crate::review::ProposalRow) -> Result<i64> {
+        match self {
+            Self::Sqlite(tx) => tx.insert_proposal(repo, row),
+            Self::Postgres(pg) => pg.insert_proposal(repo, row),
+        }
+    }
+
+    fn proposal(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+    ) -> Result<Option<crate::review::ProposalRow>> {
+        match self {
+            Self::Sqlite(tx) => tx.proposal(repo, number),
+            Self::Postgres(pg) => pg.proposal(repo, number),
+        }
+    }
+
+    fn proposals(
+        &mut self,
+        repo: RepoId,
+        state: Option<crate::review::ProposalStatus>,
+        target_ref: Option<&str>,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::review::ProposalRow>> {
+        match self {
+            Self::Sqlite(tx) => tx.proposals(repo, state, target_ref, after, limit),
+            Self::Postgres(pg) => pg.proposals(repo, state, target_ref, after, limit),
+        }
+    }
+
+    fn put_proposal(&mut self, repo: RepoId, row: &crate::review::ProposalRow) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.put_proposal(repo, row),
+            Self::Postgres(pg) => pg.put_proposal(repo, row),
+        }
+    }
+
+    fn open_proposal_with_head(
+        &mut self,
+        repo: RepoId,
+        target_ref: &str,
+        head: ChangesetId,
+    ) -> Result<Option<i64>> {
+        match self {
+            Self::Sqlite(tx) => tx.open_proposal_with_head(repo, target_ref, head),
+            Self::Postgres(pg) => pg.open_proposal_with_head(repo, target_ref, head),
+        }
+    }
+
+    fn add_proposal_head(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        row: &crate::review::HeadRow,
+    ) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.add_proposal_head(repo, number, row),
+            Self::Postgres(pg) => pg.add_proposal_head(repo, number, row),
+        }
+    }
+
+    fn proposal_heads(&mut self, repo: RepoId, number: i64) -> Result<Vec<crate::review::HeadRow>> {
+        match self {
+            Self::Sqlite(tx) => tx.proposal_heads(repo, number),
+            Self::Postgres(pg) => pg.proposal_heads(repo, number),
+        }
+    }
+
+    fn add_proposal_review(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        row: &crate::review::ReviewRow,
+    ) -> Result<()> {
+        match self {
+            Self::Sqlite(tx) => tx.add_proposal_review(repo, number, row),
+            Self::Postgres(pg) => pg.add_proposal_review(repo, number, row),
+        }
+    }
+
+    fn proposal_reviews(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+    ) -> Result<Vec<crate::review::ReviewRow>> {
+        match self {
+            Self::Sqlite(tx) => tx.proposal_reviews(repo, number),
+            Self::Postgres(pg) => pg.proposal_reviews(repo, number),
+        }
+    }
+
+    fn add_review_thread(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        row: &crate::review::ThreadRow,
+    ) -> Result<i64> {
+        match self {
+            Self::Sqlite(tx) => tx.add_review_thread(repo, number, row),
+            Self::Postgres(pg) => pg.add_review_thread(repo, number, row),
+        }
+    }
+
+    fn set_review_thread_resolved(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        thread: i64,
+        resolved: bool,
+    ) -> Result<bool> {
+        match self {
+            Self::Sqlite(tx) => tx.set_review_thread_resolved(repo, number, thread, resolved),
+            Self::Postgres(pg) => pg.set_review_thread_resolved(repo, number, thread, resolved),
+        }
+    }
+
+    fn review_threads(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+    ) -> Result<Vec<crate::review::ThreadRow>> {
+        match self {
+            Self::Sqlite(tx) => tx.review_threads(repo, number),
+            Self::Postgres(pg) => pg.review_threads(repo, number),
+        }
+    }
+
+    fn add_review_comment(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        row: &crate::review::CommentRow,
+    ) -> Result<i64> {
+        match self {
+            Self::Sqlite(tx) => tx.add_review_comment(repo, number, row),
+            Self::Postgres(pg) => pg.add_review_comment(repo, number, row),
+        }
+    }
+
+    fn review_comments(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+    ) -> Result<Vec<crate::review::CommentRow>> {
+        match self {
+            Self::Sqlite(tx) => tx.review_comments(repo, number),
+            Self::Postgres(pg) => pg.review_comments(repo, number),
+        }
+    }
+
+    fn review_comment_count(&mut self, repo: RepoId, number: i64) -> Result<i64> {
+        match self {
+            Self::Sqlite(tx) => tx.review_comment_count(repo, number),
+            Self::Postgres(pg) => pg.review_comment_count(repo, number),
+        }
+    }
 }
 
 /// The fixtures and the checks of the old-store tests (#318): a data

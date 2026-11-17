@@ -80,6 +80,45 @@ Every command takes these flags, before or after the subcommand:
   before each change. It fails unless `main` gained each landed change
   exactly once.
 
+### Review
+
+`scn proposal` proposes a changeset for a ref and reviews it, as a pull
+request does. A proposal moves no ref: `scn land` lands its head. On a ref
+the server protects, `scn land` lands only the head of an open proposal
+with enough approvals and no request for changes; otherwise it fails with
+`PERMISSION_DENIED` and records nothing, so the same land succeeds once the
+proposal is approved.
+
+- `scn proposal create REV --title TITLE` — propose a changeset (a ref
+  name or a changeset ID) with one parent. `--onto REF` is the ref it
+  should land on (default `main`); `--description TEXT` adds words for
+  people. Prints the proposal and its number.
+- `scn proposal list` — proposals, lowest number first, with `ready` or
+  `waiting` for an open one. `--state open|merged|closed|all` (default
+  `open`), `--onto REF` for one ref, `-n/--limit` how many (default 50).
+- `scn proposal show N` — the proposal, its head, its reviews, and
+  whether it may land and why not.
+- `scn proposal diff N` — the lines the head changes against its base,
+  as a unified diff. `--head ID` shows an older head; `-U/--context`
+  lines of context (default 3).
+- `scn proposal update N` — `--head REV` gives it a new head, which starts
+  the approvals over; `--title` and `--description` change its text. Only
+  its author or a reviewer may.
+- `scn proposal close N` — close it without landing. Only its author or a
+  reviewer may.
+- `scn proposal comment N --body TEXT` — start a general thread; with
+  `--path PATH` a thread on a file, with `--line L` on a line of the head
+  (`--old-side` for a line of the base); `--reply THREAD` replies.
+- `scn proposal resolve N THREAD` — mark a thread resolved; `--reopen`
+  marks it active again.
+- `scn proposal threads N` — every thread and its comments; a thread
+  started on an older head shows as outdated.
+- `scn proposal review N` — `--approve`, `--request-changes` or
+  `--comment` the head, with `--body TEXT`. `--head ID` names the head you
+  reviewed; without it, `scn` reviews the current head and prints it. An
+  approval counts only from a principal with a `review` rule, never from
+  the author, and only for the head it names.
+
 ### Queries
 
 - `scn merge-base A B` — the best common ancestors of two revisions, over

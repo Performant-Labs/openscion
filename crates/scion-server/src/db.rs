@@ -1595,6 +1595,241 @@ impl MetaTx for SqliteTx<'_> {
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(crate::error::from_sqlite)
     }
+
+    // Proposals and their review (review.rs).
+
+    fn insert_proposal(&mut self, repo: RepoId, row: &crate::review::ProposalRow) -> Result<i64> {
+        let number: i64 = self
+            .0
+            .prepare_cached("SELECT COALESCE(MAX(number), 0) + 1 FROM proposals WHERE repo_id = ?1")
+            .map_err(crate::error::from_sqlite)?
+            .query_row(params![repo.0], |r| r.get(0))
+            .map_err(crate::error::from_sqlite)?;
+        self.0.prepare_cached("INSERT INTO proposals (repo_id, number, target_ref, title, description, author, head_cs, state, merged_cs, created_at, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)").map_err(crate::error::from_sqlite)?.execute(params![repo.0, number, &row.target_ref, &row.title, &row.description, &row.author, row.head.as_bytes().as_slice(), row.state.as_str(), row.merged.map(|m| m.as_bytes().to_vec()), row.created_at, row.updated_at]).map_err(crate::error::from_sqlite)?;
+        self.0.prepare_cached("INSERT INTO proposal_heads (repo_id, number, seq, cs, pushed_by, at) VALUES (?1, ?2, 1, ?3, ?4, ?5)").map_err(crate::error::from_sqlite)?.execute(params![repo.0, number, row.head.as_bytes().as_slice(), &row.author, row.created_at]).map_err(crate::error::from_sqlite)?;
+        Ok(number)
+    }
+
+    fn proposal(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+    ) -> Result<Option<crate::review::ProposalRow>> {
+        let mut stmt = self.0.prepare_cached("SELECT number, target_ref, title, description, author, head_cs, state, merged_cs, created_at, updated_at FROM proposals WHERE repo_id = ?1 AND number = ?2").map_err(crate::error::from_sqlite)?;
+        let raw: Vec<crate::review::RawProposal> = stmt
+            .query_map(params![repo.0, number], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                ))
+            })
+            .map_err(crate::error::from_sqlite)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(crate::error::from_sqlite)?;
+        raw.into_iter()
+            .next()
+            .map(crate::review::decode_proposal)
+            .transpose()
+    }
+
+    fn proposals(
+        &mut self,
+        repo: RepoId,
+        state: Option<crate::review::ProposalStatus>,
+        target_ref: Option<&str>,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::review::ProposalRow>> {
+        let state = state.map_or("", |s| s.as_str());
+        let target_ref = target_ref.unwrap_or("");
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let mut stmt = self.0.prepare_cached("SELECT number, target_ref, title, description, author, head_cs, state, merged_cs, created_at, updated_at FROM proposals WHERE repo_id = ?1 AND number > ?2 AND (?3 = '' OR state = ?3) AND (?4 = '' OR target_ref = ?4) ORDER BY number LIMIT ?5").map_err(crate::error::from_sqlite)?;
+        let raw: Vec<crate::review::RawProposal> = stmt
+            .query_map(params![repo.0, after, state, target_ref, limit], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                    r.get(7)?,
+                    r.get(8)?,
+                    r.get(9)?,
+                ))
+            })
+            .map_err(crate::error::from_sqlite)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(crate::error::from_sqlite)?;
+        raw.into_iter()
+            .map(crate::review::decode_proposal)
+            .collect()
+    }
+
+    fn put_proposal(&mut self, repo: RepoId, row: &crate::review::ProposalRow) -> Result<()> {
+        self.0.prepare_cached("UPDATE proposals SET title = ?3, description = ?4, head_cs = ?5, state = ?6, merged_cs = ?7, updated_at = ?8 WHERE repo_id = ?1 AND number = ?2").map_err(crate::error::from_sqlite)?.execute(params![repo.0, row.number, &row.title, &row.description, row.head.as_bytes().as_slice(), row.state.as_str(), row.merged.map(|m| m.as_bytes().to_vec()), row.updated_at]).map_err(crate::error::from_sqlite)?;
+        Ok(())
+    }
+
+    fn open_proposal_with_head(
+        &mut self,
+        repo: RepoId,
+        target_ref: &str,
+        head: ChangesetId,
+    ) -> Result<Option<i64>> {
+        self.0.prepare_cached("SELECT number FROM proposals WHERE repo_id = ?1 AND target_ref = ?2 AND head_cs = ?3 AND state = 'open' ORDER BY number LIMIT 1").map_err(crate::error::from_sqlite)?.query_row(params![repo.0, target_ref, head.as_bytes().as_slice()], |r| r.get(0)).optional().map_err(crate::error::from_sqlite)
+    }
+
+    fn add_proposal_head(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        row: &crate::review::HeadRow,
+    ) -> Result<()> {
+        let seq: i64 = self.0.prepare_cached("SELECT COALESCE(MAX(seq), 0) + 1 FROM proposal_heads WHERE repo_id = ?1 AND number = ?2").map_err(crate::error::from_sqlite)?.query_row(params![repo.0, number], |r| r.get(0)).map_err(crate::error::from_sqlite)?;
+        self.0.prepare_cached("INSERT INTO proposal_heads (repo_id, number, seq, cs, pushed_by, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)").map_err(crate::error::from_sqlite)?.execute(params![repo.0, number, seq, row.changeset.as_bytes().as_slice(), &row.pushed_by, row.at]).map_err(crate::error::from_sqlite)?;
+        Ok(())
+    }
+
+    fn proposal_heads(&mut self, repo: RepoId, number: i64) -> Result<Vec<crate::review::HeadRow>> {
+        let mut stmt = self.0.prepare_cached("SELECT seq, cs, pushed_by, at FROM proposal_heads WHERE repo_id = ?1 AND number = ?2 ORDER BY seq").map_err(crate::error::from_sqlite)?;
+        let raw: Vec<crate::review::RawHead> = stmt
+            .query_map(params![repo.0, number], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?))
+            })
+            .map_err(crate::error::from_sqlite)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(crate::error::from_sqlite)?;
+        raw.into_iter().map(crate::review::decode_head).collect()
+    }
+
+    fn add_proposal_review(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        row: &crate::review::ReviewRow,
+    ) -> Result<()> {
+        let seq: i64 = self.0.prepare_cached("SELECT COALESCE(MAX(seq), 0) + 1 FROM proposal_reviews WHERE repo_id = ?1 AND number = ?2").map_err(crate::error::from_sqlite)?.query_row(params![repo.0, number], |r| r.get(0)).map_err(crate::error::from_sqlite)?;
+        self.0.prepare_cached("INSERT INTO proposal_reviews (repo_id, number, seq, reviewer, verdict, cs, body, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)").map_err(crate::error::from_sqlite)?.execute(params![repo.0, number, seq, &row.reviewer, row.verdict.as_str(), row.changeset.as_bytes().as_slice(), &row.body, row.at]).map_err(crate::error::from_sqlite)?;
+        Ok(())
+    }
+
+    fn proposal_reviews(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+    ) -> Result<Vec<crate::review::ReviewRow>> {
+        let mut stmt = self.0.prepare_cached("SELECT seq, reviewer, verdict, cs, body, at FROM proposal_reviews WHERE repo_id = ?1 AND number = ?2 ORDER BY seq").map_err(crate::error::from_sqlite)?;
+        let raw: Vec<crate::review::RawReview> = stmt
+            .query_map(params![repo.0, number], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                ))
+            })
+            .map_err(crate::error::from_sqlite)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(crate::error::from_sqlite)?;
+        raw.into_iter().map(crate::review::decode_review).collect()
+    }
+
+    fn add_review_thread(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        row: &crate::review::ThreadRow,
+    ) -> Result<i64> {
+        let thread: i64 = self.0.prepare_cached("SELECT COALESCE(MAX(thread), 0) + 1 FROM review_threads WHERE repo_id = ?1 AND number = ?2").map_err(crate::error::from_sqlite)?.query_row(params![repo.0, number], |r| r.get(0)).map_err(crate::error::from_sqlite)?;
+        self.0.prepare_cached("INSERT INTO review_threads (repo_id, number, thread, path, line, old_side, anchor_cs, resolved, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)").map_err(crate::error::from_sqlite)?.execute(params![repo.0, number, thread, row.path.as_slice(), i64::from(row.line), i64::from(row.old_side), row.anchor.as_bytes().as_slice(), i64::from(row.resolved), row.created_at]).map_err(crate::error::from_sqlite)?;
+        Ok(thread)
+    }
+
+    fn set_review_thread_resolved(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        thread: i64,
+        resolved: bool,
+    ) -> Result<bool> {
+        let n = self.0.prepare_cached("UPDATE review_threads SET resolved = ?4 WHERE repo_id = ?1 AND number = ?2 AND thread = ?3").map_err(crate::error::from_sqlite)?.execute(params![repo.0, number, thread, i64::from(resolved)]).map_err(crate::error::from_sqlite)?;
+        Ok(n > 0)
+    }
+
+    fn review_threads(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+    ) -> Result<Vec<crate::review::ThreadRow>> {
+        let mut stmt = self.0.prepare_cached("SELECT thread, path, line, old_side, anchor_cs, resolved, created_at FROM review_threads WHERE repo_id = ?1 AND number = ?2 ORDER BY thread").map_err(crate::error::from_sqlite)?;
+        let raw: Vec<crate::review::RawThread> = stmt
+            .query_map(params![repo.0, number], |r| {
+                Ok((
+                    r.get(0)?,
+                    r.get(1)?,
+                    r.get(2)?,
+                    r.get(3)?,
+                    r.get(4)?,
+                    r.get(5)?,
+                    r.get(6)?,
+                ))
+            })
+            .map_err(crate::error::from_sqlite)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(crate::error::from_sqlite)?;
+        raw.into_iter().map(crate::review::decode_thread).collect()
+    }
+
+    fn add_review_comment(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        row: &crate::review::CommentRow,
+    ) -> Result<i64> {
+        let comment: i64 = self.0.prepare_cached("SELECT COALESCE(MAX(comment), 0) + 1 FROM review_comments WHERE repo_id = ?1 AND number = ?2").map_err(crate::error::from_sqlite)?.query_row(params![repo.0, number], |r| r.get(0)).map_err(crate::error::from_sqlite)?;
+        self.0.prepare_cached("INSERT INTO review_comments (repo_id, number, comment, thread, author, body, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)").map_err(crate::error::from_sqlite)?.execute(params![repo.0, number, comment, row.thread, &row.author, &row.body, row.at]).map_err(crate::error::from_sqlite)?;
+        Ok(comment)
+    }
+
+    fn review_comments(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+    ) -> Result<Vec<crate::review::CommentRow>> {
+        let mut stmt = self.0.prepare_cached("SELECT comment, thread, author, body, at FROM review_comments WHERE repo_id = ?1 AND number = ?2 ORDER BY comment").map_err(crate::error::from_sqlite)?;
+        let raw: Vec<crate::review::RawComment> = stmt
+            .query_map(params![repo.0, number], |r| {
+                Ok((r.get(0)?, r.get(1)?, r.get(2)?, r.get(3)?, r.get(4)?))
+            })
+            .map_err(crate::error::from_sqlite)?
+            .collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(crate::error::from_sqlite)?;
+        raw.into_iter().map(crate::review::decode_comment).collect()
+    }
+
+    fn review_comment_count(&mut self, repo: RepoId, number: i64) -> Result<i64> {
+        let count: i64 = self
+            .0
+            .prepare_cached(
+                "SELECT COUNT(*) FROM review_comments WHERE repo_id = ?1 AND number = ?2",
+            )
+            .map_err(crate::error::from_sqlite)?
+            .query_row(params![repo.0, number], |r| r.get(0))
+            .map_err(crate::error::from_sqlite)?;
+        Ok(count)
+    }
 }
 /// Commit graphs for tests.
 #[cfg(test)]

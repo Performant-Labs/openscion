@@ -56,7 +56,7 @@ use crate::store::Blobs;
 pub(crate) mod test_hooks;
 
 /// The schema version this build makes and reads.
-pub(crate) const PG_SCHEMA_VERSION: u32 = 5;
+pub(crate) const PG_SCHEMA_VERSION: u32 = 6;
 
 /// How long a call may wait for a Postgres reader before the server
 /// answers [`Error::Unavailable`]. Well below the 600 s call deadline:
@@ -87,6 +87,7 @@ const PG_MIGRATIONS: [&str; PG_SCHEMA_VERSION as usize] = [
     include_str!("../migrations/postgres/0003_view_trees.sql"),
     include_str!("../migrations/postgres/0004_store_uuid.sql"),
     include_str!("../migrations/postgres/0005_parent_numbering.sql"),
+    include_str!("../migrations/postgres/0006_review.sql"),
 ];
 
 /// The fence of a process that lost the one-server lock. The worker of
@@ -3996,6 +3997,216 @@ impl MetaTx for PgTx<'_> {
                 ))
             })
             .collect()
+    }
+
+    // Proposals and their review (review.rs).
+
+    fn insert_proposal(&mut self, repo: RepoId, row: &crate::review::ProposalRow) -> Result<i64> {
+        let number: i64 = self
+            .c
+            .query_opt(
+                "SELECT COALESCE(MAX(number), 0) + 1 FROM proposals WHERE repo_id = $1",
+                &[P::i64(repo.0)],
+            )?
+            .map_or(0, |r| r.get(0));
+        self.c.execute("INSERT INTO proposals (repo_id, number, target_ref, title, description, author, head_cs, state, merged_cs, created_at, updated_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)", &[P::i64(repo.0), P::i64(number), P::text(row.target_ref.as_str()), P::text(row.title.as_str()), P::text(row.description.as_str()), P::text(row.author.as_str()), P::bytes(row.head.as_bytes().as_slice()), P::text(row.state.as_str()), P::opt_bytes(row.merged.map(|m| m.as_bytes().to_vec())), P::i64(row.created_at), P::i64(row.updated_at)])?;
+        self.c.execute("INSERT INTO proposal_heads (repo_id, number, seq, cs, pushed_by, at) VALUES ($1, $2, 1, $3, $4, $5)", &[P::i64(repo.0), P::i64(number), P::bytes(row.head.as_bytes().as_slice()), P::text(row.author.as_str()), P::i64(row.created_at)])?;
+        Ok(number)
+    }
+
+    fn proposal(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+    ) -> Result<Option<crate::review::ProposalRow>> {
+        let rows = self.c.query("SELECT number, target_ref, title, description, author, head_cs, state, merged_cs, created_at, updated_at FROM proposals WHERE repo_id = $1 AND number = $2", &[P::i64(repo.0), P::i64(number)])?;
+        rows.first()
+            .map(|r| {
+                crate::review::decode_proposal((
+                    r.get(0),
+                    r.get(1),
+                    r.get(2),
+                    r.get(3),
+                    r.get(4),
+                    r.get(5),
+                    r.get(6),
+                    r.get(7),
+                    r.get(8),
+                    r.get(9),
+                ))
+            })
+            .transpose()
+    }
+
+    fn proposals(
+        &mut self,
+        repo: RepoId,
+        state: Option<crate::review::ProposalStatus>,
+        target_ref: Option<&str>,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::review::ProposalRow>> {
+        let state = state.map_or("", |s| s.as_str());
+        let target_ref = target_ref.unwrap_or("");
+        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let rows = self.c.query("SELECT number, target_ref, title, description, author, head_cs, state, merged_cs, created_at, updated_at FROM proposals WHERE repo_id = $1 AND number > $2 AND ($3 = '' OR state = $3) AND ($4 = '' OR target_ref = $4) ORDER BY number LIMIT $5", &[P::i64(repo.0), P::i64(after), P::text(state), P::text(target_ref), P::i64(limit)])?;
+        rows.iter()
+            .map(|r| {
+                crate::review::decode_proposal((
+                    r.get(0),
+                    r.get(1),
+                    r.get(2),
+                    r.get(3),
+                    r.get(4),
+                    r.get(5),
+                    r.get(6),
+                    r.get(7),
+                    r.get(8),
+                    r.get(9),
+                ))
+            })
+            .collect()
+    }
+
+    fn put_proposal(&mut self, repo: RepoId, row: &crate::review::ProposalRow) -> Result<()> {
+        self.c.execute("UPDATE proposals SET title = $3, description = $4, head_cs = $5, state = $6, merged_cs = $7, updated_at = $8 WHERE repo_id = $1 AND number = $2", &[P::i64(repo.0), P::i64(row.number), P::text(row.title.as_str()), P::text(row.description.as_str()), P::bytes(row.head.as_bytes().as_slice()), P::text(row.state.as_str()), P::opt_bytes(row.merged.map(|m| m.as_bytes().to_vec())), P::i64(row.updated_at)])?;
+        Ok(())
+    }
+
+    fn open_proposal_with_head(
+        &mut self,
+        repo: RepoId,
+        target_ref: &str,
+        head: ChangesetId,
+    ) -> Result<Option<i64>> {
+        Ok(self.c.query_opt("SELECT number FROM proposals WHERE repo_id = $1 AND target_ref = $2 AND head_cs = $3 AND state = 'open' ORDER BY number LIMIT 1", &[P::i64(repo.0), P::text(target_ref), P::bytes(head.as_bytes().as_slice())])?.map(|r| r.get(0)))
+    }
+
+    fn add_proposal_head(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        row: &crate::review::HeadRow,
+    ) -> Result<()> {
+        let seq: i64 = self.c.query_opt("SELECT COALESCE(MAX(seq), 0) + 1 FROM proposal_heads WHERE repo_id = $1 AND number = $2", &[P::i64(repo.0), P::i64(number)])?.map_or(0, |r| r.get(0));
+        self.c.execute("INSERT INTO proposal_heads (repo_id, number, seq, cs, pushed_by, at) VALUES ($1, $2, $3, $4, $5, $6)", &[P::i64(repo.0), P::i64(number), P::i64(seq), P::bytes(row.changeset.as_bytes().as_slice()), P::text(row.pushed_by.as_str()), P::i64(row.at)])?;
+        Ok(())
+    }
+
+    fn proposal_heads(&mut self, repo: RepoId, number: i64) -> Result<Vec<crate::review::HeadRow>> {
+        let rows = self.c.query("SELECT seq, cs, pushed_by, at FROM proposal_heads WHERE repo_id = $1 AND number = $2 ORDER BY seq", &[P::i64(repo.0), P::i64(number)])?;
+        rows.iter()
+            .map(|r| crate::review::decode_head((r.get(0), r.get(1), r.get(2), r.get(3))))
+            .collect()
+    }
+
+    fn add_proposal_review(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        row: &crate::review::ReviewRow,
+    ) -> Result<()> {
+        let seq: i64 = self.c.query_opt("SELECT COALESCE(MAX(seq), 0) + 1 FROM proposal_reviews WHERE repo_id = $1 AND number = $2", &[P::i64(repo.0), P::i64(number)])?.map_or(0, |r| r.get(0));
+        self.c.execute("INSERT INTO proposal_reviews (repo_id, number, seq, reviewer, verdict, cs, body, at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)", &[P::i64(repo.0), P::i64(number), P::i64(seq), P::text(row.reviewer.as_str()), P::text(row.verdict.as_str()), P::bytes(row.changeset.as_bytes().as_slice()), P::text(row.body.as_str()), P::i64(row.at)])?;
+        Ok(())
+    }
+
+    fn proposal_reviews(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+    ) -> Result<Vec<crate::review::ReviewRow>> {
+        let rows = self.c.query("SELECT seq, reviewer, verdict, cs, body, at FROM proposal_reviews WHERE repo_id = $1 AND number = $2 ORDER BY seq", &[P::i64(repo.0), P::i64(number)])?;
+        rows.iter()
+            .map(|r| {
+                crate::review::decode_review((
+                    r.get(0),
+                    r.get(1),
+                    r.get(2),
+                    r.get(3),
+                    r.get(4),
+                    r.get(5),
+                ))
+            })
+            .collect()
+    }
+
+    fn add_review_thread(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        row: &crate::review::ThreadRow,
+    ) -> Result<i64> {
+        let thread: i64 = self.c.query_opt("SELECT COALESCE(MAX(thread), 0) + 1 FROM review_threads WHERE repo_id = $1 AND number = $2", &[P::i64(repo.0), P::i64(number)])?.map_or(0, |r| r.get(0));
+        self.c.execute("INSERT INTO review_threads (repo_id, number, thread, path, line, old_side, anchor_cs, resolved, created_at) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)", &[P::i64(repo.0), P::i64(number), P::i64(thread), P::bytes(row.path.as_slice()), P::i64(i64::from(row.line)), P::i64(i64::from(row.old_side)), P::bytes(row.anchor.as_bytes().as_slice()), P::i64(i64::from(row.resolved)), P::i64(row.created_at)])?;
+        Ok(thread)
+    }
+
+    fn set_review_thread_resolved(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        thread: i64,
+        resolved: bool,
+    ) -> Result<bool> {
+        let n = self.c.execute("UPDATE review_threads SET resolved = $4 WHERE repo_id = $1 AND number = $2 AND thread = $3", &[P::i64(repo.0), P::i64(number), P::i64(thread), P::i64(i64::from(resolved))])?;
+        Ok(n > 0)
+    }
+
+    fn review_threads(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+    ) -> Result<Vec<crate::review::ThreadRow>> {
+        let rows = self.c.query("SELECT thread, path, line, old_side, anchor_cs, resolved, created_at FROM review_threads WHERE repo_id = $1 AND number = $2 ORDER BY thread", &[P::i64(repo.0), P::i64(number)])?;
+        rows.iter()
+            .map(|r| {
+                crate::review::decode_thread((
+                    r.get(0),
+                    r.get(1),
+                    r.get(2),
+                    r.get(3),
+                    r.get(4),
+                    r.get(5),
+                    r.get(6),
+                ))
+            })
+            .collect()
+    }
+
+    fn add_review_comment(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        row: &crate::review::CommentRow,
+    ) -> Result<i64> {
+        let comment: i64 = self.c.query_opt("SELECT COALESCE(MAX(comment), 0) + 1 FROM review_comments WHERE repo_id = $1 AND number = $2", &[P::i64(repo.0), P::i64(number)])?.map_or(0, |r| r.get(0));
+        self.c.execute("INSERT INTO review_comments (repo_id, number, comment, thread, author, body, at) VALUES ($1, $2, $3, $4, $5, $6, $7)", &[P::i64(repo.0), P::i64(number), P::i64(comment), P::i64(row.thread), P::text(row.author.as_str()), P::text(row.body.as_str()), P::i64(row.at)])?;
+        Ok(comment)
+    }
+
+    fn review_comments(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+    ) -> Result<Vec<crate::review::CommentRow>> {
+        let rows = self.c.query("SELECT comment, thread, author, body, at FROM review_comments WHERE repo_id = $1 AND number = $2 ORDER BY comment", &[P::i64(repo.0), P::i64(number)])?;
+        rows.iter()
+            .map(|r| {
+                crate::review::decode_comment((r.get(0), r.get(1), r.get(2), r.get(3), r.get(4)))
+            })
+            .collect()
+    }
+
+    fn review_comment_count(&mut self, repo: RepoId, number: i64) -> Result<i64> {
+        let count: i64 = self
+            .c
+            .query_opt(
+                "SELECT COUNT(*) FROM review_comments WHERE repo_id = $1 AND number = $2",
+                &[P::i64(repo.0), P::i64(number)],
+            )?
+            .map_or(0, |r| r.get(0));
+        Ok(count)
     }
 }
 

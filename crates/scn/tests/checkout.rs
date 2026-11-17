@@ -1102,6 +1102,14 @@ fn old_tree(entries: &[(&str, BlobId, bool)]) -> Vec<u8> {
     w
 }
 
+/// Back to schema 6 from this build's schema: the derived rows, the view
+/// memo of #121 and the review tables of schema 10 go, so the upgrade
+/// replays 8, 9 and 10.
+const TO_SCHEMA_6: &str = "DELETE FROM derived; DROP TABLE IF EXISTS view_trees; \
+    DROP TABLE IF EXISTS review_comments; DROP TABLE IF EXISTS review_threads; \
+    DROP TABLE IF EXISTS proposal_reviews; DROP TABLE IF EXISTS proposal_heads; \
+    DROP TABLE IF EXISTS proposals; PRAGMA user_version = 6;";
+
 /// A data directory that the previous release (schema 6) wrote: its trees
 /// carry no byte lengths. Opening it on this build upgrades the database,
 /// drops the old trees, and re-derives them from the blob store, so the
@@ -1177,12 +1185,10 @@ fn a_schema_6_data_dir_upgrades_and_checks_out() {
             c.execute("UPDATE trees SET body = ?1 WHERE id = ?2", [body, id])
                 .unwrap();
         }
-        // The view memo of #121 did not exist in schema 6: drop the table
-        // that this build's first open made, so the upgrade replays 8 and 9.
-        c.execute_batch(
-            "DELETE FROM derived; DROP TABLE IF EXISTS view_trees; PRAGMA user_version = 6;",
-        )
-        .unwrap();
+        // The view memo of #121 and the review tables of schema 10 did not
+        // exist in schema 6: drop the tables that this build's first open
+        // made, so the upgrade replays 8, 9 and 10.
+        c.execute_batch(TO_SCHEMA_6).unwrap();
     }
 
     // This build upgrades the directory on open.
@@ -1190,7 +1196,7 @@ fn a_schema_6_data_dir_upgrades_and_checks_out() {
     let version: u32 = store
         .read(|c| sqlite_scalar(c, "PRAGMA user_version"))
         .unwrap();
-    assert_eq!(version, 9);
+    assert_eq!(version, 10);
     let trees: i64 = store
         .read(|c| sqlite_scalar(c, "SELECT count() FROM trees"))
         .unwrap();

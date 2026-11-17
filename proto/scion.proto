@@ -443,3 +443,297 @@ message ObjectPart {
   // First part only. The size of the object's bytes, at most 100 MiB.
   uint64 size = 6;
 }
+
+// Review: proposed changes, line comments, approvals, and the gate that a
+// protected ref puts on `Land` (docs/protocol-v1.md, section 11).
+//
+// A proposal names a changeset and the ref it should land on. It moves no
+// ref: `Scion.Land` does, and on a protected ref `Land` lands a changeset
+// only while an open proposal for that ref has it as its head and the
+// proposal passes its gate. Every call needs a token and a caller that
+// reads the whole repo. A server that does not serve this service answers
+// UNIMPLEMENTED; a cache tier never serves it.
+service Review {
+  // Opens a proposal: a changeset, the ref it should land on, a title and
+  // a description. Its author is the caller.
+  rpc CreateProposal(CreateProposalRequest) returns (Proposal);
+  // Gives an open proposal a new head, a new title or a new description.
+  // A new head starts the proposal's approvals over; threads stay.
+  rpc UpdateProposal(UpdateProposalRequest) returns (Proposal);
+  // One proposal, with its heads, reviews and gate.
+  rpc GetProposal(GetProposalRequest) returns (Proposal);
+  // Proposals of a repo by number, lowest first, a page at a time.
+  rpc ListProposals(ListProposalsRequest) returns (ListProposalsResponse);
+  // Closes an open proposal without landing it. Only its author or a
+  // reviewer may close it.
+  rpc CloseProposal(CloseProposalRequest) returns (Proposal);
+  // The changed files of a proposal's head against its base, with line
+  // hunks for the text files.
+  rpc GetProposalDiff(GetProposalDiffRequest) returns (GetProposalDiffResponse);
+  // Starts a thread, general or on a line, or replies to one.
+  rpc AddComment(AddCommentRequest) returns (ReviewThread);
+  // Marks a thread resolved, or active again.
+  rpc SetThreadResolved(SetThreadResolvedRequest) returns (ReviewThread);
+  // Every thread of a proposal with its comments, oldest first.
+  rpc ListThreads(ListThreadsRequest) returns (ListThreadsResponse);
+  // Approves a proposal's head, asks for changes, or comments.
+  rpc SubmitReview(SubmitReviewRequest) returns (Proposal);
+}
+
+enum ProposalState {
+  PROPOSAL_STATE_UNSPECIFIED = 0;
+  PROPOSAL_STATE_OPEN = 1;
+  // A land moved the target ref to the proposal's head, rebased.
+  PROPOSAL_STATE_MERGED = 2;
+  PROPOSAL_STATE_CLOSED = 3;
+}
+
+enum Verdict {
+  VERDICT_UNSPECIFIED = 0;
+  VERDICT_APPROVE = 1;
+  VERDICT_REQUEST_CHANGES = 2;
+  // A review that neither approves nor blocks.
+  VERDICT_COMMENT = 3;
+}
+
+message Proposal {
+  string repo = 1;
+  // Unique in the repo, from 1, never reused.
+  uint64 number = 2;
+  string target_ref = 3;
+  string title = 4;
+  string description = 5;
+  // The principal that opened it.
+  string author = 6;
+  // The changeset that would land.
+  bytes head_changeset_id = 7;
+  ProposalState state = 8;
+  int64 created_unix_secs = 9;
+  int64 updated_unix_secs = 10;
+  // When MERGED: the changeset the land put at the tip of the ref.
+  bytes merged_changeset_id = 11;
+  // Every head the proposal has had, oldest first; the last is the head.
+  repeated ProposalHead heads = 12;
+  // Every review, oldest first.
+  repeated ProposalReview reviews = 13;
+  // What `Land` would decide about the head now.
+  ProposalGate gate = 14;
+}
+
+message ProposalHead {
+  bytes changeset_id = 1;
+  // The principal that set this head.
+  string pushed_by = 2;
+  int64 unix_secs = 3;
+}
+
+message ProposalReview {
+  string reviewer = 1;
+  Verdict verdict = 2;
+  // The head this review was of.
+  bytes changeset_id = 3;
+  string body = 4;
+  int64 unix_secs = 5;
+}
+
+// The review part of the decision `Land` makes about a proposal's head.
+message ProposalGate {
+  // Whether the target ref has a protect rule. When false, `Land` does not
+  // look at proposals and the rest of this message is advice only.
+  bool protected = 1;
+  // The approvals the rule asks for.
+  uint32 required_approvals = 2;
+  // The reviewers whose approval of the current head counts: reviewers
+  // other than the author, whose latest review is an approval of the head.
+  repeated string approved_by = 3;
+  // The reviewers whose latest approving or blocking review asks for
+  // changes. Any one blocks the land.
+  repeated string changes_requested_by = 4;
+  // The proposal is open, and its approvals and blockers let it land.
+  bool approved = 5;
+  // Why it may not land yet, for people. Empty when `approved`.
+  string reason = 6;
+}
+
+message CreateProposalRequest {
+  string repo = 1;
+  string target_ref = 2;
+  // A changeset the repo has, with exactly one parent.
+  bytes changeset_id = 3;
+  // 1 to 256 bytes.
+  string title = 4;
+  // At most 64 KiB.
+  string description = 5;
+}
+
+message UpdateProposalRequest {
+  string repo = 1;
+  uint64 number = 2;
+  // Empty keeps the head.
+  bytes changeset_id = 3;
+  // Unset keeps the title.
+  optional string title = 4;
+  // Unset keeps the description.
+  optional string description = 5;
+}
+
+message GetProposalRequest {
+  string repo = 1;
+  uint64 number = 2;
+}
+
+message ListProposalsRequest {
+  string repo = 1;
+  // UNSPECIFIED lists every state.
+  ProposalState state = 2;
+  // Empty lists every ref.
+  string target_ref = 3;
+  // Only proposals with a number above this one. 0 starts at the first.
+  uint64 after_number = 4;
+  // 1 to 100; 0 means 50.
+  uint32 limit = 5;
+}
+
+message ListProposalsResponse {
+  // Without heads, reviews or threads: GetProposal has them. The gate is
+  // set.
+  repeated Proposal proposals = 1;
+  // The last number of this page when more may follow; 0 at the end.
+  uint64 next_after_number = 2;
+}
+
+message CloseProposalRequest {
+  string repo = 1;
+  uint64 number = 2;
+}
+
+message GetProposalDiffRequest {
+  string repo = 1;
+  uint64 number = 2;
+  // One of the proposal's heads; empty means the current head.
+  bytes changeset_id = 3;
+  // As DiffRequest.path.
+  bytes path = 4;
+  // As DiffRequest.after.
+  bytes after = 5;
+  // Lines of context around each hunk; unset means 3, at most 100.
+  optional uint32 context_lines = 6;
+}
+
+enum DiffLineKind {
+  DIFF_LINE_KIND_UNSPECIFIED = 0;
+  DIFF_LINE_KIND_CONTEXT = 1;
+  DIFF_LINE_KIND_ADDED = 2;
+  DIFF_LINE_KIND_REMOVED = 3;
+}
+
+message DiffLine {
+  DiffLineKind kind = 1;
+  // The line, without its line ending.
+  bytes text = 2;
+  // Counting from 1, in the base file; 0 for an added line.
+  uint32 old_line = 3;
+  // Counting from 1, in the head file; 0 for a removed line.
+  uint32 new_line = 4;
+}
+
+message DiffHunk {
+  // As in a unified diff: the first line and the line count on each side.
+  uint32 old_start = 1;
+  uint32 old_lines = 2;
+  uint32 new_start = 3;
+  uint32 new_lines = 4;
+  repeated DiffLine lines = 5;
+}
+
+message FileDiff {
+  // The path and file states, as Scion.Diff returns them.
+  DiffEntry entry = 1;
+  // Line hunks of a text file that changed. Empty for binary files,
+  // symlinks, gitlinks, a file whose content is the same, or one too
+  // large to diff.
+  repeated DiffHunk hunks = 2;
+  // One side is not text (a NUL byte), so no hunks.
+  bool binary = 3;
+  // One side is over the line-diff limit, so no hunks.
+  bool too_large = 4;
+}
+
+message GetProposalDiffResponse {
+  // The first parent of the head: what the head changes.
+  bytes base_changeset_id = 1;
+  bytes head_changeset_id = 2;
+  repeated FileDiff files = 3;
+  // As DiffResponse.next_after.
+  bytes next_after = 4;
+  // As DiffResponse.renames_incomplete.
+  bool renames_incomplete = 5;
+}
+
+message ReviewComment {
+  // Unique within the proposal, from 1.
+  uint64 id = 1;
+  string author = 2;
+  string body = 3;
+  int64 unix_secs = 4;
+}
+
+message ReviewThread {
+  // Unique within the proposal, from 1.
+  uint64 id = 1;
+  // The file the thread is on; empty for a general thread.
+  bytes path = 2;
+  // The line, counting from 1; 0 for a general thread or a whole file.
+  uint32 line = 3;
+  // The line counts in the base file, not the head file.
+  bool old_side = 4;
+  // The head the thread was started on.
+  bytes changeset_id = 5;
+  bool resolved = 6;
+  // The proposal's head moved since the thread was started on it.
+  bool outdated = 7;
+  // Oldest first; the first started the thread.
+  repeated ReviewComment comments = 8;
+}
+
+message AddCommentRequest {
+  string repo = 1;
+  uint64 number = 2;
+  // 0 starts a thread; otherwise the thread to reply to.
+  uint64 thread_id = 3;
+  // A new thread only: the file, or empty for a general thread.
+  bytes path = 4;
+  // A new thread only: the line, from 1, or 0 for the whole file.
+  uint32 line = 5;
+  // A new thread only: `line` counts in the base file.
+  bool old_side = 6;
+  // 1 byte to 16 KiB.
+  string body = 7;
+}
+
+message SetThreadResolvedRequest {
+  string repo = 1;
+  uint64 number = 2;
+  uint64 thread_id = 3;
+  bool resolved = 4;
+}
+
+message ListThreadsRequest {
+  string repo = 1;
+  uint64 number = 2;
+}
+
+message ListThreadsResponse {
+  repeated ReviewThread threads = 1;
+}
+
+message SubmitReviewRequest {
+  string repo = 1;
+  uint64 number = 2;
+  Verdict verdict = 3;
+  // The head the reviewer looked at. It must be the proposal's head, so a
+  // review never approves a head its reviewer did not see.
+  bytes changeset_id = 4;
+  // At most 16 KiB.
+  string body = 5;
+}

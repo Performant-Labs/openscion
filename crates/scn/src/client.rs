@@ -12,6 +12,7 @@ use scion_proto::runtime::auth::{Bearer, check_ancestors};
 use scion_proto::runtime::request_id;
 use scion_proto::runtime::tls::ClientTls;
 use scion_proto::v1::objects_client::ObjectsClient;
+use scion_proto::v1::review_client::ReviewClient;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, PutBlobRequest, ResolveRefRequest};
 use scion_proto::{CHUNK_BYTES, MAX_MESSAGE_BYTES, MAX_PART_MESSAGE_BYTES};
@@ -59,6 +60,9 @@ pub(crate) const MAX_JOINED_REPLY_BYTES: usize = 1 << 30;
 
 /// A connected client.
 pub type Client = ScionClient<InterceptedService<Channel, Call>>;
+
+/// The `Review` client: proposals and their review.
+pub type Reviews = ReviewClient<InterceptedService<Channel, Call>>;
 
 /// A connected client for the object reads that a cache tier can answer.
 pub type Objects = ObjectsClient<InterceptedService<Channel, Call>>;
@@ -123,6 +127,8 @@ pub struct Ctx {
     /// The `Objects` client of the server: `ResolveRef` and `GetRootTree`
     /// go there, with a token, never to a tier.
     pub roots: Objects,
+    /// The `Review` client of the server: proposals and their review.
+    pub review: Reviews,
     /// Repository name.
     pub repo: String,
     /// Print JSON instead of text.
@@ -210,6 +216,9 @@ impl Ctx {
                 .max_decoding_message_size(MAX_PART_MESSAGE_BYTES)
                 .max_encoding_message_size(MAX_MESSAGE_BYTES),
         };
+        let review = ReviewClient::with_interceptor(channel.clone(), call.clone())
+            .max_decoding_message_size(MAX_MESSAGE_BYTES)
+            .max_encoding_message_size(MAX_MESSAGE_BYTES);
         let client = ScionClient::with_interceptor(channel, call)
             .max_decoding_message_size(MAX_MESSAGE_BYTES)
             .max_encoding_message_size(MAX_MESSAGE_BYTES);
@@ -217,6 +226,7 @@ impl Ctx {
             client,
             objects,
             roots,
+            review,
             repo,
             json,
         })

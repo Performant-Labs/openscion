@@ -1,4 +1,4 @@
-//! Every RPC of both services answers `UNAUTHENTICATED` to a call that
+//! Every RPC of every service answers `UNAUTHENTICATED` to a call that
 //! carries no token or a wrong token, and none of the calls has a side
 //! effect. The list of RPCs comes from `proto/scion.proto` itself: a new
 //! RPC without a row here fails this test, so a new method cannot land
@@ -8,6 +8,8 @@ use scion_proto::runtime::auth::token_digest;
 use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::objects_client::ObjectsClient;
 use scion_proto::v1::objects_server::SERVICE_NAME as OBJECTS_SERVICE;
+use scion_proto::v1::review_client::ReviewClient;
+use scion_proto::v1::review_server::SERVICE_NAME as REVIEW_SERVICE;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::scion_server::SERVICE_NAME as SCION_SERVICE;
 use scion_proto::v1::{
@@ -49,6 +51,7 @@ impl Interceptor for Bearer {
 
 type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
 type Objects = ObjectsClient<InterceptedService<Channel, Bearer>>;
+type Review = ReviewClient<InterceptedService<Channel, Bearer>>;
 
 fn access() -> Access {
     let digest = blake3::Hash::from(token_digest("ci")).to_hex().to_string();
@@ -136,6 +139,7 @@ async fn serve(
 struct Pair {
     scion: Scion,
     objects: Objects,
+    review: Review,
 }
 
 fn client_with(channel: Channel, token: Option<&str>) -> Pair {
@@ -145,7 +149,8 @@ fn client_with(channel: Channel, token: Option<&str>) -> Pair {
     };
     Pair {
         scion: ScionClient::with_interceptor(channel.clone(), bearer.clone()),
-        objects: ObjectsClient::with_interceptor(channel, bearer),
+        objects: ObjectsClient::with_interceptor(channel.clone(), bearer.clone()),
+        review: ReviewClient::with_interceptor(channel, bearer),
     }
 }
 
@@ -201,6 +206,18 @@ macro_rules! objects_only {
             let mut objects = pair.objects.clone();
             Box::pin(async move {
                 objects.$method(<$request as Default>::default()).await?;
+                Ok(())
+            }) as Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>
+        }
+    };
+}
+
+macro_rules! review_only {
+    ($method:ident, $request:ty) => {
+        |pair: &Pair, _payload: &Payload| {
+            let mut review = pair.review.clone();
+            Box::pin(async move {
+                review.$method(<$request as Default>::default()).await?;
                 Ok(())
             }) as Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>
         }
@@ -331,6 +348,59 @@ fn rows() -> Vec<Row> {
                 }) as Pin<Box<dyn Future<Output = Result<(), Status>> + Send>>
             },
         },
+        Row {
+            service: "scion.v1.Review",
+            rpc: "CreateProposal",
+            call: review_only!(create_proposal, scion_proto::v1::CreateProposalRequest),
+        },
+        Row {
+            service: "scion.v1.Review",
+            rpc: "UpdateProposal",
+            call: review_only!(update_proposal, scion_proto::v1::UpdateProposalRequest),
+        },
+        Row {
+            service: "scion.v1.Review",
+            rpc: "GetProposal",
+            call: review_only!(get_proposal, scion_proto::v1::GetProposalRequest),
+        },
+        Row {
+            service: "scion.v1.Review",
+            rpc: "ListProposals",
+            call: review_only!(list_proposals, scion_proto::v1::ListProposalsRequest),
+        },
+        Row {
+            service: "scion.v1.Review",
+            rpc: "CloseProposal",
+            call: review_only!(close_proposal, scion_proto::v1::CloseProposalRequest),
+        },
+        Row {
+            service: "scion.v1.Review",
+            rpc: "GetProposalDiff",
+            call: review_only!(get_proposal_diff, scion_proto::v1::GetProposalDiffRequest),
+        },
+        Row {
+            service: "scion.v1.Review",
+            rpc: "AddComment",
+            call: review_only!(add_comment, scion_proto::v1::AddCommentRequest),
+        },
+        Row {
+            service: "scion.v1.Review",
+            rpc: "SetThreadResolved",
+            call: review_only!(
+                set_thread_resolved,
+                scion_proto::v1::SetThreadResolvedRequest
+            ),
+        },
+        Row {
+            service: "scion.v1.Review",
+            rpc: "ListThreads",
+            call: review_only!(list_threads, scion_proto::v1::ListThreadsRequest),
+        },
+        Row {
+            service: "scion.v1.Review",
+            rpc: "SubmitReview",
+            call: review_only!(submit_review, scion_proto::v1::SubmitReviewRequest),
+        },
     ]
 }
 
@@ -365,7 +435,11 @@ fn declared() -> (Vec<(String, String)>, Vec<String>) {
             declared.push((service.clone(), name));
         }
     }
-    let generated = vec![SCION_SERVICE.to_owned(), OBJECTS_SERVICE.to_owned()];
+    let generated = vec![
+        SCION_SERVICE.to_owned(),
+        OBJECTS_SERVICE.to_owned(),
+        REVIEW_SERVICE.to_owned(),
+    ];
     (declared, generated)
 }
 

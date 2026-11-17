@@ -81,7 +81,7 @@ const _: () = assert!(MAX_GRAPH_QUERIES < crate::store::READERS);
 /// never take more than this many of the `MAX_BLOCKING` permits either.
 const MAX_DIFFS: usize = 4;
 /// Longest a request may take before the server gives up on it.
-const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
+pub(crate) const REQUEST_TIMEOUT: Duration = Duration::from_secs(600);
 /// Most bytes that all `ReadFile` replies together hold: the parts read and
 /// not yet sent, and the readers of files of more than one part.
 const READ_BUDGET_BYTES: usize = 256 << 20;
@@ -245,6 +245,7 @@ pub struct ServeOptions {
 /// # Errors
 ///
 /// Transport errors.
+#[allow(clippy::too_many_lines)] // the server's wiring: one block per service
 pub async fn serve(
     store: Backend,
     listener: TcpListener,
@@ -329,6 +330,20 @@ pub async fn serve(
         audit.clone(),
         stop_rx,
     ));
+    // A protected ref's lands check its proposals against these rules.
+    lands.set_access(Arc::clone(&access));
+    // The review calls authenticate as the Scion calls do, and are counted
+    // the same way.
+    let review = MetricsLayer::new(Arc::clone(&metrics)).layer(InterceptedService::new(
+        crate::review_service::ReviewService::new(
+            worker.clone(),
+            Arc::clone(&access),
+            quotas.clone(),
+            audit.clone(),
+        )
+        .into_server(),
+        crate::audit::AuditedAuth::new(auth.clone(), Arc::clone(&meter)),
+    ));
     // Outside the access rules, so a refused call counts too. The layer
     // only wraps replies in a counting body; the handlers stay as they are.
     let scion = MetricsLayer::new(Arc::clone(&metrics)).layer(InterceptedService::new(
@@ -358,7 +373,7 @@ pub async fn serve(
     // line that was not made durable flips the names too, and latches:
     // the log has a hole, so the server must not be picked for writes.
     let (health, shutdown) = listen::health(
-        &["scion.v1.Scion", "scion.v1.Objects"],
+        &["scion.v1.Scion", "scion.v1.Objects", "scion.v1.Review"],
         shutdown,
         audit.ready(),
     )
@@ -368,6 +383,7 @@ pub async fn serve(
             .timeout(REQUEST_TIMEOUT)
             .add_service(scion)
             .add_service(objects)
+            .add_service(review)
             .add_service(health)
     };
     limits
@@ -846,7 +862,7 @@ fn parse_optional_path(bytes: Vec<u8>) -> Result<Option<RepoPath>, Status> {
 /// intent and result lines join by it. A call that sent no usable ID
 /// gets one the server made, so every line it leaves still carries a
 /// `request_id` its pair can be found by.
-fn request_id_of<T>(request: &Request<T>) -> String {
+pub(crate) fn request_id_of<T>(request: &Request<T>) -> String {
     scion_proto::runtime::request_id::sanitize(
         request
             .metadata()
@@ -2114,34 +2130,30 @@ impl Scion for ScionService {
                 )
             })
             .await?;
-        let entries = page
-            .entries
-            .into_iter()
-            .map(|entry| {
-                // The other path goes in `rename_from` on the added file,
-                // and in `rename_to` on the deleted one.
-                let (rename_from, rename_to, similarity) = match entry.rename {
-                    Some(r) if entry.old.is_none() => {
-                        (r.path.as_bytes().to_vec(), vec![], r.similarity)
-                    }
-                    Some(r) => (vec![], r.path.as_bytes().to_vec(), r.similarity),
-                    None => Default::default(),
-                };
-                DiffEntry {
-                    path: entry.path.as_bytes().to_vec(),
-                    old: entry.old.map(file_state),
-                    new: entry.new.map(file_state),
-                    rename_from,
-                    rename_to,
-                    similarity,
-                }
-            })
-            .collect();
+        let entries = page.entries.into_iter().map(diff_entry).collect();
         Ok(Response::new(DiffResponse {
             entries,
             next_after: path_bytes(page.next_after),
             renames_incomplete: page.renames_incomplete,
         }))
+    }
+}
+
+/// One path of a diff on the wire. The other path of a rename goes in
+/// `rename_from` on the added file, and in `rename_to` on the deleted one.
+pub(crate) fn diff_entry(entry: read::DiffEntry) -> DiffEntry {
+    let (rename_from, rename_to, similarity) = match entry.rename {
+        Some(r) if entry.old.is_none() => (r.path.as_bytes().to_vec(), vec![], r.similarity),
+        Some(r) => (vec![], r.path.as_bytes().to_vec(), r.similarity),
+        None => Default::default(),
+    };
+    DiffEntry {
+        path: entry.path.as_bytes().to_vec(),
+        old: entry.old.map(file_state),
+        new: entry.new.map(file_state),
+        rename_from,
+        rename_to,
+        similarity,
     }
 }
 
@@ -2156,7 +2168,7 @@ fn path_bytes(path: Option<RepoPath>) -> Vec<u8> {
         .unwrap_or_default()
 }
 
-fn file_state(state: FileState) -> v1::FileState {
+pub(crate) fn file_state(state: FileState) -> v1::FileState {
     let (kind, id, executable) = match state {
         FileState::Regular {
             content,

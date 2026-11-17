@@ -250,7 +250,20 @@ read	ci	main
 read	alice	main
 write	alice	main	src
 write	ci	main
+# review <principal> <repo>: the principal's approvals and requests for
+# changes count in the repo. Needs a whole-repo read rule.
+review	alice	main
+# protect <repo> <ref> [approvals]: lands on the ref go through an
+# approved proposal (default 1 approval, at most 16).
+protect	main	main	1
 ```
+
+A protected ref takes only lands of a changeset that is the head of an
+open proposal with enough approvals of that head from reviewers other than
+its author, and no reviewer asking for changes; any other land answers
+`PERMISSION_DENIED` and records nothing. `scn proposal` proposes, reviews
+and shows proposals ([docs/protocol-v1.md](docs/protocol-v1.md),
+section 11).
 
 The file holds token digests, so it is a secret: the server reads it only
 when its owner (or root) alone can read it, and refuses one that group or

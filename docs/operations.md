@@ -395,6 +395,14 @@ changes it cannot account for, and flips readiness until a restart. The
 file is mode 0600, never a symlink, in a directory only the server's
 user may write.
 
+Review changes (`scion.v1.Review`: opening, updating and closing a
+proposal, a comment, a thread resolved, and an approval or a request for
+changes) record a `review` intent and a `review` result line, each with
+the RPC, the repo, the proposal number (0 on the intent of a proposal not
+yet opened) and a `detail`: the head proposed, the verdict, or the thread
+state. A refused change's result line is `failed`, with the gRPC code in
+`why`.
+
 The lines of concurrent changes can appear in a different order than the
 changes themselves: each job records its result after its change. Each
 ref line names its old and new head, so a ref's history is rebuilt by
