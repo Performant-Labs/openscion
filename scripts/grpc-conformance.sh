@@ -23,6 +23,14 @@ die() { printf '%s %s\n' "grpc-conformance:" "$*" >&2; exit 1; }
 BIN=${SCION_SERVER:-target/release/scion-server}
 [ -x "$BIN" ] || die "no server at $BIN (build it first, or set SCION_SERVER)"
 
+# The server's metadata is Postgres: its URL reaches every command of
+# this run through the env, which the server reads quietly (the argv
+# form would warn). The job gives the test URL; the server takes the
+# same database, and derives each data directory's schema itself.
+[ -n "${SCION_TEST_POSTGRES_URL:-}" ] \
+  || die "no SCION_TEST_POSTGRES_URL: the server's metadata is Postgres"
+export SCION_POSTGRES_URL="$SCION_TEST_POSTGRES_URL"
+
 # A pinned grpcurl, downloaded only if the PATH has none.
 GRPCURL=$(command -v grpcurl || true)
 if [ -z "$GRPCURL" ]; then
@@ -37,7 +45,12 @@ if [ -z "$GRPCURL" ]; then
   tarball=$dir/grpcurl.tar.gz
   if [ ! -x "$dir/grpcurl" ]; then
     url="https://github.com/fullstorydev/grpcurl/releases/download/v$GRPCURL_VERSION/grpcurl_${GRPCURL_VERSION}_${asset}.tar.gz"
-    curl -sL -o "$tarball" "$url"
+    # -f fails on an HTTP error before any byte is kept: without it an
+    # error body becomes the tarball and the hash check reads like a
+    # tampered release (#1024). A transient error retries; a lasting
+    # one dies here with the status, before any hash.
+    curl -fsSL --retry 3 --retry-all-errors -o "$tarball" "$url" \
+      || die "the grpcurl download failed ($url)"
     got=$(shasum -a 256 "$tarball" | cut -d' ' -f1)
     [ "$got" = "$want" ] || die "grpcurl $asset sha256 $got is not the pinned $want"
     tar xzf "$tarball" -C "$dir"
@@ -69,7 +82,7 @@ git -C "$WORK/git" -c user.name=Ada -c user.email=ada@example.com \
 git -C "$WORK/git" -c user.name=Ada -c user.email=ada@example.com \
   commit -q -m conformance
 
-# D25: the server refuses a missing data directory; create it here, 0700.
+# The server refuses a missing data directory (#578); create it here, 0700.
 mkdir -p "$WORK/data"
 chmod 700 "$WORK/data"
 NO_COLOR=1 "$BIN" --data "$WORK/data" import "$WORK/git" --repo r --ref main \

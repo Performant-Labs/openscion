@@ -92,6 +92,19 @@ thread_local! {
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     pub static CHECKS: Cell<usize> = const { Cell::new(0) };
+    /// Tree checks of the transactions a checker reset rolled back: the
+    /// checks the import paid for and then paid again, exactly. A test of
+    /// a rolled-back batch reads it to add the rolled-back checks to one
+    /// pass, so the exact total holds whatever the budget split and how
+    /// many transactions rolled back.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub static ROLLED_CHECKS: Cell<usize> = const { Cell::new(0) };
+    /// Tree checks since the last checker reset, the run of the
+    /// transaction in progress. [`ROLLED_CHECKS`] collects it on a reset.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub static TX_CHECKS: Cell<usize> = const { Cell::new(0) };
     /// A test's lower bound on one commit or tree object's bytes, and on
     /// one tree's entries: the refusal is proved with small objects, and
     /// the product caps stay the documented ones. `None` is the product.
@@ -331,9 +344,8 @@ fn store_batch(
 ) -> Result<()> {
     #[cfg(test)]
     let slow_record = SLOW_RECORD.with(Cell::get);
-    // A Postgres database has one writer: a long batch holds it, like a
-    // shared data directory's write lock does. The budget applies to both.
-    let shared = store.is_shared() || store.as_postgres().is_some();
+    // A Postgres database has one writer: a long batch holds it, and the
+    // budget keeps its turn short.
     let mut rest = prepared;
     while !rest.is_empty() {
         let mut taken = 0;
@@ -351,7 +363,7 @@ fn store_batch(
             let lens = crate::tree::lens_of_puts(
                 store,
                 rest.iter()
-                    .flat_map(|(_, cs, _)| crate::db::puts(cs))
+                    .flat_map(|(_, cs, _)| crate::meta::puts(cs))
                     .map(|(_, blob)| blob),
             )?;
             let result = store.write(|c| {
@@ -404,7 +416,7 @@ fn store_batch(
                     }
                     provenance.push((*commit, id));
                     taken += 1;
-                    if shared && started_tx.elapsed() >= TX_BUDGET {
+                    if started_tx.elapsed() >= TX_BUDGET {
                         break;
                     }
                     #[cfg(any(test, feature = "test-hooks"))]
@@ -439,7 +451,7 @@ fn store_batch(
             commits_per_sec = per_sec(*done, started),
             "importing git commits"
         );
-        if shared && !rest.is_empty() {
+        if !rest.is_empty() {
             // A server write that waited for this transaction takes the lock
             // here, before the next one begins.
             std::thread::sleep(TX_YIELD);
@@ -835,6 +847,14 @@ impl Checker<'_> {
     fn reset_for_retry(&mut self) {
         self.equal.clear();
         self.intact.clear();
+        // The checks this run paid for roll back with the transaction:
+        // the retry runs them again, so they are the import's extra.
+        #[cfg(any(test, feature = "test-hooks"))]
+        {
+            let since = TX_CHECKS.with(Cell::get);
+            ROLLED_CHECKS.with(|rolled| rolled.set(rolled.get() + since));
+            TX_CHECKS.with(|checks| checks.set(0));
+        }
     }
 
     /// Fails unless the Scion tree `scion` has exactly the names, kinds,
@@ -855,6 +875,8 @@ impl Checker<'_> {
             // cleared did no work.
             #[cfg(any(test, feature = "test-hooks"))]
             CHECKS.with(|checks| checks.set(checks.get() + 1));
+            #[cfg(any(test, feature = "test-hooks"))]
+            TX_CHECKS.with(|checks| checks.set(checks.get() + 1));
             let want = read_tree(self.git, commit, Some(git_id))?;
             let have: BTreeMap<Vec<u8>, Entry> = c
                 .get_tree(scion_id)?
@@ -1195,8 +1217,9 @@ fn identity(
 
 /// The raw git date `<seconds> <sign><hhmm>`, as the pair gix parses it
 /// to, or `None` when the bytes are not that grammar. A zone with a
-/// seconds field (`+053030`) or a zone too long to read as two two-digit
-/// fields is refused here, where gix would coerce its offset to zero.
+/// seconds field (`+053030`), a zone too long to read as two two-digit
+/// fields, or one too short to hold them (`+1`, a bare `+`) is refused
+/// here, where gix would coerce its offset to zero.
 fn zone(raw: &str) -> Option<(i64, i32)> {
     let (seconds, offset) = raw.split_once(' ')?;
     let seconds = seconds.parse().ok()?;
@@ -1206,7 +1229,7 @@ fn zone(raw: &str) -> Option<(i64, i32)> {
         _ => return None,
     };
     let digits = offset.get(1..)?;
-    let (hours, minutes) = digits.split_at(2);
+    let (hours, minutes) = digits.split_at_checked(2)?;
     if minutes.len() != 2
         || !hours
             .bytes()
@@ -1215,10 +1238,16 @@ fn zone(raw: &str) -> Option<(i64, i32)> {
     {
         return None;
     }
-    Some((
-        seconds,
-        sign * (hours.parse::<i32>().ok()? * 3600 + minutes.parse::<i32>().ok()? * 60),
-    ))
+    // A negative zero (`-0000`, and `-000000` of the same shape) is
+    // the one zone that cannot read back: git writes an unknown offset
+    // this way, and zero parses to `+0000`. The arithmetic folds the
+    // sign into the value (-1 * 0 = 0), so the pair comparison below
+    // would accept it; the sign is checked here instead.
+    let total = hours.parse::<i32>().ok()? * 3600 + minutes.parse::<i32>().ok()? * 60;
+    if sign == -1 && total == 0 {
+        return None;
+    }
+    Some((seconds, sign * total))
 }
 
 fn per_sec(count: usize, since: Instant) -> u128 {
@@ -1228,7 +1257,6 @@ fn per_sec(count: usize, since: Instant) -> u128 {
 #[cfg(test)]
 mod tests {
     use crate::backend::Backend;
-    use crate::store::Store;
     use std::fs;
     use std::process::Command;
     use std::sync::Arc;
@@ -1268,7 +1296,7 @@ mod tests {
     #[test]
     fn a_tiny_blob_cache_imports_the_same_changesets() {
         crate::store::spawn_guard::prime_gix_lookup();
-        let repo = tempfile::tempdir().unwrap();
+        let repo = crate::test_support::private_tempdir();
         let dir = repo.path();
         git(dir, &["init", "-q", "-b", "main"]);
         // Eight distinct blobs, then the same blobs at new paths. With a cache
@@ -1291,8 +1319,8 @@ mod tests {
             verify_sample: usize::MAX,
         };
         let import = |cache_entries| {
-            let data = tempfile::tempdir().unwrap();
-            let store = Backend::sqlite(Store::open(data.path()).unwrap());
+            let data = crate::test_support::private_tempdir();
+            let store = Backend::open_test(data.path()).unwrap();
             import_with_cache(&store, "main", dir, &opts, cache_entries, MAX_CHANGES).unwrap()
         };
         let tiny = import(2);
@@ -1306,15 +1334,15 @@ mod tests {
     #[test]
     fn a_reimport_trusts_a_stored_blob_it_skips_and_fsck_reports_the_damage() {
         crate::store::spawn_guard::prime_gix_lookup();
-        let repo = tempfile::tempdir().unwrap();
+        let repo = crate::test_support::private_tempdir();
         let dir = repo.path();
         git(dir, &["init", "-q", "-b", "main"]);
         fs::write(dir.join("f"), "payload\n").unwrap();
         git(dir, &["add", "-A"]);
         git(dir, &["commit", "-q", "-m", "add"]);
 
-        let data = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(data.path()).unwrap());
+        let data = crate::test_support::private_tempdir();
+        let store = Backend::open_test(data.path()).unwrap();
         let opts = |rev: &str| ImportOptions {
             rev: rev.into(),
             target_ref: "main".into(),
@@ -1356,15 +1384,15 @@ mod tests {
     #[test]
     fn a_commit_with_too_many_changes_is_named_and_refused() {
         crate::store::spawn_guard::prime_gix_lookup();
-        let repo = tempfile::tempdir().unwrap();
+        let repo = crate::test_support::private_tempdir();
         let dir = repo.path();
         git(dir, &["init", "-q", "-b", "main"]);
         fs::write(dir.join("f"), "one\n").unwrap();
         git(dir, &["add", "-A"]);
         git(dir, &["commit", "-q", "-m", "one"]);
 
-        let data = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(data.path()).unwrap());
+        let data = crate::test_support::private_tempdir();
+        let store = Backend::open_test(data.path()).unwrap();
         let opts = ImportOptions {
             rev: "main".into(),
             target_ref: "main".into(),
@@ -1394,9 +1422,9 @@ mod tests {
     #[test]
     fn a_land_while_the_import_checks_the_ref_is_never_overwritten() {
         crate::store::spawn_guard::prime_gix_lookup();
-        let data = tempfile::tempdir().unwrap();
-        let server = Backend::sqlite(Store::open(data.path()).unwrap());
-        let importer = Backend::sqlite(Store::open_shared(data.path()).unwrap());
+        let data = crate::test_support::private_tempdir();
+        let server = Backend::open_test(data.path()).unwrap();
+        let importer = Backend::open_test_shared(data.path()).unwrap();
         // main is at root. Git has root ─ tip, and a land puts X on root.
         let changeset = |parents, message: &str| {
             Changeset::new(
@@ -1474,9 +1502,9 @@ mod tests {
     /// tip, so the import never hears "diverged".
     #[test]
     fn an_import_that_keeps_losing_the_ref_swap_gives_up() {
-        let data = tempfile::tempdir().unwrap();
-        let server = Backend::sqlite(Store::open(data.path()).unwrap());
-        let importer = Backend::sqlite(Store::open_shared(data.path()).unwrap());
+        let data = crate::test_support::private_tempdir();
+        let server = Backend::open_test(data.path()).unwrap();
+        let importer = Backend::open_test_shared(data.path()).unwrap();
         // main is at root. The chain root <- a1 <- a2 <- a3 <- tip hangs
         // under it, so every mover target is still an ancestor of the
         // imported tip and the import never hears "diverged".
@@ -1549,7 +1577,7 @@ mod tests {
     #[test]
     fn an_import_derives_missing_parent_root_trees_in_steps_first() {
         crate::store::spawn_guard::prime_gix_lookup();
-        let repo = tempfile::tempdir().unwrap();
+        let repo = crate::test_support::private_tempdir();
         let dir = repo.path();
         git(dir, &["init", "-q", "-b", "main"]);
         for i in 0..5 {
@@ -1557,8 +1585,8 @@ mod tests {
             git(dir, &["add", "-A"]);
             git(dir, &["commit", "-q", "-m", &i.to_string()]);
         }
-        let data = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(data.path()).unwrap());
+        let data = crate::test_support::private_tempdir();
+        let store = Backend::open_test(data.path()).unwrap();
         let import = |rev: &str| {
             let opts = ImportOptions {
                 rev: rev.into(),
@@ -1569,14 +1597,18 @@ mod tests {
         };
         import("main~1");
         // As after a version bump of the root tree: no stored root trees.
-        let sql = "DELETE FROM derived WHERE kind = ?1";
-        let removed = store.write(|c| {
-            c.sqlite()
-                .unwrap()
-                .execute(sql, [RootTree::NAME])
-                .map_err(crate::error::from_sqlite)
-        });
-        assert_eq!(removed.unwrap(), 4);
+        // The delete goes through the metadata trait, so the same reset
+        // runs on both backends.
+        let removed = store
+            .write(|c| {
+                c.delete_derived_below(
+                    RootTree::NAME,
+                    RootTree::VERSION.saturating_add(1),
+                    usize::MAX,
+                )
+            })
+            .unwrap();
+        assert_eq!(removed, 4);
 
         let commits = store.commits();
         assert_eq!(import("main").imported, 1);
@@ -1589,7 +1621,7 @@ mod tests {
     #[test]
     fn a_server_write_waits_less_than_busy_timeout_during_a_slow_batch() {
         crate::store::spawn_guard::prime_gix_lookup();
-        let repo = tempfile::tempdir().unwrap();
+        let repo = crate::test_support::private_tempdir();
         let dir = repo.path();
         git(dir, &["init", "-q", "-b", "main"]);
         // More commits than one budget-sized transaction takes, so the batch
@@ -1600,9 +1632,9 @@ mod tests {
                 &["commit", "-q", "--allow-empty", "-m", &i.to_string()],
             );
         }
-        let data = tempfile::tempdir().unwrap();
-        let server = Backend::sqlite(Store::open(data.path()).unwrap());
-        let importer = Backend::sqlite(Store::open_shared(data.path()).unwrap());
+        let data = crate::test_support::private_tempdir();
+        let server = Backend::open_test(data.path()).unwrap();
+        let importer = Backend::open_test_shared(data.path()).unwrap();
         let opts = ImportOptions {
             rev: "main".into(),
             target_ref: "main".into(),
@@ -1636,36 +1668,5 @@ mod tests {
         // its work.
         assert!(importer.txes() > 2, "the batch was one transaction");
         assert_eq!(report.imported, 160);
-    }
-
-    #[test]
-    fn an_import_that_is_alone_runs_its_batch_in_one_transaction() {
-        crate::store::spawn_guard::prime_gix_lookup();
-        let repo = tempfile::tempdir().unwrap();
-        let dir = repo.path();
-        git(dir, &["init", "-q", "-b", "main"]);
-        // More slow records than one budget-sized transaction takes, so a
-        // shared import would split the batch.
-        for i in 0..30 {
-            git(
-                dir,
-                &["commit", "-q", "--allow-empty", "-m", &i.to_string()],
-            );
-        }
-        let data = tempfile::tempdir().unwrap();
-        let importer = Backend::sqlite(Store::open(data.path()).unwrap());
-        let opts = ImportOptions {
-            rev: "main".into(),
-            target_ref: "main".into(),
-            verify_sample: 0,
-        };
-        // 30 x 40 ms of records is over the 1 s budget: an import that is
-        // alone ignores the budget and runs the batch in one transaction.
-        SLOW_RECORD.with(|c| c.set(Duration::from_millis(40)));
-        let report = import_git(&importer, "r", dir, &opts).unwrap();
-        // One transaction each for the repo, the batch, and the ref: the
-        // batch did not split at the budget.
-        assert_eq!(importer.txes(), 3);
-        assert_eq!(report.imported, 30);
     }
 }

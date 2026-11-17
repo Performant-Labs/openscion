@@ -16,16 +16,18 @@ use scion_proto::v1::LogRequest;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_server::Backend;
 use scion_server::Metrics;
-use scion_server::test_support::backend::from_store;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
-use scion_server::test_support::{service, store::Store, tree};
+use scion_server::test_support::{service, tree};
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
 
 const REPO: &str = "main";
 const TOKEN: &str = "secret";
 /// Longer than one internal page of the reply's producer
-/// (`read::MAX_SCAN` = 1,000), so one call fetches page after page.
+/// (`read::MAX_SCAN` = 1,000), so one call fetches page after page, and
+/// one past a whole number of pages, so the history ends on a full
+/// page's lookahead row: the root rides one row behind a full page, and
+/// a walk that drops it serves 3,000 of 3,001.
 const HISTORY: usize = 3 * 1000 + 1;
 
 type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
@@ -34,8 +36,8 @@ type Scion = ScionClient<InterceptedService<Channel, Bearer>>;
 /// changes: even i changes `d/f.txt`, odd i changes `other.txt`. The
 /// message names i, so a test can tell which changeset an entry holds.
 fn chain(count: usize) -> (tempfile::TempDir, Backend, Vec<scion_core::ChangesetId>) {
-    let dir = tempfile::tempdir().unwrap();
-    let store = from_store(Store::open(dir.path()).unwrap());
+    let dir = scion_server::test_support::private_tempdir();
+    let store = Backend::open_test(dir.path()).unwrap();
     let ids = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -80,6 +82,7 @@ async fn serve(store: Backend, dir: &std::path::Path) -> String {
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::new(Metrics::default()),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         None,
         std::future::pending(),
@@ -243,6 +246,38 @@ async fn log_paging_with_a_path_matches_one_full_walk() {
     want.retain(|i| full.iter().any(|(got, _)| got == i));
     assert_eq!(full.iter().map(|(i, _)| *i).collect::<Vec<_>>(), want);
 
+    let positions: Vec<usize> = full.iter().map(|(i, _)| *i).collect();
+    paged(&mut client, &tip, &positions, 7, b"d/f.txt").await;
+    paged(&mut client, &tip, &positions, 4, b"d/f.txt").await;
+}
+
+/// The same walk over a history whose tip changed the other file: the
+/// window seam then falls on the walk's hit branch, where a guard that
+/// fires one entry early, or an end check that fires one link early,
+/// ends a page mid-history. The pages must still cover every entry
+/// once, in order, and the walk must end only at the root.
+#[tokio::test]
+async fn log_paging_with_a_path_from_the_other_tip_matches_one_full_walk() {
+    let count = 3 * 1000 + 2;
+    let (dir, store, ids) = chain(count);
+    let tip = *ids.last().unwrap();
+    let url = serve(store, dir.path()).await;
+    let mut client = client(&url).await;
+
+    let mut full: Vec<(usize, scion_core::ChangesetId)> = Vec::new();
+    let mut from = tip;
+    let mut pages = 0;
+    loop {
+        pages += 1;
+        assert!(pages <= count, "the walk never left {from:?}");
+        let (ids, next) = call(&mut client, &from, 1_000, b"d/f.txt").await;
+        full.extend(ids);
+        if next.is_empty() {
+            break;
+        }
+        from = scion_core::ChangesetId::try_from(next.as_slice()).unwrap();
+    }
+    assert_eq!(full.len(), count.div_ceil(2), "every second changeset");
     let positions: Vec<usize> = full.iter().map(|(i, _)| *i).collect();
     paged(&mut client, &tip, &positions, 7, b"d/f.txt").await;
     paged(&mut client, &tip, &positions, 4, b"d/f.txt").await;

@@ -1,0 +1,11 @@
+# A path the snapshot does not hold is NOT_FOUND.
+since: v0.1
+method: Scion/ReadFile
+fixture: landed
+
+request.repo: r
+request.changeset_id: $cs
+request.path: src/gone.rs
+
+status: not_found
+message: path "src/gone.rs" not found

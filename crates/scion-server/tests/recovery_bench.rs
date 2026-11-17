@@ -13,10 +13,9 @@ use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPa
 use scion_proto::runtime::auth::{Bearer, Caller};
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{CreateChangesetRequest, LandRequest, PutBlobRequest, ResolveRefRequest};
-use scion_server::test_support::backend::from_store;
+use scion_server::Backend;
 use scion_server::test_support::land::LandState;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
-use scion_server::test_support::store::Store;
 use tonic::transport::Endpoint;
 use tonic_health::pb::health_client::HealthClient;
 
@@ -47,10 +46,11 @@ const READINESS_SERVICE: &str = "scion.v1.Scion";
 #[tokio::test(flavor = "multi_thread")]
 #[ignore = "a measurement for the recovery-time job: run with --ignored --nocapture"]
 async fn a_restart_after_a_kill_recovers_in_a_stated_time() {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
+    // Store::open creates the data directory itself, private whatever
+    // the umask; a directory made here first carries the umask's modes.
     let data = dir.path().join("data");
-    std::fs::create_dir(&data).unwrap();
-    let store = from_store(Store::open(&data).unwrap());
+    let store = Backend::open_test(&data).unwrap();
 
     // The build, the restore bench's shape: REPOS repos of
     // CHANGESETS_PER_REPO changesets each, one file per changeset, every
@@ -101,17 +101,14 @@ async fn a_restart_after_a_kill_recovers_in_a_stated_time() {
                 Instant::now() + Duration::from_secs(600),
             ),
         };
-        store
-            .commit(|c| {
-                let (_, outcome) = c.record_land(&Caller("bench@x".to_string()), &req, None)?;
-                assert_eq!(
-                    outcome.state,
-                    LandState::Pending,
-                    "the built land records as pending"
-                );
-                Ok(())
-            })
+        let (_, recorded) = store
+            .commit(|c| c.record_land(&Caller("bench@x".to_string()), &req, None))
             .unwrap();
+        assert_eq!(
+            recorded.state,
+            LandState::Pending,
+            "the built land records as pending"
+        );
     }
 
     // The seam's handle closes before the server opens the same files:
@@ -179,14 +176,18 @@ fn start_server_named(work: &std::path::Path, log: &str) -> Child {
         .open(work.join(log))
         .expect("the log opens");
     let err = out.try_clone().expect("the log clones");
-    Command::new(env!("CARGO_BIN_EXE_scion-server"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_scion-server"));
+    // The child needs the test database, under the data directory's
+    // own schema.
+    let url = common::postgres_url(&work.join("data"));
+    command.env("SCION_POSTGRES_URL", url);
+    command
         .arg("--data")
         .arg(work.join("data"))
         .arg("serve")
         .arg("--listen")
         .arg(format!("127.0.0.1:{PORT}"))
-        .arg("--token")
-        .arg(TOKEN)
+        .env("SCION_TOKEN", TOKEN)
         .stdout(Stdio::from(out))
         .stderr(Stdio::from(err))
         .spawn()
@@ -349,18 +350,11 @@ async fn land_loop() {
 }
 
 /// The pending lands the crash left, counted straight from the meta
-/// database while no server holds it.
+/// store while no server holds it: the reader the common module keeps
+/// for the server's schema.
 fn pending_lands(data: &std::path::Path) -> u64 {
-    let db = rusqlite::Connection::open(data.join("scion.db")).expect("the meta opens");
-    let pending: u64 = db
-        .query_row(
-            "SELECT count(*) FROM lands WHERE state = 'pending'",
-            [],
-            |r| r.get::<_, i64>(0),
-        )
-        .expect("the lands table reads")
-        .unsigned_abs();
-    pending
+    let (_, pending) = common::LandsReader::open(data).counts();
+    pending.unsigned_abs()
 }
 
 /// The changeset `step` of a chain in `name`: one file backed by `blob`,
@@ -383,3 +377,7 @@ fn chain_changeset(name: &str, step: u8, blob: BlobId, parent: Option<ChangesetI
     )
     .expect("changeset fits the format")
 }
+
+// Every test binary compiles this file and uses its own subset of it.
+#[path = "common/mod.rs"]
+mod common;

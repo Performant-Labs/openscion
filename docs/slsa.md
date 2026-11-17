@@ -3,8 +3,7 @@
 This document says where this project stands against the SLSA Build
 track (v1.2), and what each requirement actually rests on. The release
 pipeline it refers to is [.github/workflows/release.yml](../.github/
-workflows/release.yml); the roadmap names SLSA L3 as a v0.8.0 gate
-([ROADMAP.md](ROADMAP.md)).
+workflows/release.yml).
 
 ## What the pipeline does
 
@@ -18,7 +17,7 @@ SBOM of each shipped binary's crate get a GitHub artifact attestation:
 a DSSE envelope signed by the GitHub-hosted builder, bound to the
 subject's digest. The release step verifies every attestation against
 this repository, then publishes one immutable release. Nothing goes to
-crates.io (D12).
+crates.io.
 
 ## The requirements, one by one
 
@@ -46,7 +45,8 @@ here, and what it rests on.
   only the owner can turn on. They are on the checklist in
   [RELEASING.md](RELEASING.md). Until they exist, source identity
   rests on the workflow's own checks, which a maintainer could bypass.
-- `release-environment.txt` travels with the artifacts and is hashed,
+- `<cell>-release-environment.txt` travels with the artifacts and is
+  hashed,
   but it is not a SLSA "resolved dependencies" record. Reproducibility
   (#390) is the compensating control: two runners agreeing byte for
   byte proves the environment is described well enough to rebuild.

@@ -4,8 +4,7 @@
 //! index tip must not cost 2,000 of them. The guard counts the
 //! statements of one land whose catch-up crosses 100 and 1,000
 //! changesets: the 1,000-deep land may cost a page or two more, not
-//! nine hundred. On SQLite the count is always zero, which is why the
-//! test skips there.
+//! nine hundred.
 
 use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
@@ -83,7 +82,7 @@ fn move_main(store: &Backend, repo: RepoId, to: ChangesetId) {
 /// The statements one land costs when the ref moved `n` changesets past
 /// the path index's tip: the land's catch-up walks all `n` of them.
 fn catch_up_statements(n: usize) -> u64 {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let (store, repo, root) = setup(dir.path());
     let lands = Lands::default();
     // The index tip: one landed changeset, so the index holds a tip
@@ -143,10 +142,7 @@ fn catch_up_statements(n: usize) -> u64 {
 /// The page statement returns the whole page: one call, `limit` rows.
 #[test]
 fn the_page_statement_returns_the_whole_page() {
-    if !Backend::test_is_postgres() {
-        return;
-    }
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let (store, repo, root) = setup(dir.path());
     let mut head = root;
     for i in 0..50 {
@@ -161,19 +157,18 @@ fn the_page_statement_returns_the_whole_page() {
 }
 
 /// A 1,000-deep catch-up costs a page or two more than a 100-deep one,
-/// not a statement per changeset.
+/// not a statement per changeset. The page reads carry the depth: since
+/// the walks read first parents in pages, both depths cost about the
+/// same, and the bound holds in either direction.
 #[test]
 fn the_catch_up_walk_reads_first_parents_in_pages() {
-    if !Backend::test_is_postgres() {
-        return;
-    }
     let hundred = catch_up_statements(100);
     let thousand = catch_up_statements(1_000);
     assert!(
-        thousand - hundred <= 20,
-        "the 1,000-deep catch-up costs {} statements over the 100-deep one \
+        thousand.abs_diff(hundred) <= 20,
+        "the 1,000-deep catch-up costs {} statements against the 100-deep one \
          ({} vs {}): the walk reads first parents one changeset at a time",
-        thousand - hundred,
+        thousand.abs_diff(hundred),
         thousand,
         hundred
     );

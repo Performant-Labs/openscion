@@ -153,9 +153,45 @@ pub struct Metrics {
     /// latest poll saw them (`data_free_set` says whether any poll ran).
     data_free_bytes: AtomicU64,
     data_free_set: std::sync::atomic::AtomicBool,
+    /// Free inodes of the filesystem that holds the data directory: one
+    /// blob costs one inode (docs/operations.md "The inode budget"). The
+    /// latest poll saw it (`data_free_inodes_set` says whether any poll
+    /// ran); it shares the free-bytes poll's failure policy.
+    data_free_inodes: AtomicU64,
+    data_free_inodes_set: std::sync::atomic::AtomicBool,
+    /// Seconds since the free-space poll's last good sample, set on
+    /// every poll tick (`data_free_sample_age_set` says whether any
+    /// sample landed). A stuck statvfs stops the samples but not the
+    /// poll, so this gauge is what makes the stuck sample visible and
+    /// alertable; the free values keep their last good readings.
+    data_free_sample_age: AtomicU64,
+    data_free_sample_age_set: std::sync::atomic::AtomicBool,
+    /// Blobs the metadata names, as the latest refresh saw them
+    /// (`blob_count_set` says whether any refresh ran).
+    blob_count: AtomicU64,
+    blob_count_set: std::sync::atomic::AtomicBool,
+    /// Milliseconds the latest blob-count refresh took, success or
+    /// failure (`blob_count_refresh_set` says whether any refresh ran).
+    /// Stored in milliseconds so a sub-second scan keeps its fraction;
+    /// the gauge renders seconds with three decimals. The refresh
+    /// spaces itself by its own cost, so this gauge is what an operator
+    /// reads to learn how stale the count may be.
+    blob_count_refresh_ms: AtomicU64,
+    blob_count_refresh_set: std::sync::atomic::AtomicBool,
+    /// The memory floor the server's budgets sum to, set at start
+    /// (`memory_floor_set` says the start-up check ran).
+    memory_floor_bytes: AtomicU64,
+    memory_floor_set: std::sync::atomic::AtomicBool,
+    /// The host's memory limit, as the start-up check read it
+    /// (`host_memory_set` says whether it read one).
+    host_memory_bytes: AtomicU64,
+    host_memory_set: std::sync::atomic::AtomicBool,
     /// Derive walks in flight, and walks waiting for a permit.
     derive_walks_in_flight: AtomicU64,
     derive_walks_waiting: AtomicU64,
+    /// The bytes the paged diffs' rename maps hold in the read path's
+    /// cache, as its cap reports.
+    diff_rename_cache_bytes: AtomicU64,
     /// The Postgres reader pool: the time calls waited for a reader, as
     /// the same buckets as `latency`, with the sum and the count. The
     /// last two fields are the gauges: readers out of the pool, and the
@@ -163,11 +199,29 @@ pub struct Metrics {
     pg_pool_wait: [AtomicU64; BUCKETS.len() + 2],
     pg_readers_busy: AtomicU64,
     pg_tx_age: AtomicU64,
+    /// Audit reopens the server refused: a rename-plus-signal rotation
+    /// whose fresh open failed (a symlink at the path, an unwritable
+    /// directory), counted by the audit writer and sampled into
+    /// [`Self::audit_reopens_failed`], as `scion_audit_reopens_failed_total`.
+    audit_reopens_failed: AtomicU64,
+    /// What the audit's last reopen did: 1 after a refused one, 0
+    /// after a successful one, sampled into
+    /// [`Self::audit_reopen_failing`], as `scion_audit_reopen_failing`:
+    /// the state the failed-reopen alert reads.
+    audit_reopen_failing: AtomicU64,
     /// Bytes that stalled replies of live connections hold, as one
     /// [`crate::STALLED_REPLY_BYTES`]-sized estimate per stalled reply,
     /// counted by [`crate::runtime::listen::Stalled`] and given back when
     /// the stalled reply's stream ends.
     stalled_reply_bytes: AtomicU64,
+    /// Connections the server closed because no place freed within its
+    /// wait at the connection cap (`CONNECTION_WAIT` in
+    /// [`crate::runtime::listen`]), counted by the accept paths.
+    connections_refused: AtomicU64,
+    /// Accepts the listener failed (most often the process out of file
+    /// descriptors), counted by the accept tasks, which pace themselves
+    /// after failures so a persistent failure cannot spin a core.
+    accept_errors: AtomicU64,
     /// Calls the counting layer has seen whose reply body it has not
     /// given back yet: the calls a drain still waits for, as the
     /// [`scion_calls_in_flight`] gauge. A call that never reaches a
@@ -179,6 +233,30 @@ pub struct Metrics {
 /// A metric name, as the index of its RPC.
 #[derive(Clone, Copy)]
 pub struct Rpc(usize);
+
+/// The blob count docs/support.md supports per data directory: what
+/// `scion_blob_ceiling_share` divides by.
+const SUPPORTED_BLOBS: u64 = 1_000_000;
+
+/// The blob count as a share of the ceiling. The counts the ceiling
+/// names stay far under 2^52, so the f64 divide loses nothing.
+#[must_use]
+/// Milliseconds as seconds with the fraction kept: the value is a
+/// duration, so the f64's 52-bit mantissa loses nothing a duration
+/// could carry.
+fn seconds_of(milliseconds: u64) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let ms = milliseconds as f64;
+    ms / 1000.0
+}
+
+fn share_of_ceiling(count: u64) -> f64 {
+    #[allow(clippy::cast_precision_loss)]
+    let count = count as f64;
+    #[allow(clippy::cast_precision_loss)]
+    let ceiling = SUPPORTED_BLOBS as f64;
+    count / ceiling
+}
 
 impl Metrics {
     /// The counter of the RPC at `path` (like `/scion.v1.Scion/Blame`).
@@ -302,6 +380,61 @@ impl Metrics {
         self.data_free_set.store(true, Ordering::Relaxed);
     }
 
+    /// Sets the free-inodes gauge. Same policy as [`Self::data_free_bytes`]:
+    /// the latest poll is the value.
+    pub fn data_free_inodes(&self, inodes: u64) {
+        self.data_free_inodes.store(inodes, Ordering::Relaxed);
+        self.data_free_inodes_set.store(true, Ordering::Relaxed);
+    }
+
+    /// Sets the free-space sample's age, from the latest poll tick. The
+    /// first good sample arms it; every tick after that refreshes it,
+    /// so a poll whose statvfs hangs grows the age while the free
+    /// values hold.
+    pub fn data_free_sample_age(&self, seconds: u64) {
+        self.data_free_sample_age.store(seconds, Ordering::Relaxed);
+        self.data_free_sample_age_set.store(true, Ordering::Relaxed);
+    }
+
+    /// Sets the blob count the metadata names, from the latest refresh.
+    pub fn set_blob_count(&self, blobs: u64) {
+        self.blob_count.store(blobs, Ordering::Relaxed);
+        self.blob_count_set.store(true, Ordering::Relaxed);
+    }
+
+    /// Sets the milliseconds the latest blob-count refresh took,
+    /// success or failure: the refresh spaces itself by this, so a slow
+    /// scan waits proportionally longer before the next one.
+    pub fn set_blob_count_refresh_ms(&self, milliseconds: u64) {
+        self.blob_count_refresh_ms
+            .store(milliseconds, Ordering::Relaxed);
+        self.blob_count_refresh_set.store(true, Ordering::Relaxed);
+    }
+
+    /// Sets the memory floor the server's budgets sum to, at start.
+    pub fn set_memory_floor_bytes(&self, bytes: u64) {
+        self.memory_floor_bytes.store(bytes, Ordering::Relaxed);
+        self.memory_floor_set.store(true, Ordering::Relaxed);
+    }
+
+    /// Sets the host's memory limit, as the start-up check read it.
+    pub fn set_host_memory_bytes(&self, bytes: u64) {
+        self.host_memory_bytes.store(bytes, Ordering::Relaxed);
+        self.host_memory_set.store(true, Ordering::Relaxed);
+    }
+
+    /// The host's memory limit the start-up check read, if it ran.
+    #[must_use]
+    pub fn host_memory_bytes(&self) -> u64 {
+        self.host_memory_bytes.load(Ordering::Relaxed)
+    }
+
+    /// The memory floor the server's budgets sum to, if the check ran.
+    #[must_use]
+    pub fn memory_floor_bytes(&self) -> u64 {
+        self.memory_floor_bytes.load(Ordering::Relaxed)
+    }
+
     /// Counts one derive walk that took its permit.
     pub fn derive_walk_started(&self) {
         self.derive_walks_in_flight.fetch_add(1, Ordering::Relaxed);
@@ -310,6 +443,12 @@ impl Metrics {
     /// Counts one derive walk that gave its permit back.
     pub fn derive_walk_ended(&self) {
         self.derive_walks_in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+
+    /// Sets the bytes the paged diffs' rename maps hold in the read
+    /// path's cache.
+    pub fn set_diff_rename_cache_bytes(&self, bytes: u64) {
+        self.diff_rename_cache_bytes.store(bytes, Ordering::Relaxed);
     }
 
     /// Counts one walk that waits for a permit; the pair brackets each
@@ -352,6 +491,18 @@ impl Metrics {
         self.pg_readers_busy.store(busy, Ordering::Relaxed);
     }
 
+    /// Sets the total of audit reopens the server refused, sampled from
+    /// the audit's own counter.
+    pub fn audit_reopens_failed(&self, failed: u64) {
+        self.audit_reopens_failed.store(failed, Ordering::Relaxed);
+    }
+
+    /// Sets the gauge of what the audit's last reopen did: 1 failing,
+    /// 0 fine.
+    pub fn audit_reopen_failing(&self, failing: u64) {
+        self.audit_reopen_failing.store(failing, Ordering::Relaxed);
+    }
+
     /// Sets the gauge of the age of the oldest open read transaction.
     pub fn pg_tx_age(&self, age: std::time::Duration) {
         self.pg_tx_age.store(
@@ -392,6 +543,19 @@ impl Metrics {
         self.stalled_reply_bytes.load(Ordering::Relaxed)
     }
 
+    /// Counts a connection the cap refused: it waited for a place past
+    /// the wait and the server closed it. The export renders it as
+    /// `scion_connections_refused_total`.
+    pub(crate) fn connection_refused(&self) {
+        self.connections_refused.fetch_add(1, Ordering::Relaxed);
+    }
+
+    /// Counts one accept the listener failed. The export renders it as
+    /// `scion_accept_errors_total`.
+    pub(crate) fn accept_error(&self) {
+        self.accept_errors.fetch_add(1, Ordering::Relaxed);
+    }
+
     /// Renders the registry as the Prometheus text format.
     #[must_use]
     pub fn render(&self) -> String {
@@ -414,10 +578,97 @@ impl Metrics {
                 self.data_free_bytes.load(Ordering::Relaxed)
             );
         }
+        if self.data_free_inodes_set.load(Ordering::Relaxed) {
+            let _ = writeln!(
+                text,
+                "# HELP scion_data_free_inodes Free inodes of the filesystem that holds the data directory; one blob costs one inode (docs/operations.md, The inode budget).\n\
+                 # TYPE scion_data_free_inodes gauge\n\
+                 scion_data_free_inodes {}",
+                self.data_free_inodes.load(Ordering::Relaxed)
+            );
+        }
+        if self.data_free_sample_age_set.load(Ordering::Relaxed) {
+            let _ = writeln!(
+                text,
+                "# HELP scion_data_free_sample_age_seconds Seconds since the free-space poll's last good sample; a growing age says the poll's statvfs is stuck.\n\
+                 # TYPE scion_data_free_sample_age_seconds gauge\n\
+                 scion_data_free_sample_age_seconds {}",
+                self.data_free_sample_age.load(Ordering::Relaxed)
+            );
+        }
+        if self.blob_count_set.load(Ordering::Relaxed) {
+            let count = self.blob_count.load(Ordering::Relaxed);
+            let _ = writeln!(
+                text,
+                "# HELP scion_blob_count Blobs the metadata names; docs/support.md supports 1,000,000 per data directory.
+\
+                 # TYPE scion_blob_count gauge
+\
+                 scion_blob_count {}
+\
+                 # HELP scion_blob_ceiling_share The blob count as a share of the 1,000,000 blobs docs/support.md supports per data directory.
+\
+                 # TYPE scion_blob_ceiling_share gauge
+\
+                 scion_blob_ceiling_share {}",
+                count,
+                share_of_ceiling(count)
+            );
+        }
+        if self.blob_count_refresh_set.load(Ordering::Relaxed) {
+            let _ = writeln!(
+                text,
+                "# HELP scion_blob_count_refresh_seconds Seconds the latest blob-count refresh took, success or failure; the refresh waits at least 100x this before the next one, so a large store's count may be minutes stale.\n\
+                 # TYPE scion_blob_count_refresh_seconds gauge\n\
+                 scion_blob_count_refresh_seconds {:.3}",
+                seconds_of(self.blob_count_refresh_ms.load(Ordering::Relaxed))
+            );
+        }
+        if self.memory_floor_set.load(Ordering::Relaxed) {
+            let _ = writeln!(
+                text,
+                "# HELP scion_memory_floor_bytes The memory floor the server's budgets and caps sum to, which its host needs.\n\
+                 # TYPE scion_memory_floor_bytes gauge\n\
+                 scion_memory_floor_bytes {}",
+                self.memory_floor_bytes.load(Ordering::Relaxed)
+            );
+        }
+        if self.host_memory_set.load(Ordering::Relaxed) {
+            let _ = writeln!(
+                text,
+                "# HELP scion_host_memory_bytes The host's memory limit, as the start-up check read it: the cgroup limit, or the host's total.\n\
+                 # TYPE scion_host_memory_bytes gauge\n\
+                 scion_host_memory_bytes {}",
+                self.host_memory_bytes.load(Ordering::Relaxed)
+            );
+        }
         self.render_derive_walks(&mut text);
         self.render_pg(&mut text);
+        self.render_connections(&mut text);
         self.render_stalled(&mut text);
         text
+    }
+
+    /// The connections a full cap closed: the series an operator reads to
+    /// tell a storm from a cap set too low. A client that left while it
+    /// waited counts here too: the server learns of the leaving only when
+    /// the wait ends.
+    fn render_connections(&self, text: &mut String) {
+        use std::fmt::Write as _;
+        let _ = writeln!(
+            text,
+            "# HELP scion_connections_refused_total Connections the server closed because no place freed within its wait at the connection cap; a client that left while it waited counts here too.\n\
+             # TYPE scion_connections_refused_total counter\n\
+             scion_connections_refused_total {}",
+            self.connections_refused.load(Ordering::Relaxed)
+        );
+        let _ = writeln!(
+            text,
+            "# HELP scion_accept_errors_total Accepts the listener failed; a persistent failure leaves new clients unserved, and the accept task paces itself after failures.\n\
+             # TYPE scion_accept_errors_total counter\n\
+             scion_accept_errors_total {}",
+            self.accept_errors.load(Ordering::Relaxed)
+        );
     }
 
     /// The per-RPC latency histograms, one series per RPC that counted.
@@ -585,6 +836,11 @@ impl Metrics {
                 "Derive walks waiting for a permit.",
                 &self.derive_walks_waiting,
             ),
+            (
+                "scion_diff_rename_cache_bytes",
+                "The bytes the paged diffs' rename maps hold in the read path's cache.",
+                &self.diff_rename_cache_bytes,
+            ),
         ] {
             let value = gauge.load(Ordering::Relaxed);
             if value > 0 {
@@ -639,6 +895,24 @@ impl Metrics {
             text,
             "scion_pg_tx_age_seconds {}",
             seconds(self.pg_tx_age.load(Ordering::Relaxed))
+        );
+        text.push_str(
+            "# HELP scion_audit_reopens_failed_total Audit reopens the server refused: a rename-and-signal rotation whose fresh open failed, with the old file still recording.\n",
+        );
+        text.push_str("# TYPE scion_audit_reopens_failed_total counter\n");
+        let _ = writeln!(
+            text,
+            "scion_audit_reopens_failed_total {}",
+            self.audit_reopens_failed.load(Ordering::Relaxed)
+        );
+        text.push_str(
+            "# HELP scion_audit_reopen_failing What the audit's last reopen did: 1 after a refused one, 0 after a successful one; the state the failed-reopen alert reads.\n",
+        );
+        text.push_str("# TYPE scion_audit_reopen_failing gauge\n");
+        let _ = writeln!(
+            text,
+            "scion_audit_reopen_failing {}",
+            self.audit_reopen_failing.load(Ordering::Relaxed)
         );
     }
 
@@ -889,6 +1163,45 @@ type BoxedBody = std::pin::Pin<
     >,
 >;
 
+/// The request body the layer hands in: it counts the bytes of the data
+/// frames into a shared counter, so a request that streams without a
+/// content-length still reports its real size. Whoever reads the request
+/// body (its handler, the transport) makes the counter move.
+struct CountingFrames {
+    inner: BoxedBody,
+    counted_in: std::sync::Arc<std::sync::atomic::AtomicU64>,
+}
+
+impl http_body::Body for CountingFrames {
+    type Data = bytes::Bytes;
+    type Error = Box<dyn std::error::Error + Send + Sync>;
+
+    fn poll_frame(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Result<http_body::Frame<Self::Data>, Self::Error>>> {
+        let this = self.get_mut();
+        match this.inner.as_mut().poll_frame(cx) {
+            std::task::Poll::Ready(Some(Ok(frame))) => {
+                if let Some(data) = frame.data_ref() {
+                    this.counted_in
+                        .fetch_add(data.len() as u64, std::sync::atomic::Ordering::Relaxed);
+                }
+                std::task::Poll::Ready(Some(Ok(frame)))
+            }
+            other => other,
+        }
+    }
+
+    fn is_end_stream(&self) -> bool {
+        self.inner.is_end_stream()
+    }
+
+    fn size_hint(&self) -> http_body::SizeHint {
+        self.inner.size_hint()
+    }
+}
+
 /// The reply body the layer hands back: it counts the bytes of the data
 /// frames, and on the trailers frame it counts the whole call, so a
 /// streaming reply's code and bytes arrive when its last frame does. A body
@@ -898,7 +1211,10 @@ struct CountingBody {
     metrics: std::sync::Arc<Metrics>,
     rpc: Rpc,
     started: Instant,
+    /// The request's content-length, when the client sent one.
     bytes_in: u64,
+    /// The bytes its request body's frames carried.
+    bytes_in_frames: std::sync::Arc<std::sync::atomic::AtomicU64>,
     bytes_out: u64,
     /// Set once the call is counted, by the trailers or by the drop.
     counted: bool,
@@ -930,13 +1246,9 @@ impl http_body::Body for CountingBody {
                         .and_then(|v| v.to_str().ok())
                         .and_then(|v| v.parse::<u32>().ok())
                         .unwrap_or(0);
-                    this.metrics.request(
-                        this.rpc,
-                        code,
-                        this.started,
-                        this.bytes_in,
-                        this.bytes_out,
-                    );
+                    let (bytes_in, bytes_out) = this.moved_bytes();
+                    this.metrics
+                        .request(this.rpc, code, this.started, bytes_in, bytes_out);
                 }
                 std::task::Poll::Ready(Some(Ok(frame)))
             }
@@ -953,14 +1265,29 @@ impl http_body::Body for CountingBody {
     }
 }
 
+impl CountingBody {
+    /// The bytes the call moved: the request's own frames when its body
+    /// flowed (the truth, whether or not the client sent a length), or
+    /// the client's content-length when it did not flow and the client
+    /// named one.
+    fn moved_bytes(&self) -> (u64, u64) {
+        let frames = self
+            .bytes_in_frames
+            .load(std::sync::atomic::Ordering::Relaxed);
+        let bytes_in = if frames > 0 { frames } else { self.bytes_in };
+        (bytes_in, self.bytes_out)
+    }
+}
+
 impl Drop for CountingBody {
     fn drop(&mut self) {
         // The guard's drop gives the call back to the in-flight gauge,
         // whether the reply ended or the transport dropped the body.
         drop(self.guard.take());
         if !self.counted {
+            let (bytes_in, bytes_out) = self.moved_bytes();
             self.metrics
-                .cancelled(self.rpc, self.started, self.bytes_in, self.bytes_out);
+                .cancelled(self.rpc, self.started, bytes_in, bytes_out);
         }
     }
 }
@@ -1066,14 +1393,24 @@ where
             metrics: std::sync::Arc::clone(&metrics),
         };
         metrics.call_started();
-        // The bytes of a request: its content-length, or what its body
-        // hints, or nothing (a streaming request that sends no length).
+        // The bytes of a request: the frames of its body as they flow (a
+        // gRPC client sends no content-length), or the client's
+        // content-length when its body never flows and the client named
+        // one. The counter is shared with the reply's `CountingBody`,
+        // which reports when its own trailers arrive.
         let bytes_in = request
             .headers()
             .get(http::header::CONTENT_LENGTH)
             .and_then(|v| v.to_str().ok())
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(0);
+        let bytes_in_frames = std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0));
+        let request = request.map(|body| {
+            tonic::body::Body::new(CountingFrames {
+                inner: boxed(body),
+                counted_in: std::sync::Arc::clone(&bytes_in_frames),
+            })
+        });
         let future = self.inner.call(request);
         Box::pin(async move {
             // Every reply body goes through a `CountingBody` or, for a path
@@ -1094,6 +1431,8 @@ where
                 None => None,
             };
             if let (Some(rpc), Some(code)) = (rpc, code) {
+                let frames = bytes_in_frames.load(std::sync::atomic::Ordering::Relaxed);
+                let bytes_in = if frames > 0 { frames } else { bytes_in };
                 metrics.request(rpc, code, started, bytes_in, 0);
                 counted = true;
             }
@@ -1105,6 +1444,7 @@ where
                         rpc,
                         started,
                         bytes_in,
+                        bytes_in_frames,
                         bytes_out: 0,
                         counted,
                         guard: Some(guard),
@@ -1129,7 +1469,11 @@ mod tests {
 
     /// Polls a boxed body to its end with a no-op waker: the frames of
     /// these tests are ready at once.
-    fn drain(body: &mut CountingBody) {
+    fn drain<B>(body: &mut B)
+    where
+        B: http_body::Body<Data = bytes::Bytes> + Unpin,
+        B::Error: std::fmt::Display,
+    {
         use http_body::Body as _;
         let waker = Waker::noop();
         let mut cx = std::task::Context::from_waker(waker);
@@ -1164,6 +1508,7 @@ mod tests {
             rpc,
             started: Instant::now(),
             bytes_in: 7,
+            bytes_in_frames: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             bytes_out: 0,
             counted: false,
             guard: None,
@@ -1192,6 +1537,33 @@ mod tests {
         );
     }
 
+    /// The blob-count gauge renders the count and its share of the
+    /// supported ceiling, and nothing until the first refresh set it.
+    #[test]
+    fn the_blob_count_renders_the_count_and_its_share() {
+        let metrics = std::sync::Arc::new(Metrics::default());
+        let text = metrics.render();
+        assert!(!text.contains("scion_blob_count"), "{text}");
+        metrics.set_blob_count(3);
+        // A sub-second scan keeps its fraction: 612 ms renders 0.612,
+        // not 0, so the staleness the docs point at is honest at the
+        // sizes where the wait matters.
+        metrics.set_blob_count_refresh_ms(612);
+        let text = metrics.render();
+        assert!(text.contains("scion_blob_count 3\n"), "{text}");
+        assert!(
+            text.contains("scion_blob_count_refresh_seconds 0.612"),
+            "{text}"
+        );
+        assert!(
+            text.contains("scion_blob_ceiling_share 0.000003\n"),
+            "{text}"
+        );
+        metrics.set_blob_count(500_000);
+        let text = metrics.render();
+        assert!(text.contains("scion_blob_ceiling_share 0.5\n"), "{text}");
+    }
+
     /// A body dropped before its trailers counts the call as cancelled.
     #[test]
     fn a_dropped_body_counts_the_call_as_cancelled() {
@@ -1207,6 +1579,7 @@ mod tests {
             rpc,
             started: Instant::now(),
             bytes_in: 0,
+            bytes_in_frames: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
             bytes_out: 0,
             counted: false,
             guard: None,
@@ -1237,6 +1610,7 @@ mod tests {
         let text = metrics.render();
         assert!(!text.contains("scion_blob_sync_seconds"), "{text}");
         assert!(!text.contains("scion_data_free_bytes"), "{text}");
+        assert!(!text.contains("scion_blob_count"), "{text}");
         assert!(!text.contains("scion_derive_walks"), "{text}");
         assert!(!text.contains("scion_pg_collector_key_wait"), "{text}");
 
@@ -1360,5 +1734,464 @@ mod tests {
         let text = empty.render();
         assert!(text.contains("scion_pg_tx_age_seconds 0"), "{text}");
         assert!(!text.contains("scion_pg_pool_wait_seconds_count"), "{text}");
+    }
+
+    /// A gRPC client streams its request without a content-length: the
+    /// counted request bytes are the frames its body carried, so the
+    /// metric is not pinned at zero.
+    #[tokio::test]
+    async fn a_streamed_request_counts_the_bytes_its_body_carried() {
+        let metrics = std::sync::Arc::new(Metrics::default());
+        let service = MetricsLayer::new(metrics.clone()).layer(tower::service_fn(
+            |req: http::Request<tonic::body::Body>| async move {
+                use http_body::Body as _;
+                // The handler reads the whole request body: the frames
+                // flow, and the counter they fill is the truth.
+                let (_, mut body) = req.into_parts();
+                loop {
+                    match std::pin::pin!(&mut body)
+                        .poll_frame(&mut std::task::Context::from_waker(Waker::noop()))
+                    {
+                        Poll::Ready(Some(Ok(_))) => {}
+                        Poll::Ready(None) => break,
+                        other => panic!("unexpected frame: {other:?}"),
+                    }
+                }
+                let mut reply = http::Response::new(tonic::body::Body::empty());
+                reply
+                    .headers_mut()
+                    .insert("grpc-status", "0".parse().unwrap());
+                Ok::<_, std::convert::Infallible>(reply.map(tonic::body::Body::new))
+            },
+        ));
+        let body = StreamBody::new(tokio_stream::iter([
+            Ok::<_, std::convert::Infallible>(http_body::Frame::data(bytes::Bytes::from_static(
+                b"ab",
+            ))),
+            Ok(http_body::Frame::data(bytes::Bytes::from_static(b"cd"))),
+        ]));
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("http://localhost/scion.v1.Scion/Blame")
+            .body(tonic::body::Body::new(body))
+            .unwrap();
+        let mut service = service;
+        tower::Service::call(&mut service, request).await.unwrap();
+        let text = metrics.render();
+        assert!(
+            text.contains("scion_rpc_bytes_total{rpc=\"Scion/Blame\",direction=\"in\"} 4\n"),
+            "{text}"
+        );
+    }
+
+    /// A client that named a content-length and whose body nobody reads
+    /// (a refusal) still counts what the client declared.
+    #[tokio::test]
+    async fn an_unread_request_counts_the_length_the_client_sent() {
+        let metrics = std::sync::Arc::new(Metrics::default());
+        let service = MetricsLayer::new(metrics.clone()).layer(tower::service_fn(
+            |_req: http::Request<tonic::body::Body>| async move {
+                let mut reply = http::Response::new(tonic::body::Body::empty());
+                reply
+                    .headers_mut()
+                    .insert("grpc-status", "7".parse().unwrap());
+                Ok::<_, std::convert::Infallible>(reply.map(tonic::body::Body::new))
+            },
+        ));
+        let request = http::Request::builder()
+            .method(http::Method::POST)
+            .uri("http://localhost/scion.v1.Scion/Blame")
+            .header(http::header::CONTENT_LENGTH, "9")
+            .body(tonic::body::Body::empty())
+            .unwrap();
+        let mut service = service;
+        tower::Service::call(&mut service, request).await.unwrap();
+        let text = metrics.render();
+        assert!(
+            text.contains("scion_rpc_bytes_total{rpc=\"Scion/Blame\",direction=\"in\"} 9\n"),
+            "{text}"
+        );
+    }
+
+    /// The request body's own frames outweigh the client's declared
+    /// content-length: `moved_bytes` reads the frames when they flowed.
+    #[test]
+    fn the_request_frames_outweigh_a_declared_content_length() {
+        let metrics = std::sync::Arc::new(Metrics::default());
+        let rpc = metrics.rpc("/scion.v1.Scion/Blame").unwrap();
+        let body = CountingBody {
+            inner: boxed(StreamBody::new(tokio_stream::iter(Vec::<
+                Result<http_body::Frame<bytes::Bytes>, std::convert::Infallible>,
+            >::new()))),
+            metrics: metrics.clone(),
+            rpc,
+            started: Instant::now(),
+            bytes_in: 7,
+            bytes_in_frames: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(5)),
+            bytes_out: 3,
+            counted: false,
+            guard: None,
+        };
+        assert_eq!(body.moved_bytes(), (5, 3));
+    }
+
+    /// The counting bodies hand `is_end_stream` and `size_hint` through,
+    /// so a swap serves wrong hints to the transport.
+    #[test]
+    fn the_counting_bodies_delegate_the_hints() {
+        use http_body::Body as _;
+        let metrics = std::sync::Arc::new(Metrics::default());
+        let rpc = metrics.rpc("/scion.v1.Scion/Blame").unwrap();
+        let frames: Vec<Result<http_body::Frame<bytes::Bytes>, std::convert::Infallible>> =
+            vec![Ok(http_body::Frame::data(bytes::Bytes::from_static(b"hi")))];
+        let frames_body = CountingFrames {
+            inner: boxed(StreamBody::new(tokio_stream::iter(frames))),
+            counted_in: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        assert!(!frames_body.is_end_stream(), "a frame is still coming");
+        let mut body = CountingBody {
+            inner: boxed(http_body_util::Full::new(bytes::Bytes::from_static(b"hi"))),
+            metrics: metrics.clone(),
+            rpc,
+            started: Instant::now(),
+            bytes_in: 0,
+            bytes_in_frames: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+            bytes_out: 0,
+            counted: false,
+            guard: None,
+        };
+        assert!(!body.is_end_stream(), "a full body holds its frame");
+        assert_eq!(body.size_hint().lower(), 2);
+        assert_eq!(body.size_hint().upper(), Some(2));
+        drain(&mut body);
+        assert!(body.is_end_stream(), "a full body ends");
+        // The same delegation over a body that knows its own end: a
+        // Full's frames end once its one frame is polled.
+        let mut full = CountingFrames {
+            inner: boxed(http_body_util::Full::new(bytes::Bytes::from_static(b"hi"))),
+            counted_in: std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
+        };
+        assert_eq!(
+            full.size_hint().lower(),
+            2,
+            "the frames hint follows the inner"
+        );
+        drain(&mut full);
+        assert!(
+            full.is_end_stream(),
+            "a frames body ends once its frames do"
+        );
+    }
+
+    /// The in-flight gauge returns when the guard drops, however the call
+    /// ended: the drain waits on exactly this gauge.
+    #[test]
+    fn a_dropped_guard_gives_the_in_flight_gauge_back() {
+        let metrics = std::sync::Arc::new(Metrics::default());
+        metrics.call_started();
+        assert_eq!(metrics.calls_in_flight(), 1);
+        drop(CallGuard {
+            metrics: metrics.clone(),
+        });
+        assert_eq!(metrics.calls_in_flight(), 0);
+    }
+
+    /// The metrics listener takes loopback addresses, and non-loopback
+    /// ones only with `allow_insecure`: the endpoint is plain HTTP.
+    #[test]
+    fn the_metrics_listener_takes_loopback_only_unless_allowed() {
+        let loopback: std::net::SocketAddr = "127.0.0.1:9100".parse().unwrap();
+        let wild: std::net::SocketAddr = "0.0.0.0:9100".parse().unwrap();
+        assert!(loopback_or_allow(loopback, false).is_ok());
+        assert!(loopback_or_allow(wild, true).is_ok());
+        let why = loopback_or_allow(wild, false).unwrap_err();
+        assert!(why.contains("not a loopback address"), "{why}");
+        assert!(why.contains("--insecure-listen"), "{why}");
+    }
+
+    /// `/metrics` renders, another path answers 404, and the shutdown
+    /// future ends the serve loop cleanly.
+    #[tokio::test]
+    async fn the_metrics_endpoint_serves_and_shuts_down() {
+        async fn scrape(addr: std::net::SocketAddr, path: &str) -> String {
+            use tokio::io::{AsyncReadExt, AsyncWriteExt};
+            let mut stream = tokio::net::TcpStream::connect(addr).await.unwrap();
+            stream
+                .write_all(
+                    format!("GET {path} HTTP/1.1\r\nhost: t\r\nconnection: close\r\n\r\n")
+                        .as_bytes(),
+                )
+                .await
+                .unwrap();
+            let mut buf = Vec::new();
+            stream.read_to_end(&mut buf).await.unwrap();
+            String::from_utf8_lossy(&buf).to_string()
+        }
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let metrics = std::sync::Arc::new(Metrics::default());
+        metrics.blob_sync(4_000);
+        let (shutdown_tx, shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let server = tokio::spawn(serve(listener, metrics.clone(), async move {
+            let _ = shutdown_rx.await;
+        }));
+        let page = scrape(addr, "/metrics").await;
+        assert!(page.contains("200"), "{page}");
+        assert!(page.contains("scion_blob_sync_seconds_count 1"), "{page}");
+        let other = scrape(addr, "/nope").await;
+        assert!(other.contains("404"), "{other}");
+        let _ = shutdown_tx.send(());
+        let _: std::io::Result<()> =
+            tokio::time::timeout(std::time::Duration::from_secs(5), server)
+                .await
+                .expect("serve ends on shutdown")
+                .expect("serve ends without an error");
+    }
+
+    /// Every gRPC code renders under its own label: the label table is the
+    /// metric surface's vocabulary.
+    #[test]
+    fn every_code_renders_under_its_own_label() {
+        let codes = [
+            (tonic::Code::Aborted, "aborted"),
+            (tonic::Code::DeadlineExceeded, "deadline_exceeded"),
+            (tonic::Code::ResourceExhausted, "resource_exhausted"),
+            (tonic::Code::Unavailable, "unavailable"),
+            (tonic::Code::NotFound, "not_found"),
+            (tonic::Code::InvalidArgument, "invalid_argument"),
+            (tonic::Code::PermissionDenied, "permission_denied"),
+            (tonic::Code::FailedPrecondition, "failed_precondition"),
+            (tonic::Code::Cancelled, "cancelled"),
+            (tonic::Code::Internal, "internal"),
+            (tonic::Code::Unauthenticated, "internal"),
+            (tonic::Code::Unknown, "internal"),
+        ];
+        for (code, label) in codes {
+            assert_eq!(code_label(code), label, "{code:?}");
+        }
+    }
+
+    /// A code the binary does not know counts in the last (internal) slot,
+    /// not out of bounds.
+    #[test]
+    fn an_unknown_code_counts_as_internal() {
+        let metrics = std::sync::Arc::new(Metrics::default());
+        let rpc = metrics.rpc("/scion.v1.Scion/Blame").unwrap();
+        metrics.request(rpc, 99, Instant::now(), 0, 0);
+        // The first code past the table: still one past the known codes.
+        metrics.request(rpc, 18, Instant::now(), 0, 0);
+        let text = metrics.render();
+        assert!(
+            text.contains("scion_requests_total{rpc=\"Scion/Blame\",code=\"unrecognised\"} 2\n"),
+            "{text}"
+        );
+        // Both calls sat in the smallest buckets, and the count carries
+        // both: a flipped comparison drops them from every bucket.
+        assert!(
+            text.contains("scion_request_seconds_bucket{rpc=\"Scion/Blame\",le=\"+Inf\"} 2\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("scion_request_seconds_count{rpc=\"Scion/Blame\"} 2\n"),
+            "{text}"
+        );
+    }
+
+    /// `cancelled` counts by its own shape: the cancelled code, the
+    /// latency in the buckets its duration fits, and the bytes it moved.
+    #[test]
+    fn a_cancelled_call_counts_its_latency_and_bytes() {
+        let metrics = std::sync::Arc::new(Metrics::default());
+        let rpc = metrics.rpc("/scion.v1.Scion/Blame").unwrap();
+        // A duration of at least 9 ms, and that is all the test says:
+        // the start sits 9 ms in the past, so the recorded duration is
+        // 9 ms plus whatever the call between here and `cancelled`
+        // takes. Which upper bucket that lands in is the runner's
+        // business, and no assert may decide a result by elapsed time.
+        // The pins are the ones the 9 ms floor proves: the two lowest
+        // buckets stay empty (a flipped comparison would count the call
+        // into them), and the sum slot holds at least the 9 ms the
+        // start was set back.
+        let started = Instant::now()
+            .checked_sub(std::time::Duration::from_millis(9))
+            .expect("the clock is past 9 ms");
+        metrics.cancelled(rpc, started, 11, 13);
+        let text = metrics.render();
+        assert!(
+            text.contains("scion_requests_total{rpc=\"Scion/Blame\",code=\"cancelled\"} 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("scion_request_seconds_bucket{rpc=\"Scion/Blame\",le=\"0.001\"} 0\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("scion_request_seconds_bucket{rpc=\"Scion/Blame\",le=\"0.004\"} 0\n"),
+            "{text}"
+        );
+        // The sum slot holds at least the 9 ms the start was set back:
+        // read as microseconds, past the render's float seconds.
+        let sum = metrics.latency[rpc.0][BUCKETS.len()].load(Ordering::Relaxed);
+        assert!(
+            sum >= 9_000,
+            "the sum holds at least the 9 ms the start was set back: {sum} µs"
+        );
+        assert!(
+            text.contains("scion_rpc_bytes_total{rpc=\"Scion/Blame\",direction=\"in\"} 11\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("scion_rpc_bytes_total{rpc=\"Scion/Blame\",direction=\"out\"} 13\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("scion_request_seconds_count{rpc=\"Scion/Blame\"} 1\n"),
+            "{text}"
+        );
+        // An RPC and a code that counted nothing render no line at all.
+        assert!(
+            !text.contains("scion_request_seconds_bucket{rpc=\"Scion/PutBlob\""),
+            "{text}"
+        );
+        assert!(
+            !text.contains("scion_rpc_bytes_total{rpc=\"Scion/PutBlob\""),
+            "{text}"
+        );
+        assert!(
+            !text.contains("scion_requests_total{rpc=\"Scion/Blame\",code=\"ok\"} 0\n"),
+            "{text}"
+        );
+    }
+
+    /// The lands render by outcome, an unknown outcome counts nothing,
+    /// the replans render only when one happened, and the cache counters
+    /// keep their counts apart.
+    #[test]
+    fn the_land_and_cache_series_render_what_counted() {
+        let metrics = Metrics::default();
+        metrics.land("landed");
+        metrics.land("conflict");
+        metrics.land("not-an-outcome");
+        metrics.land_replan();
+        metrics.land_replan();
+        assert_eq!(metrics.land_replans(), 2);
+        metrics.cache_hit();
+        metrics.cache_miss();
+        let text = metrics.render();
+        assert!(
+            text.contains("scion_lands_total{outcome=\"landed\"} 1\n"),
+            "{text}"
+        );
+        // An outcome that counted nothing renders no line.
+        assert!(
+            !text.contains("scion_lands_total{outcome=\"landed\"} 0\n"),
+            "{text}"
+        );
+        assert!(
+            !text.contains("scion_lands_total{outcome=\"aborted\"} 0\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("scion_lands_total{outcome=\"conflict\"} 1\n"),
+            "{text}"
+        );
+        assert!(text.contains("scion_land_replans_total 2\n"), "{text}");
+        assert!(text.contains("scion_cache_hits_total 1\n"), "{text}");
+        assert!(text.contains("scion_cache_misses_total 1\n"), "{text}");
+        assert_eq!(metrics.cache_counts(), (1, 1));
+        metrics.cache_miss();
+        assert_eq!(metrics.cache_counts(), (1, 2));
+        let text = metrics.render();
+        assert!(text.contains("scion_cache_misses_total 2\n"), "{text}");
+    }
+
+    /// The operator gauges read back what the setters set, and the
+    /// Postgres series render their buckets, sums and gauges.
+    #[test]
+    fn the_set_gauges_read_back_and_render() {
+        let metrics = Metrics::default();
+        metrics.set_memory_floor_bytes(1 << 20);
+        metrics.set_host_memory_bytes(8 << 30);
+        metrics.set_diff_rename_cache_bytes(4096);
+        metrics.set_blob_count(500_000);
+        metrics.data_free_inodes(12_345);
+        metrics.data_free_sample_age(90);
+        metrics.audit_reopens_failed(4);
+        metrics.audit_reopen_failing(1);
+        metrics.pg_readers_busy(3);
+        metrics.pg_tx_age(std::time::Duration::from_secs(2));
+        metrics.pg_pool_wait(std::time::Duration::from_millis(64));
+        assert_eq!(metrics.memory_floor_bytes(), 1 << 20);
+        assert_eq!(metrics.host_memory_bytes(), 8 << 30);
+        let text = metrics.render();
+        assert!(
+            text.contains("scion_memory_floor_bytes 1048576\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("scion_host_memory_bytes 8589934592\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("scion_diff_rename_cache_bytes 4096\n"),
+            "{text}"
+        );
+        assert!(text.contains("scion_blob_ceiling_share 0.5\n"), "{text}");
+        assert!(text.contains("scion_audit_reopen_failing 1\n"), "{text}");
+        assert!(text.contains("scion_data_free_inodes 12345\n"), "{text}");
+        assert!(
+            text.contains("scion_data_free_sample_age_seconds 90\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("scion_audit_reopens_failed_total 4\n"),
+            "{text}"
+        );
+        assert!(text.contains("scion_pg_readers_busy 3\n"), "{text}");
+        assert!(text.contains("scion_pg_tx_age_seconds 2\n"), "{text}");
+        assert!(
+            text.contains("scion_pg_pool_wait_seconds_bucket{le=\"0.064\"} 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("scion_pg_pool_wait_seconds_count 1\n"),
+            "{text}"
+        );
+        // Nothing replanned and nothing cached here: no zero line renders.
+        assert!(!text.contains("scion_land_replans_total 0\n"), "{text}");
+        assert!(!text.contains("scion_cache_hits_total 0\n"), "{text}");
+        assert!(!text.contains("scion_cache_misses_total 0\n"), "{text}");
+    }
+
+    /// A view walk that ended renders nothing; the walk counter reads
+    /// what the counting setter put in.
+    #[test]
+    fn the_view_walk_counter_counts_the_trees_it_opened() {
+        let metrics = Metrics::default();
+        metrics.view_tree_walked(7);
+        assert_eq!(metrics.view_trees_walked(), 7);
+        let text = metrics.render();
+        assert!(text.contains("scion_view_trees_walked_total 7\n"), "{text}");
+    }
+
+    /// The blob-sync histogram separates the buckets it fits from the sum:
+    /// two flushes of different lengths land in different buckets, and the
+    /// sum carries both.
+    #[test]
+    fn the_blob_sync_histogram_keeps_buckets_and_sum_apart() {
+        let metrics = Metrics::default();
+        metrics.blob_sync(4_000);
+        metrics.blob_sync(32_000_000);
+        let text = metrics.render();
+        assert!(
+            text.contains("scion_blob_sync_seconds_bucket{le=\"0.004\"} 1\n"),
+            "{text}"
+        );
+        assert!(
+            text.contains("scion_blob_sync_seconds_bucket{le=\"+Inf\"} 2\n"),
+            "{text}"
+        );
+        assert!(text.contains("scion_blob_sync_seconds_count 2\n"), "{text}");
+        assert!(!text.contains("scion_blob_sync_seconds_sum 0\n"), "{text}");
     }
 }

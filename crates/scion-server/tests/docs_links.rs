@@ -9,6 +9,11 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 
+#[path = "docs_common/mod.rs"]
+mod docs_common;
+
+use docs_common::github_slug as slug;
+
 const ROOT: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/../..");
 
 /// The two repo-absolute link shapes the README uses: a file at main
@@ -76,31 +81,6 @@ fn slugs(markdown: &str) -> Vec<String> {
             format!("{slug}{suffix}")
         })
         .collect()
-}
-
-/// GitHub's slug of one heading's text.
-fn slug(text: &str) -> String {
-    let mut out = String::new();
-    let mut last_space = false;
-    for c in text.chars() {
-        if c.is_whitespace() {
-            if !last_space {
-                out.push('-');
-            }
-            last_space = true;
-            continue;
-        }
-        last_space = false;
-        if c == '`' || c == '*' || c == '_' {
-            // Formatting is dropped, but a bare `_` or `*` word mark is
-            // punctuation on GitHub too.
-            continue;
-        }
-        if c.is_alphanumeric() || c == '-' || c == '_' {
-            out.extend(c.to_lowercase());
-        }
-    }
-    out
 }
 
 /// One inline link's target, or a reference definition's target.
@@ -288,7 +268,7 @@ fn a_broken_link_is_reported() {
     // repository whose path is not in the repo, and to a heading that
     // `b.md` has. The checker must name the first three, each for its own
     // reason, and pass the fourth.
-    let root = tempfile::tempdir().expect("a temp tree");
+    let root = scion_server::test_support::private_tempdir();
     fs::write(
         root.path().join("a.md"),
         "[file](missing.md)\n[anchor](b.md#no)\n[repo](https://github.com/bnsd55/openscion/blob/main/docs/no-such-doc.md)\n[good](b.md#real)\n",

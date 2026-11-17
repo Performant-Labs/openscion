@@ -14,6 +14,19 @@ Report security problems as [SECURITY.md](../SECURITY.md) describes.
 One active server per data directory, on one host. The model holds only
 inside this profile.
 
+The host has at least 8 GiB of memory. The derivation: the server's
+memory budgets and caps sum to 5,968 MiB (the shares table in
+`crates/scion-server/src/floor.rs`: the blame pool, the derive walks,
+the uploads in flight, the `GetObjects` replies in flight, the read and
+unary-reply budgets, the land indexes, the gc prune, the process-wide
+stall total, the view derivations' memo pool, the diffs' rename passes,
+and the paged diffs' shared rename maps), plus 1,536 MiB of headroom
+for what the budgets do not count, so the floor is 7,504 MiB and 8 GiB
+leaves 688 MiB above it. At
+start the server reads the host's limit and writes one error line when
+the host is under the floor; it starts anyway (the floor row of section
+9 of architecture.md).
+
 Trusted, by definition:
 
 - The server host and everyone with an account on it. Whoever can read
@@ -93,7 +106,11 @@ Out of profile. Any of these voids the model:
    start, before the data directory opens
    (`scion-server/tests/serve_flags.rs::a_non_loopback_listen_is_refused_before_the_data_directory_opens`).
    There are no public TLS roots: a client trusts a CA only when the
-   operator names one.
+   operator names one. A leaf that CA signed is trusted until it
+   expires: v1 has no active revocation, and the server exports no
+   certificate-expiry metric, so expiry watch and the replace-and-
+   restart rotation are the operator's
+   (docs/operations.md, "Rotating the server's certificate").
 2. **The RPC auth step.** Every call but `GetObjects` presents a token;
    the server maps the token's BLAKE3 digest to a principal and its
    rules before any data moves
@@ -107,8 +124,12 @@ Out of profile. Any of these voids the model:
 4. **Between tiers.** A daemon trusts its upstream and its socket user;
    a cache trusts the public keys it was given. Neither decides who may
    read: the ticket does, wherever it is checked.
-5. **The client machine.** `scn` keeps the token out of files and logs,
-   but the command line is public through `ps`; the environment is not.
+5. **The client machine.** `scn` keeps the token out of files and
+   logs, and refuses the command-line form at start, before any
+   parsing (`ps` makes the command line public); the checked file form
+   and the environment remain
+   (`scn/tests/argv_token.rs::a_command_line_token_is_refused_and_leaks_nowhere_scn_writes`,
+   `scn/tests/argv_secrets.rs::the_argv_form_refuses_and_names_the_file_and_env_forms`).
 6. **The data directory.** Local files answer who may read what only
    through the server; every open refuses a directory that group or
    others can write, and one under a directory another user can change.
@@ -163,10 +184,13 @@ that breaks one is caught.
   `scion-tier/tests/tier.rs::a_tier_serves_no_root_trees_or_refs`,
   `scion-tier/tests/tier.rs::a_tier_refuses_an_object_whose_bytes_do_not_match_its_id`
 - **A daemon serves one OS user.** Its socket is 0600 in a directory
-  only its user can reach, and it refuses any other; the daemon checks
-  no ticket, so the rule is what keeps one user's objects from
-  another's. The single-user rule itself rests on the operating system,
-  not on the code: no test yet.
+  only its user can reach, and it refuses any other; the daemon relays
+  a ticket as it came, without verifying it, by design - its socket
+  user can already read everything the daemon stores, and the upstream
+  verifies the ticket's signature, expiry and walk before any byte
+  moves - so the rule is what keeps one user's objects from another's.
+  The single-user rule itself rests on the operating system, not on
+  the code: no test yet.
 - **The keys on disk are what the checks say.** A secret is a regular
   file, owned by the account that runs the process or root, mode 0600;
   a whole-keeping file refuses group and others write; a symlink dies
@@ -270,6 +294,19 @@ that breaks one is caught.
   `scion-server/tests/archive_attacks.rs::two_pending_lands_sharing_a_request_key_are_named_or_tolerated`,
   `scion-server/tests/archive_attacks.rs::a_mid_replay_failure_leaves_the_target_empty`,
   `scion-server/tests/archive_attacks.rs::a_pg_replay_that_dies_halfway_leaves_the_database_empty`
+- **A cache verifies every ticket it serves.** The cache refuses to
+  start without a public key, and a call whose ticket the key did not
+  sign is refused before the walk; the unverified relay is the daemon's
+  explicit mode (its 0600 socket already gives it one user). The
+  connection cap, the stream cap and the audit meter's per-address
+  folding bound a refused call the same as any other.
+  `scion-tier/tests/keyless_cache.rs::a_cache_without_a_public_key_does_not_start`
+- **A call that fails its auth carries no principal, so no
+  per-principal quota applies to it.** The connection cap, the stream
+  cap and the audit meter's per-address folding bound such calls; the
+  per-principal request and upload caps begin once the token names a
+  principal.
+  `scion-server/tests/every_rpc_unauthenticated.rs::every_rpc_answers_unauthenticated_without_a_valid_token`
 - **A refused-auth flood is counted by the machine, not the socket.**
   The audit meter folds one peer's refusals into counted lines keyed
   by the address — an IPv6 by its /64, the smallest block one site
@@ -278,11 +315,24 @@ that breaks one is caught.
   stranger in the shared bucket. (#414)
   `meter_key`, and the test
   `scion-server/src/audit.rs::one_address_rotating_ports_does_not_bury_a_stranger`
-- **A restore verifies first, and goes only into an empty store.** It
-  runs the same `verify` a reader runs and refuses on any damage, and it
-  refuses a data directory that already holds a store
-  (`scion-server/tests/archive.rs::a_verify_names_a_blob_whose_bytes_someone_corrupted`,
-  `scion-server/tests/archive.rs::a_restore_refuses_a_data_directory_that_already_holds_a_store`).
+- **A client that never reads its unary replies holds the budget, not
+  the server's memory.** The reply-memory layer counts every parked
+  unary reply's bytes against one budget (128 MiB across every
+  connection) and refuses further unary reads with `resource_exhausted`
+  while it is spent; a committed write's reply goes out regardless, and
+  every way a reply ends — the reply finishes, the client resets the
+  stream, or the connection closes — frees its share. (#586)
+  `crates/scion-server/tests/reply_budget_h2.rs`
+- **A narrowed access file does not cut outstanding tickets.** A ticket
+  holds for at most 15 minutes from signing, by design; to cut one at
+  once, rotate the key. The window and the cut are pinned:
+  `scion-server/tests/access.rs::an_outstanding_ticket_survives_a_narrowed_access_file_until_the_key_rotates`
+- **A partial reader sees real changeset IDs for its view.** A landing
+  on hidden paths moves `main`, and the reader's `ResolveRef` answers
+  the new ID over an unchanged view. The channel is pinned as
+  documented behavior, not closed:
+  `scion-server/tests/access.rs::a_partial_reader_sees_a_hidden_landing_through_the_ref_id`
+
 ## 6. What has no test yet
 
 Each of these is a claim this document makes without a test behind it.
@@ -296,17 +346,8 @@ They become issues as the project moves past alpha.
   duration lets a caller estimate how many principals are configured.
   That is config size, not identity, and the compare itself stays
   constant time; a fixed-worst-case loop would buy nothing else.
-- A narrowed access file does not cut outstanding tickets: they hold
-  for at most 15 minutes from signing, by design (rotate the key to cut
-  at once). The window and the cut are pinned:
-  `scion-server/tests/access.rs::an_outstanding_ticket_survives_a_narrowed_access_file_until_the_key_rotates`
 - TLS revocation, and hostname checks beyond what the CA signs: no
   test; revocation has no issue yet.
-- A partial reader sees real changeset IDs for its view: a landing on
-  hidden paths moves `main`, and the reader's `ResolveRef` answers the
-  new ID over an unchanged view. The channel is pinned as documented
-  behavior, not closed:
-  `scion-server/tests/access.rs::a_partial_reader_sees_a_hidden_landing_through_the_ref_id`
 - The page cache makes a shared blob fast, and the rename of a replaced
   blob frees the old file: two side channels the code does not hide. No
   test can exist here: both are behavior of the operating system and

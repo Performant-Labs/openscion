@@ -2,6 +2,7 @@
 //! `scion-cache`: a regional cache tier. Serves the `Objects` calls from
 //! memory and fetches misses from its upstream, the server.
 
+use std::io::IsTerminal;
 use std::net::SocketAddr;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::os::unix::fs::DirBuilderExt as _;
@@ -55,28 +56,20 @@ struct Cli {
     /// Most object bytes to keep in memory.
     #[arg(long, default_value_t = 1 << 30)]
     max_bytes: usize,
-    /// Bearer token that clients must send. Give `--token-file`, or
-    /// `SCION_TOKEN`; the argv form sits in the process list and warns.
-    #[arg(long, value_name = "TOKEN")]
-    token: Option<String>,
-    /// File with the bearer token of `--token`, read like the access
+    /// File with the bearer token for this tier, read like the access
     /// file: the owner alone may read it, and a symlink is refused.
-    #[arg(long, conflicts_with = "token", value_name = "FILE")]
+    #[arg(long, value_name = "FILE")]
     token_file: Option<PathBuf>,
-    /// Bearer token to send upstream. Give `--upstream-token-file`, or
-    /// `SCION_UPSTREAM_TOKEN`; the argv form sits in the process list
-    /// and warns.
-    #[arg(long, value_name = "TOKEN")]
-    upstream_token: Option<String>,
-    /// File with the bearer token of `--upstream-token`, read like the
+    /// File with the bearer token for the upstream, read like the
     /// access file.
-    #[arg(long, conflicts_with = "upstream_token", value_name = "FILE")]
+    #[arg(long, value_name = "FILE")]
     upstream_token_file: Option<PathBuf>,
     /// The public keys (64 hex characters, from `scion-server ticket-key`)
     /// that a ticket of a call must verify against. One is enough; a
-    /// second keeps the old key alive during a rotation. Without one, no
-    /// object is served.
-    #[arg(long, value_name = "HEX")]
+    /// second keeps the old key alive during a rotation. The cache
+    /// refuses to start without one: a tier that checks no ticket would
+    /// serve every object it holds to any caller.
+    #[arg(long, value_name = "HEX", required = true)]
     ticket_public_key: Vec<String>,
     /// Most connections served at once. More clients wait until one closes.
     #[arg(long, default_value_t = listen::DEFAULT_CONNECTIONS)]
@@ -121,63 +114,65 @@ struct Cli {
     drain_timeout_secs: u64,
 }
 
+/// Fails the run when the command line still names a secret flag the
+/// binary has removed, before any parsing: the parser never sees the
+/// line, so its own errors cannot quote the value either.
+fn refuse_removed_flags() {
+    use scion_proto::runtime::auth::removed::{RemovedFlag, refusal_text, removed_flag_of};
+    if let Some(removed) = removed_flag_of(
+        std::env::args_os().skip(1).collect::<Vec<_>>().as_slice(),
+        &[
+            RemovedFlag {
+                flag: "--token",
+                instead: "pass the token in SCION_TOKEN, or in a file with --token-file FILE",
+            },
+            RemovedFlag {
+                flag: "--upstream-token",
+                instead: "pass the token in SCION_UPSTREAM_TOKEN, or in a file with --upstream-token-file FILE",
+            },
+        ],
+    ) {
+        eprintln!("error: {}", refusal_text(removed));
+        std::process::exit(2);
+    }
+}
+
 /// The two tokens of a tier: what it asks for, and what it sends
-/// upstream. Each resolves through the checked file, the env, or the
-/// argv form, which warns.
+/// upstream. Each resolves through the checked file or the env.
 fn resolve_tokens(cli: &Cli) -> anyhow::Result<(String, String)> {
-    let token = secret_of(
-        cli.token.as_deref(),
-        cli.token_file.as_deref(),
-        "--token",
-        "--token-file",
-        "SCION_TOKEN",
-    )?;
+    let token = secret_of(cli.token_file.as_deref(), "--token-file", "SCION_TOKEN")?;
     let upstream = secret_of(
-        cli.upstream_token.as_deref(),
         cli.upstream_token_file.as_deref(),
-        "--upstream-token",
         "--upstream-token-file",
         "SCION_UPSTREAM_TOKEN",
     )?;
     Ok((token, upstream))
 }
 
-/// A secret that the flags may carry three ways: the checked file, the
-/// env, or the argv form, which warns that the process list shows it.
-/// The warning names the replacement, per the deprecation rule: warn
-/// first, remove in a later minor.
-fn secret_of(
-    token: Option<&str>,
-    file: Option<&std::path::Path>,
-    flag: &str,
-    file_flag: &str,
-    env: &str,
-) -> anyhow::Result<String> {
-    match (token, file) {
-        (Some(_), Some(_)) => unreachable!("clap refuses {flag} with {file_flag}"),
-        (Some(_), None) => {
-            eprintln!(
-                "warning: {flag} put a secret on the command line, which ps and \
-                 /proc/$$/cmdline show to every local account; use {file_flag} \
-                 (or {env}) instead (the argv form is deprecated and goes away \
-                 in a later release)"
-            );
-            Ok(token.expect("the argv form is given").to_owned())
-        }
-        (None, Some(file)) => {
-            let bytes = scion_proto::runtime::auth::read_secret_file(file)
-                .map_err(|why| scion_proto::runtime::auth::checked_read_error(file, why))?;
-            let text = String::from_utf8(bytes)
-                .map_err(|_| anyhow::anyhow!("{} is not UTF-8", file.display()))?;
-            let token = text.trim();
-            anyhow::ensure!(!token.is_empty(), "{} holds no token", file.display());
-            Ok(token.to_owned())
-        }
-        (None, None) => {
-            let from_env = std::env::var(env).unwrap_or_default();
-            anyhow::ensure!(!from_env.is_empty(), "give {flag}, {file_flag} or {env}");
-            Ok(from_env)
-        }
+/// A secret that arrives two ways: the checked file, or the env.
+fn secret_of(file: Option<&std::path::Path>, file_flag: &str, env: &str) -> anyhow::Result<String> {
+    let Some(file) = file else {
+        let from_env = std::env::var(env).unwrap_or_default();
+        anyhow::ensure!(!from_env.is_empty(), "give {env} or {file_flag} FILE");
+        return Ok(from_env);
+    };
+    let bytes = scion_proto::runtime::auth::read_secret_file(file)
+        .map_err(|why| scion_proto::runtime::auth::checked_read_error(file, why))?;
+    let text =
+        String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("{} is not UTF-8", file.display()))?;
+    let token = text.trim();
+    anyhow::ensure!(!token.is_empty(), "{} holds no token", file.display());
+    Ok(token.to_owned())
+}
+
+/// The connection caps of a cache: the three flags, with the process's
+/// stall total at its default.
+fn tier_limits(cli: &Cli) -> Limits {
+    Limits {
+        connections: cli.max_connections,
+        streams: cli.max_streams,
+        stalled_bytes: cli.max_stalled_bytes,
+        ..Limits::default()
     }
 }
 
@@ -185,10 +180,14 @@ fn secret_of(
 async fn main() -> anyhow::Result<()> {
     // Logs go to stderr: stdout may carry command output that callers
     // capture with $(...).
+    // Color only when stderr is a terminal: a file or a pipe is a log
+    // to keep, and escape bytes in it are noise on every line.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .init();
+    refuse_removed_flags();
     let cli = Cli::parse();
     let (token, upstream) = resolve_tokens(&cli)?;
     let server_tls = match (cli.tls_cert.as_deref(), cli.tls_key.as_deref()) {
@@ -220,6 +219,8 @@ async fn main() -> anyhow::Result<()> {
         Some(&client_tls),
         ticket_keys(&cli.ticket_public_key)?,
     )?;
+    // Built before the snapshot spawn: it moves out of `cli`.
+    let limits = tier_limits(&cli);
     if let Some(dir) = cli.snapshot {
         std::fs::DirBuilder::new()
             .recursive(true)
@@ -272,11 +273,7 @@ async fn main() -> anyhow::Result<()> {
     // The bound address, so port 0 shows the port that the OS chose.
     let listen = listener.local_addr()?;
     tracing::info!(%listen, upstream = %cli.upstream, "serving");
-    let limits = Limits {
-        connections: cli.max_connections,
-        streams: cli.max_streams,
-        stalled_bytes: cli.max_stalled_bytes,
-    };
+
     Box::pin(tier.serve(
         &token,
         listen::tcp(listener),
@@ -336,13 +333,13 @@ async fn snapshots(
 /// The keys that a ticket of a call must verify against: at most two, the
 /// second one from a rotation.
 fn ticket_keys(hex: &[String]) -> anyhow::Result<Vec<ed25519_dalek::VerifyingKey>> {
-    anyhow::ensure!(hex.len() <= 2, "give at most two --ticket-key");
+    anyhow::ensure!(hex.len() <= 2, "give at most two --ticket-public-key");
     hex.iter()
         .map(|key| {
             let bytes = scion_tier::key_from_hex(key)
-                .ok_or_else(|| anyhow::anyhow!("--ticket-key must be 64 hex characters"))?;
+                .ok_or_else(|| anyhow::anyhow!("--ticket-public-key must be 64 hex characters"))?;
             ed25519_dalek::VerifyingKey::from_bytes(&bytes)
-                .map_err(|why| anyhow::anyhow!("bad --ticket-key: {why}"))
+                .map_err(|why| anyhow::anyhow!("bad --ticket-public-key: {why}"))
         })
         .collect()
 }

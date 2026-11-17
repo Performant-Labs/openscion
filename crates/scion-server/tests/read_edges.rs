@@ -7,14 +7,14 @@ use std::sync::Arc;
 use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPath, Tree};
 use scion_proto::CHUNK_BYTES;
 use scion_proto::runtime::auth::token_digest;
+use scion_proto::runtime::check::MAX_NAME_BYTES;
 use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{ListDirRequest, ReadFileRequest};
 use scion_server::Access;
 use scion_server::Backend;
-use scion_server::test_support::backend::from_store;
 use scion_server::test_support::meta::MetaTx as _;
-use scion_server::test_support::{meta::Meta as _, service, store::Store};
+use scion_server::test_support::{meta::Meta as _, service};
 use tokio::net::TcpListener;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -66,8 +66,8 @@ fn author() -> IdentityTime {
 /// A store whose repo has one root changeset that puts `files` at the repo
 /// root. An empty `files` makes an empty directory.
 fn store(files: &[(Vec<u8>, &[u8])]) -> (tempfile::TempDir, Backend, ChangesetId) {
-    let dir = tempfile::tempdir().unwrap();
-    let store = from_store(Store::open(dir.path()).unwrap());
+    let dir = scion_server::test_support::private_tempdir();
+    let store = Backend::open_test(dir.path()).unwrap();
     let root = store
         .write(|c| {
             let repo = c.create_repo(REPO)?;
@@ -116,6 +116,7 @@ async fn serve(store: &Backend, dir: &std::path::Path) -> (Stop, Scion) {
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::new(scion_server::Metrics::default()),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         Some(Arc::new(scion_server::Keys::generate())),
         async {
@@ -278,6 +279,34 @@ async fn a_path_over_the_cap_is_refused_as_invalid_argument() {
                 .await
                 .unwrap_err()
         };
+        assert_eq!(err.code(), Code::InvalidArgument, "{note}: {err}");
+    }
+}
+
+/// A repo name that breaks the name rules - empty, a control character,
+/// or one byte over the cap - is refused at the door: the call answers
+/// `INVALID_ARGUMENT` before the store sees it. Kills the mutant that
+/// skips `check_name` (every RPC then takes whatever name it is sent).
+#[tokio::test(flavor = "multi_thread")]
+async fn a_bad_repo_name_is_refused_as_invalid_argument() {
+    let (dir, store, root) = store(&[(b"file.txt".to_vec(), b"body\n")]);
+    let (_stop, mut client) = serve(&store, dir.path()).await;
+    let over_cap = "x".repeat(MAX_NAME_BYTES + 1);
+    for note in ["empty", "newline", "escape", "over the cap"] {
+        let repo = match note {
+            "empty" => "",
+            "newline" => "a\nb",
+            "escape" => "\u{1b}[31m",
+            _ => over_cap.as_str(),
+        };
+        let err = client
+            .read_file(ReadFileRequest {
+                repo: repo.to_string(),
+                changeset_id: root.as_bytes().to_vec(),
+                path: b"file.txt".to_vec(),
+            })
+            .await
+            .unwrap_err();
         assert_eq!(err.code(), Code::InvalidArgument, "{note}: {err}");
     }
 }

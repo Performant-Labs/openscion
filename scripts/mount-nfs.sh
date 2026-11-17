@@ -10,6 +10,11 @@
 # runner hung.
 set -euo pipefail
 
+# mount-nfs runs its own build and its own timeout resolution, so it does
+# not source common.sh; it sources only the pg_url_for helper.
+# shellcheck source=pg-url.sh source-path=SCRIPTDIR
+. "$(dirname "$0")/pg-url.sh"
+
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 case ${CARGO_TARGET_DIR:-} in
   "") BIN=$ROOT/target/debug ;;
@@ -65,26 +70,31 @@ fi
 
 note "building the debug binaries"
 "$TIMEOUT" 300 cargo build --locked --quiet -p open-scion-server -p open-scion
+# The write path is the unstable-writable-mount build feature, off in
+# this default build. Both builds write the same target path, so the
+# default binary is copied out first and the write checks below run on
+# a feature build. Both builds keep --locked.
+mkdir -p "$WORK/default-bin"
+cp "$BIN/scn" "$WORK/default-bin/scn"
+"$TIMEOUT" 300 cargo build --locked --quiet -p open-scion --features unstable-writable-mount
+mkdir -p "$WORK/feature-bin"
+cp "$BIN/scn" "$WORK/feature-bin/scn-writable"
 
 # The kernel NFS client: the module, and mount.nfs(8).
 sudo modprobe nfs
 command -v mount.nfs > /dev/null || sudo apt-get install -y -qq nfs-common
 
 note "starting the server"
-# D25: the server refuses a missing data directory; create it here.
-mkdir -p "$WORK/server"
+# The server refuses a missing data directory (#578); create it here.
+install -d -m 0700 "$WORK/server"
 chmod 700 "$WORK/server"
 "$BIN/scion-server" --data "$WORK/server" ticket-key --out "$WORK/ticket.key" > "$WORK/ticket.pub"
-# In Postgres mode (SCION_TEST_BACKEND=postgres) the server serves its
-# metadata from the test database; the data directory keeps the marker and
+# The server serves its metadata from Postgres: one schema for this run's
+# data directory, made if missing. The data directory keeps the marker and
 # the blob files, and the checks below prove which backend served.
-PG_ARG=""
-if [ "${SCION_TEST_BACKEND:-}" = postgres ]; then
-  : "${SCION_TEST_POSTGRES_URL:?SCION_TEST_POSTGRES_URL must name the test database}"
-  PG_ARG="--postgres-url $SCION_TEST_POSTGRES_URL"
-fi
-# shellcheck disable=SC2086 # the URL holds no spaces
-"$BIN/scion-server" --data "$WORK/server" $PG_ARG serve \
+export SCION_POSTGRES_URL
+SCION_POSTGRES_URL="$(pg_url_for "$WORK/server")"
+"$BIN/scion-server" --data "$WORK/server" serve \
   --listen "127.0.0.1:$SERVER_PORT" \
   --ticket-key "$WORK/ticket.key" \
   > "$WORK/server.log" 2>&1 &
@@ -93,15 +103,13 @@ echo $! > "$WORK/server.pid"
   || { tail -n 20 "$WORK/server.log"; die "the server did not start"; }
 # The run proves the backend it was asked for: a Postgres-backed server
 # writes the marker and no SQLite database, so a spawn that lost its
-# --postgres-url fails here, not vacuously as a second SQLite run.
-if [ "${SCION_TEST_BACKEND:-}" = postgres ]; then
-  test -f "$WORK/server/backend" || die "the data directory has no backend marker"
-  test "$(head -n 1 "$WORK/server/backend")" = postgres \
-    || die "the server is not Postgres-backed"
-  test ! -e "$WORK/server/scion.db" \
-    || die "a Postgres-backed server must not keep a SQLite database"
-  note "the server is Postgres-backed (marker, no scion.db)"
-fi
+# a URL from no source fails here, not vacuously as a second SQLite run.
+test -f "$WORK/server/backend" || die "the data directory has no backend marker"
+test "$(head -n 1 "$WORK/server/backend")" = postgres \
+  || die "the server is not Postgres-backed"
+test ! -e "$WORK/server/scion.db" \
+  || die "a Postgres-backed server must not keep a SQLite database"
+note "the server is Postgres-backed (marker, no scion.db)"
 
 # A known changeset with known bytes on main: a one-file git repository,
 # imported (import creates the repo, a commit cannot, so this goes before
@@ -111,32 +119,31 @@ printf 'hello from the mount test\n' > "$WORK/src/README.md"
 git -C "$WORK/src" add README.md
 git -C "$WORK/src" -c user.name=mount-nfs -c user.email=mount-nfs@localhost \
   commit -qm "seed the repo"
-# The import opens the same backend beside the serving one, so it takes
-# the same `--postgres-url` in Postgres mode, before the subcommand: the
-# flag belongs to the root command.
-# shellcheck disable=SC2086 # the URL holds no spaces
-"$TIMEOUT" 120 "$BIN/scion-server" --data "$WORK/server" $PG_ARG import \
+# The import opens the same backend beside the serving one, so it reads
+# the same URL in the same schema: the variable the export above carries.
+"$TIMEOUT" 120 "$BIN/scion-server" --data "$WORK/server" import \
   --repo main --rev main "$WORK/src" \
   > "$WORK/import.out" 2> "$WORK/import.log" || {
   tail -n 20 "$WORK/import.log" >&2
   die "the import failed"
 }
 
-# The mount, as the README says: `scn mount DIR main` as the user. Its own
+# The mount, as docs/cli.md says: `scn mount DIR main` as the user. Its own
 # mount attempt fails (only root may mount), so it prints the sudo command
 # and keeps serving; the script runs that printed command under sudo, and
 # polls until the mount answers.
 note "mounting main on $VIEW"
 # mount(2) needs an existing mount point; scn mount does not make one.
 mkdir -p "$VIEW"
-# The writes of (b) and the commit of (c) need --unstable-writable: the
-# v0.1 mount is read-only without it.
-"$BIN/scn" --server "$SERVER" mount --unstable-writable "$VIEW" main \
+# The writes of (b) and the commit of (c) run on the feature build: the
+# default build has no write path, and the check below proves the
+# default build refuses the flag by name.
+"$WORK/feature-bin/scn-writable" --server "$SERVER" mount --unstable-writable "$VIEW" main \
   > "$WORK/mount.log" 2>&1 &
 MOUNT_PID=$!
 echo "$MOUNT_PID" > "$WORK/mount.pid"
 "$TIMEOUT" 30 bash -c 'until grep -q "^sudo mount -t nfs" '"$WORK"'/mount.log 2> /dev/null; do
-  kill -0 '"$MOUNT_PID"' 2> /dev/null || { cat '"$WORK"'/mount.log >&2; die "scn mount died"; }
+  kill -0 '"$MOUNT_PID"' 2> /dev/null || { cat '"$WORK"'/mount.log >&2; exit 1; }
   sleep 0.2
 done' || die "scn mount printed no mount command"
 MOUNT_CMD=$(grep '^sudo mount -t nfs' "$WORK/mount.log" | tail -n 1)
@@ -156,9 +163,11 @@ got=$("$TIMEOUT" 30 cat "$VIEW/README.md")
 "$TIMEOUT" 30 mv "$VIEW/notes.txt" "$VIEW/renamed.txt"
 "$TIMEOUT" 30 rm "$VIEW/README.md"
 
-# (c) The commit from the mount. The session file and the overlay belong to
-# the user, so scn runs as the user, no sudo.
-"$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" commit -m "from the mount" \
+# (c) The commit from the mount, on the feature build: the default
+# build refuses --from-mount by name (that refusal is (e1)'s check).
+# The session file and the overlay belong to the user, so scn runs as
+# the user, no sudo.
+"$TIMEOUT" 60 "$WORK/feature-bin/scn-writable" --server "$SERVER" commit -m "from the mount" \
   --from-mount "$VIEW" \
   > "$WORK/from-mount.out" 2> "$WORK/from-mount.log" || {
   tail -n 20 "$WORK/from-mount.log" >&2
@@ -170,7 +179,6 @@ CS2=$(grep -Eo '[0-9a-f]{64}' "$WORK/from-mount.out" | tail -n 1)
 # (d) The diff of main against the new changeset: exactly the rename and
 # the delete, two lines.
 diff_out=$("$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" diff main "$CS2")
-echo "$diff_out" | grep -q 'A' || true
 echo "$diff_out" | grep -Eq '^A[^[:alnum:]]*renamed\.txt$' \
   || die "the diff lacks 'A renamed.txt': $diff_out"
 echo "$diff_out" | grep -Eq '^D[^[:alnum:]]*README\.md$' \
@@ -195,15 +203,27 @@ if "$TIMEOUT" 30 sudo mount -t nfs -o "vers=3,tcp,port=$port,mountport=$port,nol
 fi
 "$TIMEOUT" 30 stat "$VIEW/renamed.txt" > /dev/null || die "the mount died"
 
+# (e1) The default build refuses --unstable-writable by name: it has no
+# write path at all. The mount point exists, so the refusal is the
+# build's, not the mount-point check's.
+mkdir -p "$WORK/refused-view"
+if "$WORK/default-bin/scn" --server "$SERVER" mount --unstable-writable "$WORK/refused-view" main \
+  2> "$WORK/refused.log"; then
+  die "the default build took --unstable-writable"
+fi
+grep -q -- "unstable-writable-mount" "$WORK/refused.log" \
+  || die "the default build's refusal names no flag: $(cat "$WORK/refused.log")"
+note "the default build refuses --unstable-writable by name"
+
 # (e2) A mount without --unstable-writable is read-only: the read works,
 # the write is refused with EROFS, and the commit from it names the flag.
 VIEW2="$WORK/ro-view"
 mkdir -p "$VIEW2"
-"$BIN/scn" --server "$SERVER" mount "$VIEW2" main \
+"$WORK/default-bin/scn" --server "$SERVER" mount "$VIEW2" main \
   > "$WORK/mount-ro.log" 2>&1 &
 RO_PID=$!
 "$TIMEOUT" 30 bash -c 'until grep -q "^sudo mount -t nfs" '"$WORK"'/mount-ro.log 2> /dev/null; do
-  kill -0 '"$RO_PID"' 2> /dev/null || { cat '"$WORK"'/mount-ro.log >&2; die "the read-only scn mount died"; }
+  kill -0 '"$RO_PID"' 2> /dev/null || { cat '"$WORK"'/mount-ro.log >&2; exit 1; }
   sleep 0.2
 done' || die "the read-only mount printed no mount command"
 RO_CMD=$(grep '^sudo mount -t nfs' "$WORK/mount-ro.log" | tail -n 1)
@@ -216,11 +236,11 @@ got=$("$TIMEOUT" 30 cat "$VIEW2/README.md")
 if "$TIMEOUT" 30 bash -c 'echo refused > "'"$VIEW2"'/refused.txt"' 2> /dev/null; then
   die "a read-only mount took a write"
 fi
-RO_COMMIT=$("$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" commit -m "ro" \
+RO_COMMIT=$("$TIMEOUT" 60 "$WORK/default-bin/scn" --server "$SERVER" commit -m "ro" \
   --from-mount "$VIEW2" 2>&1 || true)
-echo "$RO_COMMIT" | grep -q -- "--unstable-writable" \
+echo "$RO_COMMIT" | grep -q -- "unstable-writable-mount" \
   || die "the commit from a read-only mount names no flag: $RO_COMMIT"
-"$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" unmount "$VIEW2" \
+"$TIMEOUT" 60 "$WORK/default-bin/scn" --server "$SERVER" unmount "$VIEW2" \
   > "$WORK/unmount-ro.log" 2>&1 || die "scn unmount of the read-only mount failed"
 sudo umount -f -l "$VIEW2" 2> /dev/null || true
 if mount | grep -q " on $VIEW2 "; then
@@ -230,7 +250,7 @@ kill "$RO_PID" 2> /dev/null || true
 
 # (f) The unmount: scn unmount as the user drops the session record, then
 # the real umount under sudo, and the mount table is clean afterwards.
-"$TIMEOUT" 60 "$BIN/scn" --server "$SERVER" unmount "$VIEW" \
+"$TIMEOUT" 60 "$WORK/feature-bin/scn-writable" --server "$SERVER" unmount "$VIEW" \
   > "$WORK/unmount.log" 2>&1 || die "scn unmount failed"
 sudo umount -f -l "$VIEW" 2> /dev/null || true
 if mount | grep -q " on $VIEW "; then

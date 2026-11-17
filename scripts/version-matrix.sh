@@ -6,11 +6,10 @@
 # N-1 is PREV_REF when set (any commit or tag), else the newest release
 # tag that is an ancestor of HEAD and not HEAD itself: when HEAD carries
 # the release tag, N-1 is the one before it. With no tag and no
-# PREV_REF, N-1 is the newest commit of the stand-in ladder below - the
-# same two pinned commits scripts/store-upgrade.sh runs, chosen where
-# the store schema changed, so every leg has something real to prove
-# from the first nightly on. A run with nothing to compare against
-# fails; the matrix never passes as a skip.
+# PREV_REF, N-1 is the newest commit of the stand-in ladder below,
+# chosen where the store schema changed, so every leg has something
+# real to prove from the first nightly on. A run with nothing to
+# compare against fails; the matrix never passes as a skip.
 # SHORTCUT: the pins stand in for release tags; the first release tag
 # replaces them, because a release tag is an ancestor of HEAD and the
 # pins sit on main.
@@ -44,6 +43,10 @@
 #      version's cache writes opens as the other version's daemon seed,
 #      and a checkout through that daemon reads the repo whole.
 #
+#   7. the transcript corpus's N-1 legs (issue #890): every file whose
+#      `since:` is at or under N-1 replays against the N-1 server and
+#      its tiers, and the N-1 tiers in front of the N server - the
+#      harness is this tree's runner, PREV_BIN names the N-1 binaries.
 # Left out on purpose, per docs/compatibility.md:
 #   - tier <-> tier (a chain of caches): the policy's chain rule follows
 #     from every hop, and each hop is pair 2 here.
@@ -85,19 +88,51 @@ unset SCION_SERVER SCION_REPO SCION_DATA SCION_DAEMON_DATA SCION_AUTHOR
 export GIT_CONFIG_GLOBAL=/dev/null GIT_CONFIG_NOSYSTEM=1
 export SCION_TOKEN=matrix SCION_UPSTREAM_TOKEN=matrix NO_COLOR=1
 
+# pg_db_for DATA_DIR: the URL of a fresh DATABASE of this run's own,
+# dropped and created here. The matrix is the one script that runs two
+# server versions against one database server, and the older builds do
+# not keep the `options` a schema URL rides (5ae458a5 landed after the
+# pinned N-1): a schema URL would leave every version on the database's
+# public schema, where the pairs would share rows - what the dispatch
+# of 2026-10-28 proved. A database name is the one address every
+# version understands, and a drop and create gives every pair a clean
+# store, which the pairs want anyway.
+pg_db_for() {
+  local data=$1
+  local cur=$data
+  local tail=""
+  local base=${SCION_TEST_POSTGRES_URL:?SCION_TEST_POSTGRES_URL must name the test database}
+  base=${base%%\?*}
+  while [ ! -e "$cur" ]; do
+    tail="/$(basename "$cur")$tail"
+    cur=$(dirname "$cur")
+  done
+  local canon
+  canon=$(cd "$cur" && pwd -P)
+  local hash
+  hash=$(printf '%s' "$canon$tail" | shasum -a 256 | cut -c1-16)
+  local db="scion_matrix_$hash"
+  local admin="${base%/*}/postgres"
+  psql "$admin" -X -q -v ON_ERROR_STOP=1 \
+    -c "DROP DATABASE IF EXISTS \"$db\"" \
+    -c "CREATE DATABASE \"$db\"" > /dev/null || {
+    echo "FAIL: cannot create the database $db" >&2
+    return 1
+  }
+  printf '%s/%s' "${base%/*}" "$db"
+}
+
 die() {
   echo "version-matrix: $*" >&2
   exit 1
 }
 
-# The stand-in ladder of scripts/store-upgrade.sh (#428): until
-# the first release tag, N-1 is the newest of these two pinned commits,
-# chosen where the store schema changed (8: read rules per folder, 9:
-# view memo). One resolution, two users: whoever lands second rebases
-# onto the other's form.
+# The stand-in ladder: until the first release tag, N-1 is the newest
+# commit before the SQLite removal whose Postgres path passed the
+# Postgres suite (780b894d, it has #231's schema URL options and #252's
+# integer read fix); from v0.1.0 on, N-1 is the previous release tag.
 STANDIN_TAGS=(
-  32a6117bf54510450b1bfea10b6c873dcb383207 # view memo: schema 9 (newest)
-  afe1c4db878f38fa22bd6adddd57a8c410668db5 # read rules per folder: schema 8
+  780b894d7e6e3f29a6b266c122dc021fbb885ca1 # the last main before the SQLite removal
 )
 
 note() { echo "-- $*" >&2; }
@@ -220,7 +255,12 @@ build_prev() {
 # schema_of SRC: the store schema version a checkout writes, from its
 # source. Pair 4's refusal can only fire when the two builds differ.
 schema_of() {
-  sed -n 's/.*SCHEMA_VERSION: u32 = \([0-9]*\).*/\1/p' "$1/crates/scion-server/src/store.rs" | head -1
+  # The server's schema lives in the Postgres layer since #716: the
+  # SQLite store's constant is gone. A source without pg.rs cannot be a
+  # Postgres N-1, and the matrix needs one.
+  [ -f "$1/crates/scion-server/src/pg.rs" ] ||
+    die "pair 'store': $1 has no crates/scion-server/src/pg.rs: a Postgres N-1 is required"
+  sed -n 's/.*PG_SCHEMA_VERSION: u32 = \([0-9]*\).*/\1/p' "$1/crates/scion-server/src/pg.rs" | head -1
 }
 
 # make_repo DIR: the small repository of release-smoke.sh: three commits
@@ -243,13 +283,25 @@ make_repo() {
 # import DIR SERVER_BIN: a fresh store of SERVER_BIN's version, with the
 # repo of make_repo in it, and its ticket key made. The store's version
 # is the server's, so every pair starts from what its own server wrote.
+# URL: the Postgres URL the last import made, global so the pair
+# functions' serve and fsck lines open the same schema the import did.
+# It rides the environment: SCION_POSTGRES_URL, exported here, so a
+# start's command substitution and the binary it runs inherit it, and no
+# command line carries it.
+URL=""
 import() {
   local dir=$1 srv=$2
-  # D25: the server refuses a missing data directory; create it here.
+  # The server keeps its metadata in Postgres: one schema for this data
+  # directory, made if missing. Every server of every version here opens
+  # its own schema, so the pairs never share rows.
+  URL=$(pg_db_for "$dir/server")
+  export SCION_POSTGRES_URL="$URL"
+  note "import into ${URL##*/}"
+  # The server refuses a missing data directory (#578); create it here.
   mkdir -p "$dir/server"
   chmod 700 "$dir/server"
   make_repo "$dir"
-  "$srv/scion-server" --data "$dir/server" import "$dir/src" \
+  SCION_POSTGRES_URL="$URL" "$srv/scion-server" --data "$dir/server" import "$dir/src" \
     >"$dir/import.out" 2>"$dir/import.log" || {
     tail -n 5 "$dir/import.log" >&2
     die "pair '$PAIR' ($SIDE): the import failed"
@@ -487,6 +539,8 @@ pair_3() {
   rm -f "$sock"
   sport=$(start server "$dir" "$BIN/scion-server" port --data "$dir/server" serve \
     --listen 127.0.0.1:0 --ticket-key "$dir/ticket.key")
+  mkdir -p "$dir/daemon-data"
+  chmod 700 "$dir/daemon-data"
   start daemon "$dir" "$daemon/scion-daemon" serving --data "$dir/daemon-data" \
     --socket "$sock" --upstream "http://127.0.0.1:$sport"
   mkdir -p "$dir/out"
@@ -597,12 +651,16 @@ pair_6() {
   sock="$SOCK-snap-$side"
   rm -f "$sock"
   if "$daemon/scion-daemon" --help 2>&1 | grep -q -- '--seed-full-repo'; then
-    start daemon "$dir" "$daemon/scion-daemon" serving --data "$dir/daemon-data" \
+    mkdir -p "$dir/daemon-data"
+  chmod 700 "$dir/daemon-data"
+  start daemon "$dir" "$daemon/scion-daemon" serving --data "$dir/daemon-data" \
       --socket "$sock" --upstream "http://127.0.0.1:$sport" \
       --seed "$dir/snaps/main.scnsnap" --seed-full-repo
   else
     note "the N-1 daemon predates --seed-full-repo: it seeds without the say-so"
-    start daemon "$dir" "$daemon/scion-daemon" serving --data "$dir/daemon-data" \
+    mkdir -p "$dir/daemon-data"
+  chmod 700 "$dir/daemon-data"
+  start daemon "$dir" "$daemon/scion-daemon" serving --data "$dir/daemon-data" \
       --socket "$sock" --upstream "http://127.0.0.1:$sport" \
       --seed "$dir/snaps/main.scnsnap"
   fi
@@ -615,38 +673,59 @@ pair_6() {
   stop "$dir"
 }
 
-# pair_4: the store pair, one direction by design. A server of N opens a
-# store of N-1, the migration runs forward, and reads and writes work on
-# the migrated store. A store of N on a server of N-1 is refused with
-# the version reason -- but only when the two builds write different
-# schema versions at all.
+# pair_4: the store pair, one direction by design. A server of N takes
+# a store of N-1 through the explicit upgrade (docs/operations.md §4):
+# the check reports the pending step (exit 3), the plain open refuses
+# with the fix named, the migrate moves the schema, and reads and
+# writes work on the migrated store. A store of N on a server of N-1 is
+# refused with the version reason -- but only when the two builds write
+# different schema versions at all.
 pair_4() {
   local dir port cur_schema prev_schema
   PAIR=store SIDE='N opens N-1' SCN=$BIN
   dir=$(mktemp -d "$WORK/pair4.XXXXXX")
   note "pair 4 (N opens N-1)"
   import "$dir" "$PREV_BIN"
-  "$BIN/scion-server" --data "$dir/server" fsck >"$dir/fsck.log" 2>&1 ||
-    die "pair '$PAIR' ($SIDE): the N server cannot open the N-1 store"
+  cur_schema=$(schema_of "$ROOT")
+  prev_schema=$(schema_of "$PREV_SRC")
+  if [ -z "$cur_schema" ] || [ -z "$prev_schema" ]; then
+    die "pair 'store': cannot read PG_SCHEMA_VERSION from one of the two builds"
+  fi
+  if [ "$cur_schema" = "$prev_schema" ]; then
+    SCION_POSTGRES_URL="$URL" "$BIN/scion-server" --data "$dir/server" fsck >"$dir/fsck.log" 2>&1 ||
+      die "pair '$PAIR' ($SIDE): the N server cannot open the N-1 store"
+    summary "pair 4: both builds write schema $cur_schema, so the upgrade ladder and the N-1 refusal cannot fire on this pair"
+    return 0
+  fi
+  rc=0
+  SCION_POSTGRES_URL="$URL" "$BIN/scion-server" --data "$dir/server" migrate --check >"$dir/check.log" 2>&1 || rc=$?
+  [ "$rc" -eq 3 ] || die "pair '$PAIR' ($SIDE): the check on the N-1 store did not say pending (exit 3)"
+  if SCION_POSTGRES_URL="$URL" "$BIN/scion-server" --data "$dir/server" fsck >"$dir/fsck.log" 2>&1; then
+    die "pair '$PAIR' ($SIDE): the N server opened the N-1 store without being asked to migrate"
+  fi
+  grep -q 'run `scion-server migrate` first' "$dir/fsck.log" ||
+    die "pair '$PAIR' ($SIDE): the refusal does not name the migrate"
+  SCION_POSTGRES_URL="$URL" "$BIN/scion-server" --data "$dir/server" migrate >"$dir/migrate.log" 2>&1 ||
+    die "pair '$PAIR' ($SIDE): the migrate of the N-1 store failed"
+  SCION_POSTGRES_URL="$URL" "$BIN/scion-server" --data "$dir/server" fsck >/dev/null 2>&1 ||
+    die "pair '$PAIR' ($SIDE): the N server cannot open the migrated store"
   port=$(start server "$dir" "$BIN/scion-server" port --data "$dir/server" serve \
     --listen 127.0.0.1:0 --ticket-key "$dir/ticket.key")
   story "$dir" "http://127.0.0.1:$port"
   stop "$dir"
-
-  cur_schema=$(schema_of "$ROOT")
-  prev_schema=$(schema_of "$PREV_SRC")
-  if [ -z "$cur_schema" ] || [ -z "$prev_schema" ]; then
-    die "pair 'store': cannot read SCHEMA_VERSION from one of the two builds"
-  fi
-  if [ "$cur_schema" = "$prev_schema" ]; then
-    summary "pair 4: both builds write schema $cur_schema, so the N-1 refusal cannot fire on this pair"
-    return 0
-  fi
   SIDE='N-1 refuses N'
   note "pair 4 ($SIDE)"
-  "$BIN/scion-server" --data "$dir/server2" import "$dir/src" >/dev/null 2>&1 ||
+  URL=$(pg_db_for "$dir/server2")
+  # The server refuses a missing data directory (#578), as import() says:
+  # create this one too before the import opens it.
+  mkdir -p "$dir/server2"
+  chmod 700 "$dir/server2"
+  SCION_POSTGRES_URL="$URL" "$BIN/scion-server" --data "$dir/server2" import "$dir/src" \
+    >"$dir/import2.out" 2>"$dir/import2.log" || {
+    tail -n 5 "$dir/import2.log" >&2
     die "pair '$PAIR' ($SIDE): the import of the N store failed"
-  if "$PREV_BIN/scion-server" --data "$dir/server2" fsck >"$dir/refuse.log" 2>&1; then
+  }
+  if SCION_POSTGRES_URL="$URL" "$PREV_BIN/scion-server" --data "$dir/server2" fsck >"$dir/refuse.log" 2>&1; then
     die "pair '$PAIR' ($SIDE): the N-1 server accepted a store of N"
   fi
   grep -q 'newer than this build' "$dir/refuse.log" ||
@@ -695,4 +774,30 @@ pair_5 prev "$PREV_BIN" "$BIN"
 pair_6 cur "$BIN" "$PREV_BIN"
 pair_6 prev "$PREV_BIN" "$BIN"
 
-summary "version matrix passed: N-1 $ref against N $(git -C "$ROOT" rev-parse --short HEAD), all six pairs (scn, tier, daemon, store, ticket window, snapshot window)"
+# Leg 7 (issue #890): the corpus's N-1 legs. The harness is this tree's
+# runner (cargo test builds it from HEAD), PREV_BIN names the N-1
+# binaries the pairs built, and the same Postgres database server backs
+# the N-1 server's schema. PREV_REF names the ref the pairs tested, so
+# the runner reads the N-1 side's version off it and never mistakes a
+# dispatch for a stand-in. A qualifying file that answers differently
+# on the N-1 side fails here, not in an operator's upgrade.
+note "corpus N-1 legs"
+out=$(cd "$ROOT" && PREV_BIN="$PREV_BIN" PREV_REF="$ref" \
+  SCION_TEST_POSTGRES_URL="$SCION_TEST_POSTGRES_URL" \
+  cargo test --locked -p open-scion --test transcripts \
+  the_n1_side_answers_as_its_files_say -- --exact --nocapture 2>&1) || {
+  # The leg's id diagnostics (N1 ...) name the inputs a red file saw:
+  # they go out whole, whatever tail the panic line needs.
+  echo "$out" | grep "^N1 " >&2
+  echo "$out" | tail -n 25 >&2
+  die "leg 7 (corpus N-1 legs): the runner failed"
+}
+echo "$out" | grep -q "1 passed;" ||
+  die "leg 7 (corpus N-1 legs): the runner reports no test run"
+echo "$out" | grep -q "the N-1 legs ran " ||
+  die "leg 7 (corpus N-1 legs): the runner printed no count line"
+# A green leg 7 says what it proved: the work dir (the red's log path),
+# the test verdict, and the count line.
+echo "$out" | grep -E "the N-1 work dir:|the N-1 legs ran |test result:"
+
+summary "version matrix passed: N-1 $ref against N $(git -C "$ROOT" rev-parse --short HEAD), all six pairs (scn, tier, daemon, store, ticket window, snapshot window) and the corpus's N-1 legs"

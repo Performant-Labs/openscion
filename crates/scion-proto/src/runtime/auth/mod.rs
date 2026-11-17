@@ -15,11 +15,18 @@ use std::{fs, io};
 #[cfg(target_os = "macos")]
 mod ffi;
 
+#[cfg(target_os = "macos")]
+pub(crate) use ffi::hw_memsize;
+
+pub mod removed;
+
 use rustix::fs::OFlags;
 use tonic::metadata::errors::InvalidMetadataValue;
 use tonic::metadata::{Ascii, MetadataValue};
 use tonic::service::Interceptor;
 use tonic::{Request, Status};
+
+use super::listen::Stalled;
 
 /// Who made a request: the principal of its token. Added to request
 /// extensions by [`Auth`].
@@ -29,6 +36,14 @@ pub struct Caller(pub String);
 /// The principal of the one token that [`Auth::new`] accepts.
 pub const DEFAULT_PRINCIPAL: &str = "default";
 
+/// What a refused authentication calls with the peer it came from, if
+/// the transport knows it. The server installs one sink on its [`Auth`],
+/// so every refusal path records - the interceptor's and
+/// [`Auth::caller_of`]'s alike - and a new service that checks tokens
+/// through this set records its refusals by construction, in the one
+/// place the server chose.
+pub type RefusalSink = Arc<dyn Fn(Option<std::net::SocketAddr>) + Send + Sync>;
+
 /// Accepts requests that carry `authorization: Bearer <token>` with a known
 /// token, and tags each with the token's principal.
 #[derive(Clone)]
@@ -36,6 +51,9 @@ pub struct Auth {
     /// The BLAKE3 digest of each token, and its principal. A presented token
     /// is hashed, so every comparison has the same length.
     tokens: Arc<[([u8; 32], Caller)]>,
+    /// What a refusal calls, if the server installed one. `None` on a bare
+    /// `Auth`: the check answers the same, only the recording is absent.
+    refusals: Option<RefusalSink>,
 }
 
 impl Auth {
@@ -51,7 +69,37 @@ impl Auth {
     pub fn digests(tokens: impl IntoIterator<Item = ([u8; 32], Caller)>) -> Self {
         Self {
             tokens: tokens.into_iter().collect(),
+            refusals: None,
         }
+    }
+
+    /// Records refused authentication through `sink`: the peer the
+    /// transport named, if any, and one warning line per refusal. One
+    /// `Auth` serves every service and every checker - the interceptor's
+    /// refusals and `caller_of`'s record alike.
+    #[must_use]
+    pub fn on_refusal(mut self, sink: RefusalSink) -> Self {
+        self.refusals = Some(sink);
+        self
+    }
+
+    /// The one refusal path: the sink counts the peer, the warning names
+    /// the reason and nothing else - never the token, not even its
+    /// digest - and the status leaves.
+    fn refuse<T>(&self, request: &Request<T>) -> Status {
+        if let Some(sink) = &self.refusals {
+            sink(
+                request
+                    .extensions()
+                    .get::<Stalled>()
+                    .and_then(Stalled::peer),
+            );
+        }
+        tracing::warn!(
+            reason = "missing or wrong token",
+            "the call is unauthenticated"
+        );
+        Status::unauthenticated("missing or wrong token")
     }
 
     /// The caller of `request`, from its `authorization` header. Every
@@ -62,13 +110,16 @@ impl Auth {
     ///
     /// [`Status::unauthenticated`] without a `Bearer` token of this set.
     pub fn caller_of<T>(&self, request: &Request<T>) -> Result<Caller, Status> {
-        request
+        match request
             .metadata()
             .get("authorization")
             .and_then(|value| value.as_bytes().strip_prefix(b"Bearer "))
             .and_then(|token| self.principal(token))
             .cloned()
-            .ok_or_else(|| Status::unauthenticated("missing or wrong token"))
+        {
+            Some(caller) => Ok(caller),
+            None => Err(self.refuse(request)),
+        }
     }
 
     /// The principal of `token`, if any. Compares its digest with every
@@ -94,15 +145,7 @@ impl Interceptor for Auth {
             .and_then(|value| value.as_bytes().strip_prefix(b"Bearer "))
             .and_then(|token| self.principal(token))
             .cloned()
-            .ok_or_else(|| {
-                // One line for the refusal. The span's fields name the RPC
-                // and the peer. Never the token, not even its digest.
-                tracing::warn!(
-                    reason = "missing or wrong token",
-                    "the call is unauthenticated"
-                );
-                Status::unauthenticated("missing or wrong token")
-            })?;
+            .ok_or_else(|| self.refuse(&request))?;
         request.extensions_mut().insert(caller);
         Ok(request)
     }
@@ -676,9 +719,10 @@ mod tests {
 
     use super::*;
 
-    /// A temp directory, and its owner.
+    /// A private temp directory (mode 0700, whatever the umask), and its
+    /// owner.
     fn tempdir() -> (tempfile::TempDir, u32) {
-        let tmp = tempfile::tempdir().unwrap();
+        let tmp = crate::runtime::private_tempdir();
         let me = fs::metadata(tmp.path()).unwrap().uid();
         (tmp, me)
     }
@@ -695,9 +739,6 @@ mod tests {
     #[test]
     fn private_directories_are_made_0700_and_existing_ones_keep_their_mode() {
         let (tmp, me) = tempdir();
-        // The temp directory's own mode is the umask's: set it, so only the
-        // directories made below it are judged.
-        fs::set_permissions(tmp.path(), fs::Permissions::from_mode(0o700)).unwrap();
         // Every part that is made is private, not only the last one. The
         // run's umask, 002 or 022, would leave 0775 or 0755 on a plain mkdir.
         create_private_dir_all(&tmp.path().join("a/b/c")).unwrap();
@@ -894,7 +935,10 @@ mod tests {
     }
 
     /// A real ACL on the filesystem is refused, and its removal restores
-    /// the read. Skipped where `setfacl` is absent.
+    /// the read. Skipped where `setfacl` is absent, unless
+    /// `SCION_TEST_REQUIRE_SETFACL` says the environment promised it:
+    /// CI sets that on the Linux cells it installs `acl` on, so a
+    /// missing `setfacl` there fails instead of passing silently.
     #[cfg(target_os = "linux")]
     #[test]
     fn an_acl_beyond_the_mode_is_refused_for_real() {
@@ -902,7 +946,13 @@ mod tests {
             .arg("--version")
             .output()
             .is_ok_and(|out| out.status.success());
+        let required = std::env::var("SCION_TEST_REQUIRE_SETFACL").is_ok_and(|v| v == "1");
         if !have_setfacl {
+            assert!(
+                !required,
+                "SCION_TEST_REQUIRE_SETFACL=1 but setfacl is missing: \
+                 the real-ACL case cannot run"
+            );
             eprintln!("setfacl is missing; the real-ACL case is skipped");
             return;
         }
@@ -983,6 +1033,154 @@ mod tests {
                 .success()
         );
         read_shared_file(&file).unwrap();
+    }
+
+    /// An ACL that denies first and grants second must still be
+    /// refused: the walk reads every entry, not only the first one, and
+    /// does not stop at the first deny. A walk that ended after one
+    /// entry would call this file deny-only and read it.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_acl_that_denies_first_and_grants_second_is_refused() {
+        let (tmp, _me) = tempdir();
+        let file = tmp.path().join("shared");
+        fs::write(&file, b"bytes").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("chmod")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        // Deny write, allow read: the open the check makes must
+        // succeed, so the refusal comes from the walk, not the kernel.
+        assert!(
+            run(["+a", "everyone deny write", &file.to_string_lossy()].as_ref())
+                .status
+                .success()
+        );
+        assert!(
+            run(["+a", "everyone allow read", &file.to_string_lossy()].as_ref())
+                .status
+                .success()
+        );
+        let err = read_shared_file(&file).unwrap_err();
+        assert!(
+            err.to_string().contains("ACL beyond its mode bits"),
+            "{err}"
+        );
+    }
+
+    /// A parent directory whose ACL grants another account read access
+    /// must be refused: the ancestor walk reads each ancestor's ACL,
+    /// and an ancestor that grants beyond its mode bits is one more
+    /// account that can reach the path. A check that answered "no ACL"
+    /// on every ancestor would let it through.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn a_parent_dir_whose_acl_grants_read_is_refused() {
+        let (tmp, me) = tempdir();
+        let dir = tmp.path().join("private");
+        mkdir(&dir, 0o700);
+        let run = |args: &[&str]| {
+            std::process::Command::new("chmod")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(
+            run(["+a", "everyone allow read", &dir.to_string_lossy()].as_ref())
+                .status
+                .success()
+        );
+        let err = check_ancestors(&dir.join("child"), me).unwrap_err();
+        assert!(
+            err.to_string().contains("ACL beyond its mode bits"),
+            "{err}"
+        );
+        // Clearing the ACL restores the walk.
+        assert!(
+            run(["-N", &dir.to_string_lossy()].as_ref())
+                .status
+                .success()
+        );
+        check_ancestors(&dir.join("child"), me).unwrap();
+    }
+
+    /// An allow entry that names a specific account must be refused
+    /// with a message that names what granted and whom: "an allow
+    /// entry", and the account. A walk that misread the kind, the
+    /// qualifier, or the undefined-id guard would blur exactly this
+    /// message. The named account is the file's own owner, spelled by
+    /// uid: `chmod +a` refuses users the host does not know, and the
+    /// GitHub runners' uid differs from a developer machine's.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_allow_entry_naming_a_user_is_refused_and_named() {
+        let (tmp, me) = tempdir();
+        let file = tmp.path().join("shared");
+        fs::write(&file, b"bytes").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        // `chmod +a` wants the account by name: a numeric uid fails on
+        // hosts where the id does not map to a directory-service record
+        // (domain-joined machines, and some runners). `id -un` names
+        // this process's own account, which always exists.
+        let name = String::from_utf8(
+            std::process::Command::new("id")
+                .arg("-un")
+                .output()
+                .unwrap()
+                .stdout,
+        )
+        .unwrap();
+        let name = name.trim();
+        let run = |args: &[&str]| {
+            std::process::Command::new("chmod")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        let who = format!("user:{name} allow read");
+        assert!(
+            run(["+a", &who, &file.to_string_lossy()].as_ref())
+                .status
+                .success()
+        );
+        let text = read_shared_file(&file).unwrap_err().to_string();
+        // The uid itself is the host's (a domain-joined machine and a
+        // runner spell the same account in different id spaces), so the
+        // pin is the arm, not the number: a named entry must render
+        // "for account".
+        assert!(text.contains("an allow entry for account "), "{text}");
+        let _ = me;
+    }
+
+    /// An entry that names everyone must still be refused, and the
+    /// refusal must name the kind. The qualifier of an everyone entry
+    /// is host-dependent - some macOS builds store a real group id for
+    /// `everyone`, some the undefined id - so this test pins only what
+    /// is invariant: the refusal, and the kind text. Whether the
+    /// message names an account is the host's business.
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn an_everyone_entry_is_refused_and_names_the_kind() {
+        let (tmp, _me) = tempdir();
+        let file = tmp.path().join("shared");
+        fs::write(&file, b"bytes").unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o644)).unwrap();
+        let run = |args: &[&str]| {
+            std::process::Command::new("chmod")
+                .args(args)
+                .output()
+                .unwrap()
+        };
+        assert!(
+            run(["+a", "everyone allow read", &file.to_string_lossy()].as_ref())
+                .status
+                .success()
+        );
+        let text = read_shared_file(&file).unwrap_err().to_string();
+        assert!(text.contains("an allow entry"), "{text}");
     }
 
     /// The $HOME shape of issue #399: a directory whose only ACL entry
@@ -1211,5 +1409,160 @@ mod tests {
         assert_eq!(err.kind(), io::ErrorKind::PermissionDenied, "{err}");
         assert!(err.to_string().contains("symlink"), "{err}");
         let _ = me;
+    }
+
+    /// The ancestor open's contract, pinned without winning a race: the
+    /// open is `O_NOFOLLOW` (and `O_DIRECTORY` where the platform has
+    /// it), so a symlink at the walk's answer is refused, not followed -
+    /// a fold that drops `NOFOLLOW` opens the link and reads another
+    /// directory's ACLs, and one that drops `DIRECTORY` (Linux) opens a
+    /// file as if it were the checked directory. Either way the fd is
+    /// not the directory the walk checked. The regular-file case is
+    /// Linux-only: macOS has no `O_DIRECTORY`, and opens a file.
+    #[test]
+    fn the_ancestor_open_takes_a_directory_and_no_symlink() {
+        let (tmp, me) = tempdir();
+        let dir = tmp.path().join("private");
+        mkdir(&dir, 0o700);
+        fs::write(dir.join("child"), b"").unwrap();
+
+        // A symlink where the directory should be: refused, not
+        // followed. Linux answers ENOTDIR here (O_DIRECTORY bites
+        // before ELOOP would); macOS answers ELOOP (O_NOFOLLOW). The
+        // mutants this pins open the link and answer Ok, so either
+        // errno still turns them red.
+        symlink(&dir, tmp.path().join("link")).unwrap();
+        let err = ancestor_has_hidden_acl(&tmp.path().join("link"), me).unwrap_err();
+        assert!(
+            err.raw_os_error() == Some(rustix::io::Errno::LOOP.raw_os_error())
+                || err.raw_os_error() == Some(rustix::io::Errno::NOTDIR.raw_os_error()),
+            "the symlink answer must be refused: {err}"
+        );
+
+        #[cfg(target_os = "linux")]
+        {
+            // A regular file where the directory should be: ENOTDIR.
+            let err = ancestor_has_hidden_acl(&dir.join("child"), me).unwrap_err();
+            assert_eq!(
+                err.raw_os_error(),
+                Some(rustix::io::Errno::NOTDIR.raw_os_error()),
+                "{err}"
+            );
+        }
+
+        // The real directory passes, and answers no hidden ACL.
+        assert_eq!(ancestor_has_hidden_acl(&dir, me).unwrap(), None);
+    }
+
+    /// The interceptor is what puts the token on every request: a call
+    /// through [`Interceptor::call`] must come out with the
+    /// `authorization` header carrying `Bearer <token>`, or the server
+    /// refuses a client whose token is fine.
+    #[test]
+    fn the_bearer_interceptor_stamps_the_token_on_the_request() {
+        let mut bearer = Bearer::new("t0ken").expect("the token is visible ASCII");
+        let stamped =
+            Interceptor::call(&mut bearer, Request::new(())).expect("the stamping never refuses");
+        assert_eq!(
+            stamped
+                .metadata()
+                .get("authorization")
+                .expect("the header is set"),
+            "Bearer t0ken"
+        );
+    }
+
+    /// A refused read keeps its own text - the mode and owner rules name
+    /// the fix - and every other failure gains the `cannot read <path>`
+    /// context, so an operator can tell which file failed. A sense flip
+    /// would swap the two.
+    #[test]
+    fn the_checked_read_error_keeps_the_refusal_and_contexts_the_rest() {
+        let denied = io::Error::new(io::ErrorKind::PermissionDenied, "mode rule text");
+        let err = checked_read_error(Path::new("k"), denied).to_string();
+        assert!(err.contains("mode rule text"), "{err}");
+        assert!(!err.contains("cannot read"), "{err}");
+
+        let err = checked_read_error(
+            Path::new("k"),
+            io::Error::new(io::ErrorKind::NotFound, "gone"),
+        )
+        .to_string();
+        assert!(err.contains("cannot read k"), "{err}");
+    }
+
+    /// The digest comparison must notice every differing byte, not fold
+    /// to "some bit differs": an XOR fold cancels a delta that two
+    /// positions share, so two digests differing at two positions by the
+    /// same byte compare equal under it - and a random wrong token folds
+    /// to zero whenever the 32 byte-xors XOR to zero, an 8-bit condition,
+    /// about 1 token in 256. Both shapes pin [`constant_time_eq`] (run
+    /// 42391198417 missed the XOR-fold mutant; main is correct).
+    #[test]
+    fn the_digest_comparison_notices_one_and_two_position_differences() {
+        let a = [7u8; 32];
+        // One byte differs: unequal, however the fold combines.
+        let mut one = a;
+        one[0] ^= 1;
+        assert!(
+            !constant_time_eq(&a, &one),
+            "a one-byte difference is unequal"
+        );
+        // Two positions differ by the same delta: the XOR fold cancels
+        // them and would call the digests equal.
+        let mut two = a;
+        two[0] ^= 0x40;
+        two[31] ^= 0x40;
+        assert!(
+            !constant_time_eq(&a, &two),
+            "a shared delta at two positions is unequal"
+        );
+        // Equal digests stay equal.
+        assert!(constant_time_eq(&a, &a));
+    }
+
+    /// The size cap of a checked read is a real bound: a file of exactly
+    /// the cap reads whole, one byte over is refused. Pins the cap at
+    /// one mebibyte - a flip of the cap's 1024 * 1024, or of the size
+    /// comparison that enforces it, is caught (run 42391198417, missed).
+    #[test]
+    fn a_checked_file_at_the_cap_reads_and_one_over_is_refused() {
+        // The cap is pinned by its literal, not by reading the constant:
+        // a test sized by MAX_CHECKED_FILE shrinks with a mutated cap
+        // and pins nothing. 4096 bytes sits above a flipped cap of
+        // 1024 + 1024 and below the real one; the mebibyte edges pin
+        // the comparison itself.
+        let (tmp, _me) = tempdir();
+        let file = tmp.path().join("big");
+        // fs::write takes the umask: under umask 002 the file lands
+        // group-writable and the checked read rightly refuses it. The
+        // test's subject is the cap, not the mode, so each write is
+        // followed by the owner-only mode the other checked-file tests
+        // set.
+        fs::write(&file, vec![b'x'; 4096]).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        read_checked_file(&file, false).unwrap();
+        let cap = 1024 * 1024usize;
+        fs::write(&file, vec![b'x'; cap]).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        let read = read_checked_file(&file, false).unwrap();
+        assert_eq!(read.len(), cap);
+        fs::write(&file, vec![b'x'; cap + 1]).unwrap();
+        fs::set_permissions(&file, fs::Permissions::from_mode(0o600)).unwrap();
+        let err = read_checked_file(&file, false).unwrap_err();
+        assert!(err.to_string().contains("past the"), "{err}");
+    }
+
+    /// A secret file may hold its owner's execute bits: the rule is that
+    /// group and others hold nothing, and 0700 is a valid secret mode.
+    /// The boundary mutant of the trailing-zeros check refuses every
+    /// 0700 secret (run 42391198417, missed).
+    #[test]
+    fn a_secret_file_with_owner_execute_bits_reads() {
+        let (tmp, _me) = tempdir();
+        let secret = tmp.path().join("key");
+        fs::write(&secret, b"bytes").unwrap();
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o700)).unwrap();
+        assert_eq!(read_secret_file(&secret).unwrap(), b"bytes");
     }
 }

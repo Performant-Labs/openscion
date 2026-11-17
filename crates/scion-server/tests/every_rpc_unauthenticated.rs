@@ -1,8 +1,11 @@
 //! Every RPC of both services answers `UNAUTHENTICATED` to a call that
-//! carries no token or a wrong token, and none of the calls has a side
-//! effect. The list of RPCs comes from `proto/scion.proto` itself: a new
-//! RPC without a row here fails this test, so a new method cannot land
-//! without auth coverage.
+//! carries no token or a wrong token, and a ticket-bearing method answers
+//! `PERMISSION_DENIED` to a ticket with a flipped signature byte. None of
+//! the calls has a side effect. The list of RPCs comes from the descriptor
+//! set this build compiled (`scion_proto::descriptor_set`), not from a hand
+//! parse of the proto text: a new RPC without a row here fails this test,
+//! so a new method cannot land without auth coverage, even one a text
+//! parse would miss.
 
 use scion_proto::runtime::auth::token_digest;
 use scion_proto::runtime::listen::Limits;
@@ -19,7 +22,6 @@ use scion_proto::v1::{
 use scion_server::Access;
 use scion_server::Keys;
 use scion_server::Metrics;
-use scion_server::test_support::backend::BackendExt;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::{Backend, test_support::service};
 use std::future::Future;
@@ -59,7 +61,7 @@ fn access() -> Access {
 /// A store whose repo `main` has one root changeset that puts `README`,
 /// and its blob.
 async fn store() -> (tempfile::TempDir, Backend, scion_core::ChangesetId) {
-    let dir = tempfile::tempdir().unwrap();
+    let dir = scion_server::test_support::private_tempdir();
     let store = {
         let path = dir.path().to_path_buf();
         tokio::task::spawn_blocking(move || Backend::open_test(&path).unwrap())
@@ -100,8 +102,9 @@ async fn store() -> (tempfile::TempDir, Backend, scion_core::ChangesetId) {
     (dir, store, root)
 }
 
-/// The server of `store` behind `access`, as a `http://` URL. Hold the
-/// stop signal, or the server shuts down when it drops.
+/// The server of `store` behind `access`, as a `http://` URL, with a real
+/// audit file so the refused calls' recording is checked. Hold the stop
+/// signal, or the server shuts down when it drops.
 async fn serve(
     store: &Backend,
     dir: &std::path::Path,
@@ -116,13 +119,14 @@ async fn serve(
         access,
         service::ServeOptions {
             data: dir.to_path_buf(),
-            audit: scion_server::test_support::audit::Audit::off(),
+            audit: scion_server::test_support::audit::Audit::open(&dir.join("audit.log")).unwrap(),
             limits: Limits::default(),
             quotas: scion_server::Quotas::off(),
             pending_lands: None,
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::new(Metrics::default()),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         Some(Arc::new(Keys::generate())),
         async {
@@ -334,39 +338,50 @@ fn rows() -> Vec<Row> {
     ]
 }
 
-/// The `(service, rpc)` pairs that `proto/scion.proto` declares, and the
-/// service names the generated code claims. A new RPC without a row
-/// fails the test; so does a row whose RPC is gone.
-fn declared() -> (Vec<(String, String)>, Vec<String>) {
-    // The proto of the repository: the same file the build compiles.
-    let path = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../proto/scion.proto");
-    let text = std::fs::read_to_string(&path).expect("proto/scion.proto is readable");
-    let package = text
-        .lines()
-        .map(str::trim)
-        .find_map(|line| {
-            line.strip_prefix("package ")
-                .and_then(|rest| rest.strip_suffix(';'))
-        })
-        .expect("the proto declares a package")
-        .to_owned();
-    let mut service = String::new();
+use prost::Message as _;
+use prost_types::FileDescriptorSet;
+
+type Rpcs = Vec<(String, String)>;
+
+/// The `(service, rpc)` pairs and the ticket-bearing methods that the
+/// build's descriptor set declares, and the service names the generated
+/// code claims. Both lists come from what the compiler saw: a new RPC or a
+/// new service is in the descriptor set as soon as it compiles, whatever
+/// the proto text looks like.
+fn declared() -> (Rpcs, Rpcs, Vec<String>) {
+    let bytes = scion_proto::descriptor_set();
+    let set = FileDescriptorSet::decode(bytes).expect("the build's descriptor set decodes");
     let mut declared = Vec::new();
-    for line in text.lines().map(str::trim) {
-        if let Some(name) = line
-            .strip_prefix("service ")
-            .and_then(|r| r.strip_suffix(" {"))
-        {
-            // The file's package makes the full name the generated code
-            // publishes as SERVICE_NAME.
-            service = format!("{package}.{}", name.trim());
-        } else if let Some(rest) = line.strip_prefix("rpc ") {
-            let name = rest.split('(').next().expect("rpc NAME(").trim().to_owned();
-            declared.push((service.clone(), name));
+    let mut ticket_rpcs = Vec::new();
+    for file in &set.file {
+        let package = file.package.clone().unwrap_or_default();
+        for service in &file.service {
+            let service_full = format!("{package}.{}", service.name.clone().unwrap_or_default());
+            for method in &service.method {
+                // A method whose request message carries a `ticket` field
+                // takes the ticket as its only permission (section 8 of
+                // docs/architecture.md): a bad ticket is PERMISSION_DENIED,
+                // not UNAUTHENTICATED. Requests are top-level messages of
+                // the same file.
+                let input = method.input_type.clone().unwrap_or_default();
+                let takes_ticket = file.message_type.iter().any(|message| {
+                    let full = format!(".{package}.{}", message.name.clone().unwrap_or_default());
+                    full == input
+                        && message
+                            .field
+                            .iter()
+                            .any(|field| field.name.as_deref() == Some("ticket"))
+                });
+                let name = method.name.clone().unwrap_or_default();
+                if takes_ticket {
+                    ticket_rpcs.push((service_full.clone(), name.clone()));
+                }
+                declared.push((service_full.clone(), name));
+            }
         }
     }
     let generated = vec![SCION_SERVICE.to_owned(), OBJECTS_SERVICE.to_owned()];
-    (declared, generated)
+    (declared, ticket_rpcs, generated)
 }
 
 /// The repo's state that the calls must not change: the version of
@@ -384,69 +399,38 @@ async fn state_of(store: &Backend, dir: &Path) -> (i64, Vec<i64>) {
 }
 
 fn state_of_blocking(store: &Backend, dir: &Path) -> (i64, Vec<i64>) {
-    if Backend::test_is_postgres() {
-        let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
-        let schema = Backend::test_schema(dir).expect("the tests run on Postgres");
-        let mut client = postgres::Client::connect(&url, postgres::NoTls).unwrap();
-        client
-            .batch_execute(&format!("SET search_path TO {schema}"))
-            .unwrap();
-        let tables = client
-            .query(
-                "SELECT tablename FROM pg_tables
-                 WHERE schemaname = current_schema()
-                 ORDER BY tablename",
-                &[],
-            )
-            .unwrap();
-        let counts = tables
-            .iter()
-            .map(|row| {
-                let table: String = row.get(0);
-                client
-                    .query_one(&format!("SELECT COUNT(*) FROM {table}"), &[])
-                    .unwrap()
-                    .get(0)
-            })
-            .collect();
-        let version = client
-            .query_one("SELECT version FROM refs WHERE name = 'main'", &[])
+    let url = std::env::var("SCION_TEST_POSTGRES_URL")
+        .expect("SCION_TEST_POSTGRES_URL names the test database");
+    let schema = Backend::test_schema(dir);
+    let mut client =
+        postgres::Client::connect(&url, postgres::NoTls).expect("the test database connects");
+    client
+        .batch_execute(&format!("SET search_path TO {schema}"))
+        .unwrap();
+    // Every metadata table's row count, straight from the store's own
+    // catalog, so a new table joins the check on its own.
+    let tables = client
+        .query(
+            "SELECT tablename FROM pg_tables
+             WHERE schemaname = $1
+             ORDER BY tablename",
+            &[&schema],
+        )
+        .unwrap();
+    let mut counts = Vec::new();
+    for row in &tables {
+        let table: String = row.get(0);
+        let count = client
+            .query_one(&format!("SELECT COUNT(*) FROM \"{table}\""), &[])
             .unwrap()
             .get(0);
-        return (version, counts);
+        counts.push(count);
     }
-    let store = store.sqlite().expect("the test backend is SQLite");
-    let counts = store
-        .read(|c| {
-            let mut names = c
-                .prepare(
-                    "SELECT name FROM sqlite_master
-                     WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
-                     ORDER BY name",
-                )
-                .map_err(scion_server::test_support::error::from_sqlite)?;
-            let names = names
-                .query_map([], |row| row.get::<_, String>(0))
-                .map_err(scion_server::test_support::error::from_sqlite)?
-                .collect::<Result<Vec<_>, _>>()
-                .map_err(scion_server::test_support::error::from_sqlite)?;
-            names
-                .iter()
-                .map(|name| {
-                    c.query_row::<i64, _, _>(&format!("SELECT COUNT(*) FROM {name}"), [], |row| {
-                        row.get(0)
-                    })
-                    .map_err(scion_server::test_support::error::from_sqlite)
-                })
-                .collect()
-        })
-        .expect("the row counts read");
-    let version = store
-        .read(|c| {
-            let repo = c.repo_id(REPO)?;
-            Ok(c.get_ref(repo, "main")?.expect("main exists").version)
-        })
-        .expect("main reads");
+    let version = client
+        .query_one("SELECT version FROM refs WHERE name = $1", &[&REPO])
+        .unwrap()
+        .get(0);
+    let _ = store;
     (version, counts)
 }
 
@@ -485,7 +469,7 @@ fn changeset_on(
 #[tokio::test(flavor = "multi_thread")]
 #[allow(clippy::too_many_lines)]
 async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
-    let (declared, generated) = declared();
+    let (declared, ticket_rpcs, generated) = declared();
     // The proto and the generated code agree on the services.
     for name in &generated {
         assert!(
@@ -565,16 +549,19 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
     let before = state_of(&store, dir.path()).await;
 
     for row in &rows {
+        let ticket_only = ticket_rpcs
+            .iter()
+            .any(|(service, rpc)| service == row.service && rpc == row.rpc);
+        let want = if ticket_only {
+            Code::PermissionDenied
+        } else {
+            Code::Unauthenticated
+        };
         for (who, pair) in [("no token", &none), ("wrong token", &wrong)] {
             let reply = (row.call)(pair, &payload).await;
             let status = match reply {
                 Ok(()) => panic!("{}.{}, {who}: the call went through", row.service, row.rpc),
                 Err(status) => status,
-            };
-            let want = if row.rpc == "GetObjects" {
-                Code::PermissionDenied
-            } else {
-                Code::Unauthenticated
             };
             assert_eq!(
                 status.code(),
@@ -586,6 +573,76 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
             );
         }
     }
+    // The refusals the meter must have counted: two per row that answers
+    // UNAUTHENTICATED (no token, wrong token). A ticket-only method's
+    // refusal is the ticket's, and the meter counts token refusals.
+    // The recording check at the end holds the count against the audit
+    // file, so a method whose refusal skips the recording fails here -
+    // the row check alone cannot see it.
+    let refused_auth = 2 * rows
+        .iter()
+        .filter(|row| {
+            !ticket_rpcs
+                .iter()
+                .any(|(service, rpc)| service == row.service && rpc == row.rpc)
+        })
+        .count();
+    // The ticket-bearing methods: a real ticket minted through the right
+    // token, then the same request with one signature byte flipped and no
+    // token at all (the ticket is the only permission). A damaged ticket
+    // is PERMISSION_DENIED, per docs/protocol-v1.md: the ticket is
+    // missing, damaged, expired, or not signed by the server's keys.
+    let minted = ci
+        .objects
+        .get_root_tree(GetRootTreeRequest {
+            repo: REPO.into(),
+            changeset_id: root.as_bytes().to_vec(),
+        })
+        .await
+        .expect("the right token mints a read ticket")
+        .into_inner()
+        .ticket;
+    assert!(!minted.is_empty(), "the reply carries a ticket");
+    let mut flipped = minted.clone();
+    let last = flipped.len() - 1;
+    flipped[last] ^= 0x01; // The signature is the ticket's last 64 bytes.
+    assert!(
+        ticket_rpcs
+            .iter()
+            .any(|(service, rpc)| service == "scion.v1.Objects" && rpc == "GetObjects"),
+        "the discovery found no ticket-bearing method: the walk would run zero bad-ticket calls"
+    );
+    for (service, rpc) in &ticket_rpcs {
+        let reply = match (service.as_str(), rpc.as_str()) {
+            ("scion.v1.Objects", "GetObjects") => {
+                let mut objects = none.objects.clone();
+                objects
+                    .get_objects(GetObjectsRequest {
+                        refs: vec![scion_proto::v1::ObjectRef {
+                            kind: scion_proto::v1::ObjectKind::Blob as i32,
+                            id: vec![0; 32],
+                            path: Vec::new(),
+                        }],
+                        accept: Vec::new(),
+                        ticket: flipped.clone(),
+                    })
+                    .await
+            }
+            other => unreachable!(
+                "a ticket-bearing RPC {other:?} without a call here: add one, so it cannot land without ticket coverage"
+            ),
+        };
+        let Err(status) = reply else {
+            panic!("{service}.{rpc}: a flipped-signature ticket went through")
+        };
+        assert_eq!(
+            status.code(),
+            Code::PermissionDenied,
+            "{service}.{rpc} with a damaged ticket: {}",
+            status.message()
+        );
+    }
+
     // No refused call moved a ref, stored a blob, or landed anything.
     let after = state_of(&store, dir.path()).await;
     assert_eq!(before, after, "a refused call changed the repo");
@@ -642,7 +699,45 @@ async fn every_rpc_answers_unauthenticated_without_a_valid_token() {
         }
     }
 
+    // The recording: the stop flushes the refusal meter, and the audit
+    // file must hold one counted line per peer, with every refused call
+    // on it. A method that answers UNAUTHENTICATED without recording -
+    // a new service that checks tokens outside the server's one auth -
+    // leaves the count short, and this fails.
     stop.send(()).ok();
+    let audit_path = dir.path().join("audit.log");
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    let lines = loop {
+        let text = std::fs::read_to_string(&audit_path).unwrap_or_default();
+        let lines: Vec<serde_json::Value> = text
+            .lines()
+            .filter_map(|line| serde_json::from_str(line).ok())
+            .collect();
+        if lines
+            .iter()
+            .any(|line| line["event"] == "auth" && line["outcome"] == "refused")
+            || std::time::Instant::now() > deadline
+        {
+            break lines;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    };
+    let refusals: Vec<_> = lines
+        .iter()
+        .filter(|line| line["event"] == "auth" && line["outcome"] == "refused")
+        .collect();
+    assert_eq!(
+        refusals.len(),
+        1,
+        "one counted refusal line per peer, got {lines:?}"
+    );
+    assert_eq!(
+        refusals[0]["count"], refused_auth,
+        "every refused call is counted on the one line"
+    );
+    assert_eq!(refusals[0]["peer"], "127.0.0.1");
+    let text = std::fs::read_to_string(&audit_path).unwrap();
+    assert!(!text.contains("wrong"), "the refused token never appears");
 }
 
 #[path = "common/mod.rs"]

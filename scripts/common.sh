@@ -16,6 +16,9 @@ CACHE_PORT=${CACHE_PORT:-17879}
 SERVER_METRICS_PORT=${SERVER_METRICS_PORT:-17880}
 CACHE_METRICS_PORT=${CACHE_METRICS_PORT:-17881}
 
+# shellcheck source=pg-url.sh source-path=SCRIPTDIR
+. "$(dirname "${BASH_SOURCE[0]}")/pg-url.sh"
+
 ROOT=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 case ${CARGO_TARGET_DIR:-} in
   "") BIN=$ROOT/target/release ;;
@@ -73,20 +76,27 @@ kib_per_1k() {
   fi
 }
 
+# pg_url_for lives in pg-url.sh, sourced below: the scripts that do not
+# source this file (mount-nfs.sh) source that one directly.
+
 # served_backend DATA_DIR: what the store the server ran on really is,
-# read from the data directory. backend.rs writes the `backend` marker
-# only for Postgres, so no marker file means SQLite; a marker file with
-# any other first line is damage, not SQLite, and reads as unknown:<line>
-# — the caller fails on it rather than passing a damaged store off as
-# either backend (#561 review F3).
+# read from the data directory, asserted Postgres. The server's metadata
+# store is Postgres: a directory with no backend marker ran SQLite, and
+# a marker with any other first line is damage, not SQLite, and reads
+# as unknown:<line> - either way the caller fails on it rather than
+# passing a store off as what the run asked for (#561 review F3).
 served_backend() {
   local dir=$1 line f="$1/backend"
-  [ -f "$f" ] || { echo sqlite; return 0; }
+  if [ ! -f "$f" ]; then
+    echo "FAIL: the data dir $dir has no backend marker: the server did not run Postgres-backed" >&2
+    return 1
+  fi
   line=$(head -n 1 "$f" 2> /dev/null || true)
-  case $line in
-    postgres) echo postgres ;;
-    *) echo "unknown:$line" ;;
-  esac
+  if [ "$line" != postgres ]; then
+    echo "FAIL: the data dir $dir is not Postgres-backed (the marker says ${line:-nothing})" >&2
+    return 1
+  fi
+  echo postgres
 }
 
 # du_sample CSV DATA_DIR NOW: append the store's size as `NOW,size`.
@@ -163,13 +173,16 @@ fetch_dataset() {
 }
 
 # Imports $WORK/src.git into a new server data directory, $WORK/server, and
-# sets $COMMITS. Its times are in $WORK/import.log.
+# sets $COMMITS. Its times are in $WORK/import.log. The metadata lands in
+# the database schema pg_url_for names for the directory: set PG_URL from
+# pg_url_for before calling this.
 import_dataset() {
   note "importing"
-  # D25: the server refuses a missing data directory; create it here.
+  : "${PG_URL:?set PG_URL with pg_url_for before importing}"
+  # The server refuses a missing data directory (#578); create it here.
   mkdir -p "$WORK/server"
   chmod 700 "$WORK/server"
-  /usr/bin/time -p "$BIN/scion-server" --data "$WORK/server" import --rev main "$WORK/src.git" \
+  /usr/bin/time -p env SCION_POSTGRES_URL="$PG_URL" "$BIN/scion-server" --data "$WORK/server" import --rev main "$WORK/src.git" \
     > "$WORK/import.out" 2> "$WORK/import.log" || {
     tail -n 20 "$WORK/import.log" >&2
     die "import failed"
@@ -416,10 +429,11 @@ stop() {
 # once in $WORK and keeps from run to run, and the cache verifies with the
 # key's public half. The daemon only forwards the tickets.
 start_scion() {
+  : "${PG_URL:?set PG_URL with pg_url_for before starting the stack}"
   if [ ! -f "$WORK/ticket.key" ]; then
     "$BIN/scion-server" --data "$WORK/server" ticket-key --out "$WORK/ticket.key" > "$WORK/ticket.pub"
   fi
-  start server serving "$BIN/scion-server" --data "$WORK/server" serve \
+  start server serving env SCION_POSTGRES_URL="$PG_URL" "$BIN/scion-server" --data "$WORK/server" serve \
     --listen "127.0.0.1:$SERVER_PORT" \
     --ticket-key "$WORK/ticket.key" \
     --metrics-listen "127.0.0.1:$SERVER_METRICS_PORT"
@@ -427,8 +441,35 @@ start_scion() {
     --upstream "$SERVER" \
     --ticket-public-key "$(cat "$WORK/ticket.pub")" \
     --metrics-listen "127.0.0.1:$CACHE_METRICS_PORT"
+  mkdir -p "$WORK/daemon"
+  # The daemon refuses a data directory open to other users (its socket
+  # and store live there); the scripts run alone in $WORK, so 0700.
+  chmod 700 "$WORK/daemon"
   start daemon serving "$BIN/scion-daemon" --data "$WORK/daemon" --socket "$SOCKET" \
     --upstream "http://127.0.0.1:$CACHE_PORT"
+}
+
+# cell_throughput BENCH_JSONS: the cell's throughput, the lands the
+# bench reports over the seconds its reports cover, summed over the
+# cell's reps. A rep whose bench died leaves no report and adds no
+# lands or seconds. test-capacity-counters.sh pins the arithmetic: the
+# seconds are the reports' SECOND field - summing the lands field read
+# 1.0 lands/s in every cell of run 40206407822.
+cell_throughput() {
+  local bf lands=0 secs=0 tsv
+  tsv=$(mktemp)
+  for bf in "$@"; do
+    [ -f "$bf" ] || continue
+    jq -r '[.landed // 0, .seconds // 0] | @tsv' "$bf" > "$tsv" || continue
+    lands=$((lands + $(cut -f1 "$tsv")))
+    secs=$(awk -v s="$secs" '{ print s + $2 }' "$tsv")
+  done
+  rm -f "$tsv"
+  if awk -v s="$secs" 'BEGIN { exit !(s > 0) }'; then
+    awk -v l="$lands" -v s="$secs" 'BEGIN { printf "%.1f\n", l / s }'
+  else
+    echo "-"
+  fi
 }
 
 # scrape_metrics URL: the total of the out-bytes counters of the registry at
@@ -467,16 +508,19 @@ batch() {
   local name=$1 jobs=$2 cmd=$3
   export BIN DAEMON SPARSE_DIR
   mkdir "$WORK/$name"
-  # Each job starts 10 ms after the one before it, round-robin over 20
-  # steps. All jobs starting at once can overflow a server's accept
-  # queue: git daemon listens with a backlog of 5 (daemon.c:
-  # listen(sockfd, 5)), and a connection that completes its handshake
-  # onto a full queue is refused - with tcp_abort_on_overflow=0 the
-  # kernel drops the final ACK and the client's reset comes when it
-  # sends its first bytes, which is why the failure landed mid-run as
-  # "read error: Connection reset by peer". A start every 10 ms keeps
-  # the queue near empty; the half second it adds to a 50-job batch is
-  # inside the noise, and both tools pay it alike. nstat's
+  # Each job starts 10 ms after the one before it, one slot per job.
+  # All jobs starting at once can overflow a server's accept queue:
+  # git daemon listens with a backlog of 5 (daemon.c: listen(sockfd,
+  # 5)), and a connection that completes its handshake onto a full
+  # queue is refused - with tcp_abort_on_overflow=0 the kernel drops
+  # the final ACK and the client's reset comes when it sends its first
+  # bytes, which is why the failure lands mid-run as "read error:
+  # Connection reset by peer". The slots used to round-robin over 20
+  # steps, so a 50-job batch started 2-3 clones in the same 10 ms; on
+  # a slow runner those starts bunch, the queue overflows (24 drops in
+  # one batch), and the batch dies. One slot per job paces the starts
+  # singly; the half second it adds to a 50-job batch is inside the
+  # noise, and both tools pay it alike. nstat's
   # TcpExtListenOverflows and TcpExtListenDrops, taken around every
   # batch, say whether the queue ever overflowed.
   # SHORTCUT: stagger the starts because git daemon's backlog is 5 and
@@ -485,12 +529,17 @@ batch() {
   nstat -az TcpExtListenOverflows TcpExtListenDrops > "$WORK/$name.nstat.0" 2>/dev/null || \
     netstat -s > "$WORK/$name.nstat.0" 2>/dev/null || true
   # The job's number drives the stagger, and its path is the checkout
-  # target, so sh gets both: $3 is the number, $2 the command, and $1 the
-  # path that the command's own "$1" reads.
+  # target, so sh gets all three: $3 is the number, $2 the command, $1
+  # the path that the command's own "$1" reads, and $4 the batch's job
+  # count (the count is a shell local; a child cannot see it, and
+  # without it the sleep line dies and every job starts at once). The
+  # slot form is two decimals, so the count caps at 99: at 100+ the
+  # form folds ("0.100" reads as 0.1 s) and the pace breaks.
+  [ "$jobs" -le 99 ] || die "batch: $jobs jobs breaks the two-decimal stagger cap (99)"
   local rc=0
   seq 1 "$jobs" | /usr/bin/time -p xargs -P "$jobs" -I{} sh -c \
-    'sleep "$(printf "0.%02ds" $(( ($3 - 1) % 20 )))"; eval "$2"' \
-    sh "$WORK/$name/{}" "$cmd" {} \
+    'sleep "$(printf "0.%02d" $(( ($3 - 1) % $4 )))"; eval "$2"' \
+    sh "$WORK/$name/{}" "$cmd" {} "$jobs" \
     > "$WORK/$name.log" 2>&1 || rc=$?
   # The counters land even when the batch failed: an overflow during a
   # failed batch is exactly the evidence the run exists for.

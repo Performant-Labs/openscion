@@ -569,6 +569,16 @@ async fn get(client: &mut Client, fake: &Fake, objects: &[&Object]) -> Result<Ve
     get_in(client, fake, objects).await?
 }
 
+/// A tempdir whose mode is private (0o700), whatever the process umask
+/// is: a store or a socket refuses a directory another user could swap
+/// or write, so every test's data directory and socket parent goes
+/// through this helper and no test can forget the mode.
+fn private_tempdir() -> tempfile::TempDir {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    dir
+}
+
 fn blob(data: &[u8]) -> Object {
     Object {
         kind: ObjectKind::Blob.into(),
@@ -756,20 +766,10 @@ async fn each_tier_refuses_a_call_without_the_token() {
     let fake = Fake::sending([], Duration::ZERO);
     let upstream = serve_fake(fake.clone()).await;
     let (cache, cache_url) = serve_cache(&upstream, CACHE_UPSTREAM_TIMEOUT, &fake.keys()).await;
-    let dir = tempfile::tempdir().unwrap();
-    // The socket's directory must be private.
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = private_tempdir();
     let socket = dir.path().join("daemon.sock");
     let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
-    let daemon = Tier::new(
-        store,
-        &cache_url,
-        TOKEN,
-        CACHE_UPSTREAM_TIMEOUT,
-        None,
-        Vec::new(),
-    )
-    .unwrap();
+    let daemon = Tier::new_relay(store, &cache_url, TOKEN, CACHE_UPSTREAM_TIMEOUT, None).unwrap();
     let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
     tokio::spawn(daemon.clone().serve(
         TOKEN,
@@ -1092,7 +1092,7 @@ struct TestAuthority {
 impl TestAuthority {
     /// A CA with no name that a test needs.
     fn new(name: &str) -> Self {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = private_tempdir();
         let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
         params.is_ca = rcgen::IsCa::Ca(rcgen::BasicConstraints::Unconstrained);
         params.key_usages = vec![rcgen::KeyUsagePurpose::KeyCertSign];
@@ -1239,8 +1239,7 @@ async fn serve_daemon(
     ca: Option<&TestCert>,
     client: Option<&TestCert>,
 ) -> (String, tempfile::TempDir) {
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = private_tempdir();
     let socket = dir.path().join("daemon.sock");
     let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
     let client_tls = ClientTls::load(
@@ -1249,13 +1248,12 @@ async fn serve_daemon(
         client.map(|c| c.key.as_path()),
     )
     .unwrap();
-    let daemon = Tier::new(
+    let daemon = Tier::new_relay(
         store,
         cache_url,
         TOKEN,
         CACHE_UPSTREAM_TIMEOUT,
         Some(&client_tls),
-        Vec::new(),
     )
     .unwrap();
     let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
@@ -1327,13 +1325,12 @@ async fn a_daemon_with_a_certificate_of_another_ca_is_refused() {
 #[tokio::test]
 async fn an_https_upstream_needs_a_ca() {
     let store = MemoryStore::new(1 << 20);
-    let tier = Tier::new(
+    let tier = Tier::new_relay(
         store,
         "https://127.0.0.1:1",
         TOKEN,
         CACHE_UPSTREAM_TIMEOUT,
         None,
-        Vec::new(),
     );
     assert!(tier.is_err());
 }
@@ -1347,20 +1344,11 @@ async fn a_daemon_miss_fetches_the_object_only() {
     let fake = Fake::new(&[&object], Duration::ZERO);
     let upstream = serve_fake(fake.clone()).await;
     let (cache, cache_url) = serve_cache(&upstream, CACHE_UPSTREAM_TIMEOUT, &fake.keys()).await;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = private_tempdir();
     let socket = dir.path().join("daemon.sock");
     let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
     // No ticket keys: a daemon, which checks no ticket and runs no walk.
-    let daemon = Tier::new(
-        store,
-        &cache_url,
-        TOKEN,
-        CACHE_UPSTREAM_TIMEOUT,
-        None,
-        Vec::new(),
-    )
-    .unwrap();
+    let daemon = Tier::new_relay(store, &cache_url, TOKEN, CACHE_UPSTREAM_TIMEOUT, None).unwrap();
     let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
     tokio::spawn(daemon.clone().serve(
         TOKEN,
@@ -1513,19 +1501,10 @@ async fn a_daemons_cache_still_refuses_a_view_ticket_outside_its_view() {
     let warmed = fake.calls();
 
     // bob's daemon: no ticket keys, so no walk of its own.
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = private_tempdir();
     let socket = dir.path().join("daemon.sock");
     let store = DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
-    let daemon = Tier::new(
-        store,
-        &cache_url,
-        TOKEN,
-        CACHE_UPSTREAM_TIMEOUT,
-        None,
-        Vec::new(),
-    )
-    .unwrap();
+    let daemon = Tier::new_relay(store, &cache_url, TOKEN, CACHE_UPSTREAM_TIMEOUT, None).unwrap();
     let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
     tokio::spawn(daemon.clone().serve(
         TOKEN,
@@ -1563,8 +1542,6 @@ async fn start_daemon(
     upstream: &str,
     limit: usize,
 ) -> (Kill, String) {
-    use std::time::Instant;
-
     use std::process::Command;
     let child = Command::new(env!("CARGO_BIN_EXE_scion-daemon"))
         .arg("--data")
@@ -1575,23 +1552,40 @@ async fn start_daemon(
         .arg(upstream)
         .arg("--max-bytes")
         .arg(limit.to_string())
-        .arg("--token")
-        .arg(TOKEN)
-        .arg("--upstream-token")
-        .arg(TOKEN)
+        .env("SCION_TOKEN", TOKEN)
+        .env("SCION_UPSTREAM_TOKEN", TOKEN)
         .spawn()
         .map(Kill)
         .unwrap();
-    // The child is up when its socket file is there (10 s ceiling).
+    wait_serving(socket).await;
+    (child, format!("unix://{}", socket.display()))
+}
+
+/// The daemon is up when a connect to its socket succeeds. The socket
+/// file exists from `bind()`, but a connect between the bind and the
+/// listen - two syscalls inside the bind - is refused, and a daemon
+/// thread descheduled between them on a loaded runner leaves that
+/// window open for as long as the scheduler pleases: the readiness
+/// this replaced connected the moment it saw the file, and its refusal
+/// panicked the test. A refused connect is retryable, an answered one
+/// is the daemon serving; the 10 s ceiling stands, and the failure
+/// names the last cause the poll saw.
+async fn wait_serving(socket: &std::path::Path) {
+    use std::time::Instant;
+
     let deadline = Instant::now() + Duration::from_secs(10);
-    while !socket.exists() {
-        assert!(
-            Instant::now() < deadline,
-            "the daemon never opened its socket"
-        );
+    let mut last = String::from("the 10 s ceiling passed before a try");
+    while Instant::now() < deadline {
+        match tokio::net::UnixStream::connect(socket).await {
+            Ok(stream) => {
+                drop(stream);
+                return;
+            }
+            Err(error) => last = error.to_string(),
+        }
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
-    (child, format!("unix://{}", socket.display()))
+    panic!("the daemon never answered on {}: {last}", socket.display());
 }
 
 /// Kills the daemon when the test ends, however it ends: a leftover child
@@ -1626,10 +1620,14 @@ async fn a_daemon_killed_mid_fill_serves_no_torn_object_after_its_restart() {
     let limit = 8 << 20;
     let fake = Fake::new(&fill.iter().collect::<Vec<_>>(), Duration::ZERO);
     let upstream = serve_fake(fake.clone()).await;
-    let dir = tempfile::tempdir().unwrap();
-    std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+    let dir = private_tempdir();
     let socket = dir.path().join("daemon.sock");
     let data = dir.path().join("data");
+    // The daemon refuses a data directory that does not exist, and one
+    // that is open to other users; this test's store is a real one, so
+    // it exists and is private before the start.
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
 
     let (mut child, url) = start_daemon(&data, &socket, &upstream, limit).await;
     let fill_task = spawn_get(&url, &fake, &fill).await;
@@ -1665,15 +1663,7 @@ async fn a_daemon_killed_mid_fill_serves_no_torn_object_after_its_restart() {
     // its own bytes: the copies that the kill cut arrive from upstream
     // again, and no torn file is served on the way (reads go on).
     let store = DiskStore::open(&data, limit).unwrap();
-    let restarted = Tier::new(
-        store,
-        &upstream,
-        TOKEN,
-        CACHE_UPSTREAM_TIMEOUT,
-        None,
-        Vec::new(),
-    )
-    .unwrap();
+    let restarted = Tier::new_relay(store, &upstream, TOKEN, CACHE_UPSTREAM_TIMEOUT, None).unwrap();
     let socket = dir.path().join("daemon-restarted.sock");
     let incoming = UnixListenerStream::new(bind_unix(&socket).await.unwrap());
     let serve_task = tokio::spawn(restarted.clone().serve(
@@ -1710,20 +1700,27 @@ async fn a_daemon_killed_mid_fill_serves_no_torn_object_after_its_restart() {
     };
     let deadline = Instant::now() + Duration::from_secs(10);
     loop {
-        if files.iter().all(|file| agrees(&store, file)) {
+        if files.iter().all(agreeing(&store)) {
             break;
         }
         assert!(
             Instant::now() < deadline,
-            "the walk never adopted the files that the kill stranded"
+            "the walk never settled the files that the kill stranded"
         );
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
 
-    // No stored file is torn: each unpacks to bytes that hash to the ID
-    // in its name. The tier's serve-time check would drop a bad one and
-    // fetch it again; this asserts none is bad in the first place.
-    for (kind, id, path, _) in &files {
+    // No stored file is torn: each file the store holds unpacks to bytes
+    // that hash to the ID in its name. The tier's serve-time check would
+    // drop a bad one and fetch it again; this asserts none is bad in the
+    // first place. The limit may have dropped files of the list since the
+    // kill; what it dropped is gone, and owes nothing.
+    let held = stored_files(&objects);
+    assert!(
+        held.len() < fill.len(),
+        "the store holds the whole fill: the limit never bit"
+    );
+    for (kind, id, path, _) in &held {
         let body = std::fs::read(path).unwrap();
         if kind == "blob" {
             unpacks_to_its_id(&body, id);
@@ -1731,7 +1728,7 @@ async fn a_daemon_killed_mid_fill_serves_no_torn_object_after_its_restart() {
     }
 
     // The byte limit still holds, after the walk and the fills.
-    let kept: u64 = files.iter().map(|(.., len)| *len).sum();
+    let kept: u64 = held.iter().map(|(.., len)| *len).sum();
     assert!(
         kept <= limit as u64,
         "the store holds {kept} bytes over its limit"
@@ -1795,21 +1792,377 @@ fn id_of(first: &std::ffi::OsStr, second: &std::ffi::OsStr) -> Option<Vec<u8>> {
         .collect()
 }
 
-/// One file agrees with the index: the store knows its key at the file's
-/// size.
-fn agrees(store: &DiskStore, file: &(String, Vec<u8>, std::path::PathBuf, u64)) -> bool {
-    let (kind, id, _, len) = file;
-    let key = if kind == "blob" {
-        BlobId::try_from(id.as_slice()).map(Key::Blob)
-    } else {
-        scion_core::TreeId::try_from(id.as_slice()).map(Key::Tree)
-    };
-    match key {
-        Ok(key) => store
-            .size(key)
-            .ok()
-            .flatten()
-            .is_some_and(|size| size as u64 == *len),
-        Err(_) => false,
+/// A file the store still holds is in the index at its size. A file the
+/// limit dropped since the kill is gone from disk, and the walk owes
+/// nothing for it: a file still on disk must be in the index — that is
+/// what the walk of a start adopts.
+fn agreeing(
+    store: &DiskStore,
+) -> impl Fn(&(String, Vec<u8>, std::path::PathBuf, u64)) -> bool + '_ {
+    move |(kind, id, path, len)| {
+        let key = if kind == "blob" {
+            BlobId::try_from(id.as_slice()).map(Key::Blob)
+        } else {
+            scion_core::TreeId::try_from(id.as_slice()).map(Key::Tree)
+        };
+        let known = match key {
+            Ok(key) => store
+                .size(key)
+                .ok()
+                .flatten()
+                .is_some_and(|size| size as u64 == *len),
+            Err(_) => false,
+        };
+        known || !path.exists()
     }
+}
+
+/// The daemon's stderr stays quiet and colorless across reads: no escape
+/// byte (color only when stderr is a terminal), and nothing per call (the
+/// `GetObjects` line is DEBUG; the hit and miss counts are the metrics'
+/// `cache_counts`). The 20 reads return their objects, so the quiet is
+/// not a broken daemon.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_daemons_stderr_stays_quiet_and_colorless_across_gets() {
+    use std::process::Command;
+
+    let object = blob(b"once per request is not a log level\n");
+    let fake = Fake::new(&[&object], Duration::ZERO);
+    let upstream = serve_fake(fake.clone()).await;
+    let dir = private_tempdir();
+    let socket = dir.path().join("daemon.sock");
+    let log = dir.path().join("daemon.log");
+    let data = dir.path().join("data");
+    // The daemon refuses a data directory that does not exist (the
+    // accidental-data rule) and one whose mode is open to other users
+    // (the private-directory rule): the test makes it private, the way
+    // an operator would.
+    std::fs::create_dir_all(&data).unwrap();
+    std::fs::set_permissions(&data, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let child = Command::new(env!("CARGO_BIN_EXE_scion-daemon"))
+        .arg("--data")
+        .arg(&data)
+        .arg("--socket")
+        .arg(&socket)
+        .arg("--upstream")
+        .arg(&upstream)
+        .arg("--max-bytes")
+        .arg((8 << 20).to_string())
+        .env("SCION_TOKEN", TOKEN)
+        .env("SCION_UPSTREAM_TOKEN", TOKEN)
+        // The caller's RUST_LOG must not steer the daemon's log filter:
+        // RUST_LOG=debug would bring the per-call line back, RUST_LOG=off
+        // would silence the check entirely.
+        .env_remove("RUST_LOG")
+        .stderr(std::fs::File::create(&log).unwrap())
+        .spawn()
+        .map(Kill)
+        .unwrap();
+    wait_serving(&socket).await;
+    let mut client = connect(&format!("unix://{}", socket.display()), Some(TOKEN)).await;
+
+    // One read, then measure what the daemon has logged.
+    get(&mut client, &fake, &[&object]).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let after_one = std::fs::read(&log).unwrap().len();
+
+    // Nineteen more reads: a line per call would add about 19 lines.
+    for _ in 0..19 {
+        get(&mut client, &fake, &[&object]).await.unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let bytes = std::fs::read(&log).unwrap();
+    assert!(
+        !bytes.contains(&0x1b),
+        "the daemon's stderr carries escape bytes: color is not a terminal's business"
+    );
+    let grew = bytes.len() - after_one;
+    assert!(
+        grew < 200,
+        "the daemon logged {grew} bytes across 19 reads: a line per call"
+    );
+    drop(child);
+}
+
+/// The cache verifies the ticket's signature on every call: an unsigned
+/// ticket, a ticket of a key the cache holds no public key for, and a
+/// valid ticket with one body byte flipped are all refused with the
+/// signature named, and nothing is served or fetched. The proof that
+/// binds the check to this tier: the refusal lives in this call site
+/// (`Tickets::Verify` -> `parse`), and a cache that reads its tickets
+/// unverified serves every one of these.
+#[tokio::test]
+async fn a_cache_refuses_a_ticket_that_no_key_of_its_signed() {
+    let secret = blob(b"the object a forged ticket must not reach\n");
+    let fake = Fake::new(&[&secret], Duration::ZERO);
+    let upstream = serve_fake(fake.clone()).await;
+    let (_cache, url) = serve_cache(&upstream, CACHE_UPSTREAM_TIMEOUT, &fake.keys()).await;
+    let mut caller = connect(&url, Some(TOKEN)).await;
+
+    // The body of a valid ticket for the object's tree, and its
+    // signature: the raw forms the three refusals are built from.
+    let signed = fake.ticket();
+    // The signature is 64 bytes (Ed25519); the parser refuses a body
+    // that is shorter, so the split at 64 is the real one.
+    let signature_bytes = 64_usize;
+    let (body, _) = signed.split_at(signed.len() - signature_bytes);
+
+    let unsigned = [body, &[0_u8; 64]].concat();
+    let status = get_with(&mut caller, vec![ref_for(&fake, &secret)], unsigned)
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    assert!(status.message().contains("signature"), "{status:?}");
+
+    let stranger = ed25519_dalek::SigningKey::from_bytes(&[9; 32]);
+    let wrong_key = scion_proto::ticket::sign(
+        &stranger,
+        "r",
+        "test",
+        *fake.root.as_bytes(),
+        scion_proto::ticket::now(),
+    )
+    .unwrap();
+    let status = get_with(&mut caller, vec![ref_for(&fake, &secret)], wrong_key)
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    assert!(status.message().contains("signature"), "{status:?}");
+
+    let mut flipped = signed.clone();
+    // The body layout is version (1 byte), expiry (8), root tree (32),
+    // then the u16 length of the repo name. The flip hits the repo
+    // name's first byte: the length stays small and even, so the body
+    // still parses to exactly a repo, a principal and a root tree - the
+    // shape check cannot refuse it, and the signature is the only check
+    // left that can.
+    let at = 1 + 8 + 32 + 2;
+    flipped[at] ^= 0xff;
+    let status = get_with(&mut caller, vec![ref_for(&fake, &secret)], flipped)
+        .await
+        .unwrap_err();
+    assert_eq!(status.code(), Code::PermissionDenied, "{status:?}");
+    assert!(status.message().contains("signature"), "{status:?}");
+
+    assert_eq!(fake.calls(), 0, "nothing was fetched for any of the three");
+}
+
+/// The object ref at the fake's path for `object`, for a caller that
+/// brings its own ticket.
+fn ref_for(fake: &Fake, object: &Object) -> ObjectRef {
+    ObjectRef {
+        kind: object.kind,
+        id: object.id.clone(),
+        path: fake.path(object),
+    }
+}
+/// A body of the limit exactly is kept; one byte over is not stored at
+/// all - not evicted later, refused at the put - so the store never
+/// holds an object it cannot keep, and the limit's own byte stays.
+#[test]
+fn the_byte_limit_keeps_its_exact_byte_and_refuses_the_next() {
+    let data = vec![7_u8; 1 << 20];
+    let blob_id = scion_core::BlobId::of(&data);
+    let packed = scion_proto::runtime::object::pack(&data).unwrap();
+    let over = vec![7_u8; (1 << 20) + 1];
+    let over_id = scion_core::BlobId::of(&over);
+    let over_packed = scion_proto::runtime::object::pack(&over).unwrap();
+
+    let memory = scion_tier::MemoryStore::new(packed.len() as usize);
+    scion_tier::Store::put(
+        &memory,
+        scion_tier::Key::Blob(blob_id),
+        &packed.clone().into(),
+    )
+    .unwrap();
+    assert_eq!(
+        scion_tier::Store::get(&memory, scion_tier::Key::Blob(blob_id), packed.len())
+            .unwrap()
+            .as_deref(),
+        Some(&packed[..]),
+        "a body of the limit exactly is kept"
+    );
+    scion_tier::Store::put(
+        &memory,
+        scion_tier::Key::Blob(over_id),
+        &over_packed.clone().into(),
+    )
+    .unwrap();
+    assert!(
+        scion_tier::Store::get(&memory, scion_tier::Key::Blob(over_id), over_packed.len())
+            .unwrap()
+            .is_none(),
+        "one byte over the limit is not stored"
+    );
+
+    let dir = private_tempdir();
+    let disk =
+        scion_tier::DiskStore::open(&dir.path().join("data"), packed.len() as usize).unwrap();
+    scion_tier::Store::put(
+        &disk,
+        scion_tier::Key::Blob(blob_id),
+        &packed.clone().into(),
+    )
+    .unwrap();
+    assert_eq!(
+        scion_tier::Store::get(&disk, scion_tier::Key::Blob(blob_id), packed.len())
+            .unwrap()
+            .as_deref(),
+        Some(&packed[..]),
+        "the disk store keeps its exact byte too"
+    );
+    scion_tier::Store::put(
+        &disk,
+        scion_tier::Key::Blob(over_id),
+        &over_packed.clone().into(),
+    )
+    .unwrap();
+    assert!(
+        scion_tier::Store::get(&disk, scion_tier::Key::Blob(over_id), over_packed.len())
+            .unwrap()
+            .is_none(),
+        "one byte over the disk store's limit is not stored"
+    );
+}
+
+/// The store drops the least recently used objects first: a put that
+/// must evict drops the object no read has touched, and a read moves an
+/// object behind the others, so the eviction order follows the calls,
+/// not the puts.
+#[test]
+fn the_eviction_order_follows_the_reads() {
+    let a = vec![b'a'; 1 << 20];
+    let b = vec![b'b'; 1 << 20];
+    let c = vec![b'c'; 1 << 20];
+    let key = |data: &[u8]| scion_tier::Key::Blob(scion_core::BlobId::of(data));
+    let (key_a, key_b, key_c) = (key(&a), key(&b), key(&c));
+    let packed_a = scion_proto::runtime::object::pack(&a).unwrap();
+    let packed_b = scion_proto::runtime::object::pack(&b).unwrap();
+    let packed_c = scion_proto::runtime::object::pack(&c).unwrap();
+    // Two objects fill the limit; a third must evict one.
+    let limit = (packed_a.len() + packed_b.len()) as usize;
+
+    let memory = scion_tier::MemoryStore::new(limit);
+    scion_tier::Store::put(&memory, key_a, &packed_a.clone().into()).unwrap();
+    scion_tier::Store::put(&memory, key_b, &packed_b.clone().into()).unwrap();
+    // The read makes b the most recently used: c evicts a, not b.
+    scion_tier::Store::get(&memory, key_b, packed_b.len()).unwrap();
+    scion_tier::Store::put(&memory, key_c, &packed_c.clone().into()).unwrap();
+    assert!(
+        scion_tier::Store::get(&memory, key_a, packed_a.len())
+            .unwrap()
+            .is_none(),
+        "the least recently used object drops first"
+    );
+    assert!(
+        scion_tier::Store::get(&memory, key_b, packed_b.len())
+            .unwrap()
+            .is_some(),
+        "the object a read touched stays while another drops"
+    );
+
+    let dir = private_tempdir();
+    let disk = scion_tier::DiskStore::open(&dir.path().join("data"), limit).unwrap();
+    scion_tier::Store::put(&disk, key_a, &packed_a.clone().into()).unwrap();
+    scion_tier::Store::put(&disk, key_b, &packed_b.clone().into()).unwrap();
+    scion_tier::Store::get(&disk, key_b, packed_b.len()).unwrap();
+    scion_tier::Store::put(&disk, key_c, &packed_c.clone().into()).unwrap();
+    assert!(
+        scion_tier::Store::get(&disk, key_a, packed_a.len())
+            .unwrap()
+            .is_none(),
+        "the disk store drops the least recently used first"
+    );
+    assert!(
+        scion_tier::Store::get(&disk, key_b, packed_b.len())
+            .unwrap()
+            .is_some(),
+        "the disk store keeps the read object"
+    );
+}
+
+/// The disk store checks each object against its ID when it reads it
+/// back: an object whose bytes on disk were rewritten behind the
+/// store's back is not served - the caller never sees bytes the ID
+/// does not name.
+#[test]
+fn a_disk_object_whose_bytes_do_not_match_its_id_is_not_served() {
+    let data = b"the read-back check is the last guard\n".to_vec();
+    let packed = scion_proto::runtime::object::pack(&data).unwrap();
+    let key = scion_tier::Key::Blob(scion_core::BlobId::of(&data));
+    let dir = private_tempdir();
+    let disk = scion_tier::DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
+    scion_tier::Store::put(&disk, key, &packed.clone().into()).unwrap();
+    assert!(
+        scion_tier::Store::get(&disk, key, packed.len())
+            .unwrap()
+            .is_some(),
+        "the object reads back before the corruption"
+    );
+    // Rewrite the stored file in place: same length, other bytes. The
+    // layout is objects/<kind>/<first hex pair>/<the rest>.
+    let scion_tier::Key::Blob(id) = key else {
+        panic!("the test stores a blob");
+    };
+    let id_hex = id.to_string();
+    let path = dir
+        .path()
+        .join("data")
+        .join("objects")
+        .join("blob")
+        .join(&id_hex[..2])
+        .join(&id_hex[2..]);
+    let corrupted = packed
+        .iter()
+        .enumerate()
+        .map(|(i, b)| if i == 40 { b ^ 0xff } else { *b })
+        .collect::<Vec<u8>>();
+    std::fs::write(&path, &corrupted).unwrap();
+    assert!(
+        scion_tier::Store::get(&disk, key, packed.len())
+            .unwrap()
+            .is_none(),
+        "the rewritten object is not served"
+    );
+    assert!(
+        !path.exists(),
+        "a refused object is removed, not left for the next read"
+    );
+}
+
+/// A get that finds the object's file gone drops the row: the store
+/// forgets the object, so its size answers None. A row kept past its
+/// file would answer Some here and hand the limit's accounting a
+/// phantom.
+#[test]
+fn a_get_that_finds_the_file_gone_drops_the_row() {
+    let data = b"the row goes when the file does\n".to_vec();
+    let packed = scion_proto::runtime::object::pack(&data).unwrap();
+    let key = scion_tier::Key::Blob(scion_core::BlobId::of(&data));
+    let dir = private_tempdir();
+    let disk = scion_tier::DiskStore::open(&dir.path().join("data"), 1 << 20).unwrap();
+    scion_tier::Store::put(&disk, key, &packed.clone().into()).unwrap();
+    let scion_tier::Key::Blob(id) = key else {
+        panic!("the test stores a blob");
+    };
+    let id_hex = id.to_string();
+    let path = dir
+        .path()
+        .join("data")
+        .join("objects")
+        .join("blob")
+        .join(&id_hex[..2])
+        .join(&id_hex[2..]);
+    std::fs::remove_file(&path).unwrap();
+    assert!(
+        scion_tier::Store::get(&disk, key, packed.len())
+            .unwrap()
+            .is_none(),
+        "the file is gone; the get answers None either way"
+    );
+    assert_eq!(
+        scion_tier::Store::size(&disk, key).unwrap(),
+        None,
+        "the row goes when the file does"
+    );
 }

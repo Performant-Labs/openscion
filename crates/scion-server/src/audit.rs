@@ -17,7 +17,7 @@
 use std::collections::HashMap;
 use std::io::{self, Write as _};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -99,6 +99,17 @@ pub struct Audit {
     /// test that proves the create path does it.
     #[cfg_attr(not(test), allow(dead_code))]
     dir_fsyncs: Arc<AtomicU64>,
+    /// The reopen request: SIGHUP sets it, the writer thread checks it
+    /// between batches and reopens the path (#970).
+    reopen: Arc<AtomicBool>,
+    /// How many reopens were refused: the serve path's sampler reads
+    /// it into `scion_audit_reopens_failed_total`.
+    reopens_failed: Arc<AtomicU64>,
+    /// What the LAST reopen did: 1 after a refused reopen, 0 after a
+    /// successful one. The alert reads the state
+    /// (`scion_audit_reopen_failing`), not a ratio of totals - a month
+    /// of successes must not silence the next failure.
+    reopen_failing: Arc<AtomicU64>,
     /// The readiness sender of the off handle, held so its watch never
     /// closes: a closed watch would flip readiness at once.
     _ready_tx: Option<watch::Sender<bool>>,
@@ -126,15 +137,36 @@ impl Audit {
         let (ready_tx, ready_rx) = watch::channel(true);
         let path = path.to_path_buf();
         let faults = Arc::new(AtomicU64::new(0));
+        let reopen = Arc::new(AtomicBool::new(false));
+        let reopens_failed = Arc::new(AtomicU64::new(0));
+        let reopen_failing = Arc::new(AtomicU64::new(0));
         std::thread::Builder::new().name("audit".into()).spawn({
             let faults = Arc::clone(&faults);
-            move || writer(rx, file, path, ready_tx, faults)
+            let reopen = Arc::clone(&reopen);
+            let reopens_failed = Arc::clone(&reopens_failed);
+            let reopen_failing = Arc::clone(&reopen_failing);
+            #[allow(clippy::too_many_arguments)]
+            move || {
+                writer(
+                    rx,
+                    file,
+                    path,
+                    ready_tx,
+                    faults,
+                    reopen,
+                    reopens_failed,
+                    reopen_failing,
+                );
+            }
         })?;
         Ok(Self {
             tx: Some(tx),
             ready: ready_rx,
             faults,
             dir_fsyncs,
+            reopen,
+            reopens_failed,
+            reopen_failing,
             _ready_tx: None,
         })
     }
@@ -158,8 +190,36 @@ impl Audit {
             ready,
             faults: Arc::new(AtomicU64::new(0)),
             dir_fsyncs: Arc::new(AtomicU64::new(0)),
+            reopen: Arc::new(AtomicBool::new(false)),
+            reopens_failed: Arc::new(AtomicU64::new(0)),
+            reopen_failing: Arc::new(AtomicU64::new(0)),
             _ready_tx: Some(ready_tx),
         }
+    }
+
+    /// Asks the writer to close the current file and open the path
+    /// again: the operator's logrotate renamed the file, and the signal
+    /// (SIGHUP) is the reopen's trigger. The writer checks the request
+    /// between batches, so a batch is always whole in one file; a
+    /// refused reopen keeps the old file and the lines go on there.
+    /// Returns once the request is recorded, not once it ran.
+    pub fn request_reopen(&self) {
+        self.reopen.store(true, Ordering::Release);
+    }
+
+    /// How many reopens were refused since the audit opened. The
+    /// serve path's sampler reads it into
+    /// `scion_audit_reopens_failed_total`.
+    #[must_use]
+    pub fn reopens_failed(&self) -> u64 {
+        self.reopens_failed.load(Ordering::Relaxed)
+    }
+
+    /// What the last reopen did: 1 failing, 0 fine. The serve path's
+    /// sampler reads it into `scion_audit_reopen_failing`.
+    #[must_use]
+    pub fn reopen_failing(&self) -> u64 {
+        self.reopen_failing.load(Ordering::Relaxed)
     }
 
     /// Makes the next `n` appends of THIS audit fail, as an EIO or an
@@ -253,16 +313,9 @@ fn checked_open(path: &Path, dir_syncs: Option<&AtomicU64>) -> io::Result<std::f
     )
     .map_err(io::Error::from)?;
     let stat = rustix::fs::fstat(&file).map_err(io::Error::from)?;
-    // Plain mode bits, no platform raw-mode conversions: a regular
-    // file of the user or root, mode 0600.
-    let is_file = stat.st_mode & 0o170_000 == 0o100_000;
-    let owned = stat.st_uid == me || stat.st_uid == 0;
-    let mode = stat.st_mode & 0o777;
-    if !is_file || !owned || mode != 0o600 {
+    if let Err(why) = refuse_wrong_file_ownership(stat.st_mode, stat.st_uid, me) {
         drop(file);
-        return Err(io::Error::other(
-            "the audit file must be a plain 0600 file of the user or root",
-        ));
+        return Err(why);
     }
     // The file's fsync makes its bytes durable, not its entry in the
     // parent: a crash right after the first start would lose the file
@@ -283,6 +336,24 @@ fn checked_open(path: &Path, dir_syncs: Option<&AtomicU64>) -> io::Result<std::f
         }
     }
     Ok(file.into())
+}
+
+/// The audit file must be a plain file of the user or root, mode
+/// 0600. The check takes the three stat fields it reads, so a test can
+/// drive it for an owner the suite's own uid cannot stage (#1006).
+fn refuse_wrong_file_ownership(st_mode: impl Into<u32>, st_uid: u32, me: u32) -> io::Result<()> {
+    // The stat's mode is u16 in the darwin stat and u32 elsewhere: the
+    // conversion rides the argument, not a cast at the call.
+    let st_mode: u32 = st_mode.into();
+    let is_file = st_mode & 0o170_000 == 0o100_000;
+    let owned = st_uid == me || st_uid == 0;
+    let mode = st_mode & 0o777;
+    if !is_file || !owned || mode != 0o600 {
+        return Err(io::Error::other(
+            "the audit file must be a plain 0600 file of the user or root",
+        ));
+    }
+    Ok(())
 }
 
 /// An append that failed mid-line (an ENOSPC in the middle of a write)
@@ -308,7 +379,7 @@ fn glue_torn_line(file: &mut std::fs::File) -> io::Result<()> {
 
 /// The writer thread: one owner of the file. It takes its file, path,
 /// readiness and faults by value because it is the only owner there is.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn writer(
     #[allow(clippy::needless_pass_by_value)] // the thread owns them
     mut rx: mpsc::Receiver<Msg>,
@@ -319,6 +390,9 @@ fn writer(
     // ENOSPC would, without touching the file. Read only by the
     // test-hooks seam.
     #[cfg_attr(not(feature = "test-hooks"), allow(dead_code))] faults: Arc<AtomicU64>,
+    reopen: Arc<AtomicBool>,
+    reopens_failed: Arc<AtomicU64>,
+    reopen_failing: Arc<AtomicU64>,
 ) {
     while let Some(first) = rx.blocking_recv() {
         let mut batch = Vec::with_capacity(16);
@@ -327,6 +401,35 @@ fn writer(
             match rx.try_recv() {
                 Ok(msg) => batch.push(msg),
                 Err(_) => break,
+            }
+        }
+        // The reopen request is checked between batches only: a batch
+        // is always whole in one file, so a rotation never splits or
+        // duplicates a line.
+        if reopen.swap(false, Ordering::AcqRel) {
+            match checked_open(&path, None).and_then(|mut fresh| {
+                glue_torn_line(&mut fresh)?;
+                Ok(fresh)
+            }) {
+                Ok(fresh) => {
+                    file = fresh;
+                    // The state flips to fine: the alert reads what
+                    // the LAST reopen did, so a failure whose later
+                    // signal reopened fine clears.
+                    reopen_failing.store(0, Ordering::Relaxed);
+                }
+                Err(why) => {
+                    reopens_failed.fetch_add(1, Ordering::Relaxed);
+                    reopen_failing.store(1, Ordering::Relaxed);
+                    // The old file stays open: the lines go on where
+                    // they are, nothing is dropped, and the next
+                    // signal retries the reopen.
+                    tracing::error!(
+                        path = %path.display(),
+                        reason = %why,
+                        "the audit file did not reopen; recording on in the renamed file"
+                    );
+                }
             }
         }
         match append(&mut file, &batch, &faults) {
@@ -441,38 +544,6 @@ pub(crate) async fn meter_task(meter: Arc<Meter>, audit: Audit, mut stop: watch:
     }
 }
 
-/// The bearer-token check of [`Auth`], counting every refusal into the
-/// meter. The principal of an accepted call rides through unchanged.
-#[derive(Clone)]
-pub(crate) struct AuditedAuth {
-    inner: scion_proto::runtime::auth::Auth,
-    meter: Arc<Meter>,
-}
-
-impl AuditedAuth {
-    pub(crate) fn new(inner: scion_proto::runtime::auth::Auth, meter: Arc<Meter>) -> Self {
-        Self { inner, meter }
-    }
-}
-
-impl tonic::service::Interceptor for AuditedAuth {
-    fn call(&mut self, request: tonic::Request<()>) -> Result<tonic::Request<()>, tonic::Status> {
-        let key = request
-            .extensions()
-            .get::<scion_proto::runtime::listen::Stalled>()
-            .and_then(scion_proto::runtime::listen::Stalled::peer)
-            .map(|addr| meter_key(&addr))
-            .unwrap_or_default();
-        match self.inner.call(request) {
-            Err(status) => {
-                self.meter.count(&key);
-                Err(status)
-            }
-            ok => ok,
-        }
-    }
-}
-
 /// The unit the refusal meter keys by: the address, not the socket.
 /// One machine can open a thousand connections from a thousand ports,
 /// and each port would fill the peer cap for free and bury every real
@@ -511,7 +582,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_line_carries_the_schema_version_and_a_timestamp() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("audit.log");
         let audit = Audit::open(&path).unwrap();
         audit
@@ -531,9 +602,100 @@ mod tests {
             .expect("the timestamp is RFC 3339");
     }
 
+    /// A rotation while the audit records: the operator renames the
+    /// file and signals, and every line lands whole in exactly one of
+    /// the two files - the intent in the renamed file, the result in
+    /// the fresh one. Nothing is lost and nothing is duplicated
+    /// (#970). The refused-reopen twin (a symlink at the fresh path)
+    /// keeps every line in the old file, and counts the refusal.
+    #[tokio::test]
+    async fn a_reopened_audit_loses_no_line_across_the_two_files() {
+        let dir = crate::test_support::private_tempdir();
+        let path = dir.path().join("audit.log");
+        let audit = Audit::open(&path).unwrap();
+        audit
+            .record(Event::new("admin", "intent", json!({"what": "t"})))
+            .await
+            .unwrap();
+        let rotated = dir.path().join("audit.log.1");
+        std::fs::rename(&path, &rotated).unwrap();
+        audit.request_reopen();
+        audit
+            .record(Event::new("admin", "ok", json!({"what": "t"})))
+            .await
+            .unwrap();
+        let old = read_lines(&rotated);
+        let fresh = read_lines(&path);
+        assert_eq!(
+            old.len(),
+            1,
+            "the intent stays whole in the renamed file: {old:?}"
+        );
+        assert_eq!(old[0]["outcome"], "intent");
+        assert_eq!(
+            fresh.len(),
+            1,
+            "the result belongs in the fresh file, exactly once: {fresh:?}"
+        );
+        assert_eq!(fresh[0]["outcome"], "ok");
+        assert_eq!(audit.reopens_failed(), 0);
+    }
+
+    #[tokio::test]
+    async fn a_refused_reopen_keeps_every_line_and_names_its_cause() {
+        let dir = crate::test_support::private_tempdir();
+        let path = dir.path().join("audit.log");
+        let audit = Audit::open(&path).unwrap();
+        audit
+            .record(Event::new("admin", "intent", json!({"what": "t"})))
+            .await
+            .unwrap();
+        let rotated = dir.path().join("audit.log.1");
+        std::fs::rename(&path, &rotated).unwrap();
+        // A symlink at the fresh path: the reopen must refuse it and
+        // go on recording into the old (renamed) file.
+        std::os::unix::fs::symlink(&rotated, &path).unwrap();
+        audit.request_reopen();
+        audit
+            .record(Event::new("admin", "ok", json!({"what": "t"})))
+            .await
+            .unwrap();
+        let old = read_lines(&rotated);
+        assert_eq!(old.len(), 2, "every line lands in the old file: {old:?}");
+        assert_eq!(old[0]["outcome"], "intent");
+        assert_eq!(old[1]["outcome"], "ok");
+        assert_eq!(audit.reopens_failed(), 1, "the refusal is counted");
+        assert_eq!(
+            audit.reopen_failing(),
+            1,
+            "the gauge holds the state the alert reads: the last reopen failed"
+        );
+        // The cause is removed and the next signal succeeds: the gauge
+        // flips back to 0 - the alert clears - and the line lands in
+        // the fresh file.
+        std::fs::remove_file(&path).unwrap();
+        audit.request_reopen();
+        audit
+            .record(Event::new("admin", "ok", json!({"what": "u"})))
+            .await
+            .unwrap();
+        assert_eq!(
+            audit.reopen_failing(),
+            0,
+            "the gauge reads 0 once a reopen succeeds"
+        );
+        let fresh = read_lines(&path);
+        assert_eq!(
+            fresh.len(),
+            1,
+            "the line after the good reopen is in the fresh file: {fresh:?}"
+        );
+        assert_eq!(fresh[0]["outcome"], "ok");
+    }
+
     #[tokio::test]
     async fn a_batch_is_one_durable_append_per_caller() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("audit.log");
         let audit = Audit::open(&path).unwrap();
         let (a, b) = tokio::join!(
@@ -547,7 +709,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_write_error_keeps_its_kind() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("audit.log");
         let audit = Audit::open(&path).unwrap();
         audit.fail_next_appends(1).unwrap();
@@ -564,7 +726,7 @@ mod tests {
 
     #[tokio::test]
     async fn a_failing_append_refuses_the_caller_and_latches_readiness() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("audit.log");
         let audit = Audit::open(&path).unwrap();
         audit.fail_next_appends(1).unwrap();
@@ -584,7 +746,7 @@ mod tests {
 
     #[tokio::test]
     async fn the_meter_folds_many_refusals_into_one_counted_line() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("audit.log");
         let audit = Audit::open(&path).unwrap();
         let meter = Arc::new(Meter::default());
@@ -613,7 +775,7 @@ mod tests {
 
     #[tokio::test]
     async fn one_address_rotating_ports_does_not_bury_a_stranger() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("audit.log");
         let audit = Audit::open(&path).unwrap();
         let meter = Arc::new(Meter::default());
@@ -646,7 +808,7 @@ mod tests {
 
     #[tokio::test]
     async fn an_ipv6_machine_keys_by_its_prefix64() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("audit.log");
         let audit = Audit::open(&path).unwrap();
         let meter = Arc::new(Meter::default());
@@ -663,7 +825,7 @@ mod tests {
 
     #[tokio::test]
     async fn strangers_past_the_peer_cap_share_one_bucket() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("audit.log");
         let audit = Audit::open(&path).unwrap();
         let meter = Arc::new(Meter::default());
@@ -681,7 +843,7 @@ mod tests {
 
     #[test]
     fn every_open_syncs_the_parent_directory() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("audit.log");
         let audit = Audit::open(&path).unwrap();
         assert_eq!(audit.dir_syncs(), 1, "the create syncs the parent");
@@ -693,7 +855,7 @@ mod tests {
     #[tokio::test]
     async fn a_torn_line_is_glued_on_reopen_so_the_next_lines_parse() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("audit.log");
         // A line that an ENOSPC cut in the middle: no newline at the
         // end. The tear stays a fragment; the glue keeps it from
@@ -716,7 +878,7 @@ mod tests {
 
     #[test]
     fn a_symlink_at_the_audit_path_is_refused() {
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let target = dir.path().join("real.log");
         std::fs::write(&target, b"").unwrap();
         let link = dir.path().join("audit.log");
@@ -730,9 +892,31 @@ mod tests {
     }
 
     #[test]
+    fn the_ownership_guard_drives_directly() {
+        let me = rustix::process::getuid().as_raw();
+        // Neither the suite's uid nor root, whatever the suite runs as.
+        let foreign = if me == 0 { 1 } else { u32::MAX };
+        // A plain 0600 file of the user: the one shape the guard accepts.
+        refuse_wrong_file_ownership(0o100_600u32, me, me).unwrap();
+        // The root arm: a plain 0600 file of root is accepted too.
+        refuse_wrong_file_ownership(0o100_600u32, 0, me).unwrap();
+        // A plain 0600 file of another uid is refused, whatever the
+        // suite's uid can stage on disk (#1006).
+        let why = refuse_wrong_file_ownership(0o100_600u32, foreign, me).unwrap_err();
+        assert!(why.to_string().contains("0600"), "{why:?}");
+        // A directory with mode 0600 is refused for its kind, not its
+        // mode: the `||` must stay an or.
+        let why = refuse_wrong_file_ownership(0o040_600u32, me, me).unwrap_err();
+        assert!(why.to_string().contains("plain"), "{why:?}");
+        // A plain 0644 file of the user is refused for its mode.
+        let why = refuse_wrong_file_ownership(0o100_644u32, me, me).unwrap_err();
+        assert!(why.to_string().contains("0600"), "{why:?}");
+    }
+
+    #[test]
     fn a_preexisting_file_with_the_wrong_mode_is_refused() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let path = dir.path().join("audit.log");
         std::fs::write(&path, b"").unwrap();
         std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
@@ -743,7 +927,7 @@ mod tests {
     #[test]
     fn an_audit_path_in_a_shared_parent_is_refused() {
         use std::os::unix::fs::PermissionsExt;
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let parent = dir.path().join("shared");
         std::fs::create_dir(&parent).unwrap();
         std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o777)).unwrap();

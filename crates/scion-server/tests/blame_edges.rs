@@ -10,12 +10,8 @@ use scion_proto::runtime::listen::Limits;
 use scion_proto::v1::scion_client::ScionClient;
 use scion_proto::v1::{BlameChangeset, BlameRange, BlameRequest};
 use scion_server::Access;
-use scion_server::test_support::backend::from_store;
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
-use scion_server::{
-    Backend,
-    test_support::{service, store::Store},
-};
+use scion_server::{Backend, test_support::service};
 use tokio::net::TcpListener;
 use tonic::service::interceptor::InterceptedService;
 use tonic::transport::Channel;
@@ -82,8 +78,8 @@ fn commit(
 /// A store whose repo has one root changeset that puts `file.txt` with
 /// `root_body`, written by a 4-byte author.
 fn store(root_body: &[u8]) -> (tempfile::TempDir, Backend, ChangesetId) {
-    let dir = tempfile::tempdir().unwrap();
-    let store = from_store(Store::open(dir.path()).unwrap());
+    let dir = scion_server::test_support::private_tempdir();
+    let store = Backend::open_test(dir.path()).unwrap();
     let blob = store.blobs().put(root_body).unwrap();
     let root = store
         .write(|c| {
@@ -143,6 +139,7 @@ async fn serve(
             land_stale_secs: 1 << 40,
             tls: None,
             metrics: Arc::new(scion_server::Metrics::default()),
+            reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
         },
         Some(Arc::new(scion_server::Keys::generate())),
         async {
@@ -340,6 +337,132 @@ async fn the_part_seam_loses_no_range_and_no_changeset() {
             );
         }
         assert!(next.is_empty(), "the whole chain was explained");
+    }
+}
+
+/// A resumed part names each line its own changeset. The cursor's
+/// window carries the named runs across the part seam, and adjacent
+/// lines of the seam store name different changesets: a run packed
+/// across two of them would name the second line's lines with the
+/// first line's changeset on the resume. The reply of every part must
+/// match the chain line for line: line n's last change is the child
+/// at `ids[n + 1]`.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_part_names_each_line_its_own_changeset() {
+    // 151 versions over the walk's 100-version bound: the first call
+    // stops mid-file and hands a cursor whose window carries the named
+    // lines - adjacent lines of different changesets.
+    let (dir, store, ids) = seam_store(1_000, 150);
+    let tip = ids[ids.len() - 1];
+    let (_stop, mut client) = serve(&store, dir.path(), whole_access(), TOKEN).await;
+    let mut cursor: Vec<u8> = Vec::new();
+    let mut calls = 0usize;
+    loop {
+        calls += 1;
+        let (ranges, _changesets, next, _parts) = blame(&mut client, &tip, PATH, &cursor).await;
+        let mut named: Vec<usize> = Vec::new();
+        for range in &ranges {
+            if range.changeset_id.is_empty() {
+                continue;
+            }
+            // Child i rewrites line i+1 and reverts line i, so line n's
+            // last change is the child at ids[n + 1] - the tip for the
+            // last line. A range names one changeset, so it must not
+            // stretch over a line the next child rewrote.
+            let start = range.start_line as usize;
+            for n in start..start + range.line_count as usize {
+                named.push(n);
+                let last = ids[(n + 1).min(ids.len() - 1)].as_bytes();
+                assert_eq!(
+                    range.changeset_id.as_slice(),
+                    last,
+                    "line {n} names the wrong changeset: {range:?}"
+                );
+            }
+        }
+        if next.is_empty() {
+            // A resumed call answers the same window again (scion.proto;
+            // #1070 asks for that in the proto doc), so it re-names the
+            // lines an earlier call named: the once-each check is on
+            // this, the last call's reply.
+            named.sort_unstable();
+            assert_eq!(named, (1..=150).collect::<Vec<usize>>());
+            break;
+        }
+        cursor = next;
+    }
+    // The walk stopped at its 100-version bound: the reply needed a
+    // resume. If the bound grows past the fixture, this test stops
+    // guarding the run merge and must grow with it.
+    assert!(calls >= 2, "the walk finished in one call; no resume");
+}
+
+/// The window's unnamed lines carry their place in the version the walk
+/// stopped at. A line the tip lost - the last child deleted it - sits
+/// between two of them, so their places skip one. The cursor must carry
+/// each line's own place: a run that packed across the seam would point
+/// the resume at the deleted line, and the reply would name the wrong
+/// origin line.
+#[tokio::test(flavor = "multi_thread")]
+async fn a_resumed_walk_reads_each_unnamed_line_at_its_own_place() {
+    // The root puts 150 unique lines. The next 99 children flip the
+    // executable bit only: the walk counts them as versions, names no
+    // line, and keeps every place. The tip deletes line 75. The walk's
+    // 100-version bound stops it at the root, with the window's places
+    // 1..=74 and 76..=150 - the seam skips the deleted line.
+    let count = 150;
+    let seed: Vec<u8> = (1..=count)
+        .map(|line| format!("line {line}\n"))
+        .collect::<Vec<_>>()
+        .concat()
+        .into_bytes();
+    let (dir, store, root) = store(&seed);
+    let tip = store
+        .write(|c| {
+            let repo = c.repo_id(REPO)?;
+            let seed_blob = store.blobs().put(&seed).unwrap();
+            let mut parent = root;
+            for i in 0..100 {
+                let state = if i == 99 {
+                    let body: Vec<u8> = (1..=count)
+                        .filter(|line| *line != 75)
+                        .map(|line| format!("line {line}\n"))
+                        .collect::<Vec<_>>()
+                        .concat()
+                        .into_bytes();
+                    let blob = store.blobs().put(&body).unwrap();
+                    c.add_repo_blob(repo, blob)?;
+                    regular(blob)
+                } else {
+                    FileState::Regular {
+                        content: seed_blob,
+                        executable: i % 2 == 0,
+                    }
+                };
+                let cs = commit(vec![parent], PATH, Some(state), 1_000);
+                parent = c.insert_changeset(repo, &cs)?;
+            }
+            Ok(parent)
+        })
+        .unwrap();
+    let (_stop, mut client) = serve(&store, dir.path(), whole_access(), TOKEN).await;
+    let (ranges, _cs, next, _parts) = blame(&mut client, &tip, PATH, b"").await;
+    // The bound stopped the walk: the reply names nothing yet.
+    assert!(
+        !next.is_empty(),
+        "the walk finished in one call; the resume is not exercised"
+    );
+    assert!(ranges.iter().all(|r| r.changeset_id.is_empty()));
+    let (ranges, _cs, next, _parts) = blame(&mut client, &tip, PATH, &next).await;
+    assert!(next.is_empty(), "the resume did not finish the blame");
+    for range in &ranges {
+        assert_eq!(range.changeset_id.as_slice(), root.as_bytes());
+        let start = range.start_line as usize;
+        for n in start..start + range.line_count as usize {
+            let origin = range.origin_line as usize + (n - start);
+            let want = if n >= 75 { n + 1 } else { n };
+            assert_eq!(origin, want, "line {n} points at the wrong root line");
+        }
     }
 }
 
@@ -641,3 +764,138 @@ async fn an_older_version_with_too_many_lines_counts_as_absent() {
 
 #[path = "common/mod.rs"]
 mod common;
+
+/// A rename search that one call's budget cannot finish goes on in the
+/// next call, across the walk's steps: the walk's cursor and its search
+/// state carry, and the answer names the file the search finds. A step
+/// that ended mid-version once left the cursor at the version's parent
+/// while the path still named the version, and the next call looked for
+/// the blamed path there.
+#[test]
+fn a_rename_search_goes_on_across_calls() {
+    let dir = scion_server::test_support::private_tempdir();
+    let store = Backend::open_test(dir.path()).unwrap();
+    // `new` replaces 24 deleted files of 65,536 lines, one chunk each, so
+    // one call's budget reads about 15 of them, and the search goes on in
+    // a second call. All are 99% like `new`, so the first by path wins.
+    let empty = "\n".repeat((1 << 16) - 1);
+    let put = |text: String| Some(regular(store.blobs().put(text.as_bytes()).unwrap()));
+    let names: Vec<String> = (0..24).map(|k| format!("f/{k:02}")).collect();
+    let root_changes: std::collections::BTreeMap<RepoPath, Option<FileState>> = names
+        .iter()
+        .enumerate()
+        .map(|(k, p)| {
+            (
+                RepoPath::new(p.as_str()).unwrap(),
+                put(format!("{empty}{k}\n")),
+            )
+        })
+        .collect();
+    let mut rename_changes: Vec<(RepoPath, Option<FileState>)> = names
+        .iter()
+        .map(|p| (RepoPath::new(p.as_str()).unwrap(), None))
+        .collect();
+    rename_changes.push((RepoPath::new("new").unwrap(), put(format!("x\n{empty}"))));
+    let author = IdentityTime::new(vec![b'a'; 4], b"a@example.com".to_vec(), 1_700_000_000, 0)
+        .expect("identity fits the format");
+    let message = b"change\n".to_vec();
+    let mut head: Option<ChangesetId> = None;
+    let mut ids = Vec::new();
+    for changes in [
+        root_changes,
+        rename_changes
+            .into_iter()
+            .collect::<std::collections::BTreeMap<_, _>>(),
+    ] {
+        let cs = Changeset::new(
+            head.into_iter().collect::<Vec<_>>(),
+            author.clone(),
+            None,
+            message.clone(),
+            changes,
+        )
+        .expect("changeset fits the format");
+        let id = store
+            .write(|c| {
+                let repo = c.create_repo(REPO)?;
+                c.insert_changeset(repo, &cs)
+            })
+            .unwrap();
+        ids.push(id);
+        head = Some(id);
+    }
+
+    // Blame the tip's `new`: the first call reads about 15 candidates and
+    // stops; the second finishes the search and the walk. The lines of
+    // the reply name the tip for its own line, and the file the search
+    // found for the rest.
+    let mut resume = scion_server::test_support::blame::Resume::default();
+    let mut lines: Vec<(ChangesetId, u64)> = Vec::new();
+    let mut paths: std::collections::HashMap<ChangesetId, RepoPath> =
+        std::collections::HashMap::new();
+    loop {
+        let out = scion_server::test_support::blame::blame(
+            &store,
+            REPO,
+            ids[1],
+            &RepoPath::new("new").unwrap(),
+            &resume,
+            0,
+            &scion_server::test_support::memory::Bytes::new(scion_server::REPLY_MEMORY_BUDGET),
+            Some(std::time::Instant::now() + std::time::Duration::from_secs(600)),
+        )
+        .unwrap();
+        for (id, _, path) in &out.changesets {
+            paths.insert(*id, path.clone());
+        }
+        for range in &out.ranges {
+            let Some(id) = range.changeset else { continue };
+            for n in 0..u64::from(range.line_count) {
+                lines.push((id, u64::from(range.origin_line) + n));
+            }
+        }
+        match out.resume.clone() {
+            None => break,
+            Some(next) => resume = next,
+        }
+    }
+    assert_eq!(lines.len(), 1 << 16, "every line of the file named");
+    assert_eq!(lines[0].0, ids[1], "the line the tip adds is the tip's");
+    assert!(
+        lines[1..].iter().all(|(id, _)| *id == ids[0]),
+        "the rest come from one older changeset"
+    );
+    assert_eq!(paths.get(&ids[0]), Some(&RepoPath::new("f/00").unwrap()));
+}
+
+/// A cursor that carries a rename search at a root changeset is refused:
+/// a root has no parent, so the search has nothing to search in, and
+/// dropping it silently would blame every line on the root.
+#[test]
+fn a_rename_search_at_a_root_changeset_is_refused() {
+    let (dir, store, root) = store(b"content\n");
+    let resume = scion_server::test_support::blame::Resume {
+        next: None,
+        search: scion_server::test_support::blame::RenameSearch {
+            searched: 1,
+            best: None,
+        },
+        ..Default::default()
+    };
+    let err = scion_server::test_support::blame::blame(
+        &store,
+        REPO,
+        root,
+        &RepoPath::new(PATH).unwrap(),
+        &resume,
+        0,
+        &scion_server::test_support::memory::Bytes::new(scion_server::REPLY_MEMORY_BUDGET),
+        Some(std::time::Instant::now() + std::time::Duration::from_secs(600)),
+    )
+    .unwrap_err();
+    assert!(
+        matches!(err, scion_server::Error::InvalidArgument(_)),
+        "{err:?}"
+    );
+    drop(dir);
+}

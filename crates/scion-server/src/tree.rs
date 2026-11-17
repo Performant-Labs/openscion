@@ -17,13 +17,13 @@ use scion_core::{
 };
 
 use crate::backend::Backend;
-use crate::db;
 use crate::deadline::Deadline;
 use crate::derived::{self, Kind};
 use crate::error::{ApplyError, Error, Result};
 use crate::graph::CommitGraph;
 use crate::history::PathHistory;
-use crate::meta::{MetaTx, RepoId};
+use crate::meta as db;
+use crate::meta::{DerivedValues, MetaTx, RepoId};
 
 /// The byte length of a blob, as the tree entries carry it. The store reads
 /// it from the blob's frame header without unpacking it.
@@ -92,16 +92,58 @@ pub fn apply(
     base: Option<TreeId>,
     changes: &BTreeMap<RepoPath, Option<FileState>>,
     lens: BlobLens<'_>,
-) -> Result<TreeId> {
+) -> Result<Applied> {
+    apply_impl(c, base, changes, lens, None)
+}
+
+/// What an apply answers: the root tree's id, and the rows of every
+/// node it built (each id is its body's hash, so the rows can land
+/// after the walk, folded into the caller's own write statement).
+pub(crate) type Applied = (TreeId, Vec<(TreeId, Vec<u8>)>);
+
+/// The build checks the deadline per path, so a cancelled call's job
+/// stops between paths and frees its permit instead of building on.
+///
+/// # Errors
+///
+/// As [`apply`].
+pub fn apply_within(
+    c: &mut dyn MetaTx,
+    base: Option<TreeId>,
+    changes: &BTreeMap<RepoPath, Option<FileState>>,
+    lens: BlobLens<'_>,
+    deadline: &Deadline,
+) -> Result<Applied> {
+    apply_impl(c, base, changes, lens, Some(deadline))
+}
+
+fn apply_impl(
+    c: &mut dyn MetaTx,
+    base: Option<TreeId>,
+    changes: &BTreeMap<RepoPath, Option<FileState>>,
+    lens: BlobLens<'_>,
+    deadline: Option<&Deadline>,
+) -> Result<Applied> {
     // The stored trees on every changed path, one get_trees per level of
     // depth: a commit that touches many directories loads them in one
     // statement per level instead of one per directory.
     let mut loaded = prefetch(c, base, changes)?;
     let mut root = base.map_or_else(|| Dir::Loaded(BTreeMap::new()), Dir::Stored);
     for (path, _) in changes.iter().filter(|(_, change)| change.is_none()) {
+        if let Some(deadline) = deadline {
+            // A cancelled call's job stops between paths, and frees its
+            // permit, instead of building the tree on. The transaction
+            // rolls the partial build back: no tree names it.
+            deadline.check()?;
+        }
         root.delete(c, &mut loaded, path, &parts(path))?;
     }
     for (path, state) in changes {
+        if let Some(deadline) = deadline {
+            // The same check on the put path: a large tree's store is
+            // all puts, and its job stops between puts like a delete's.
+            deadline.check()?;
+        }
         if let Some(state) = state {
             // A gitlink names no blob, so it carries no length; its entry
             // ends at the commit bytes.
@@ -111,11 +153,20 @@ pub fn apply(
             };
             root.put(c, &mut loaded, path, &parts(path), 0, entry)?;
         }
+        // The test seam of the cancelled tree build: the caller parks
+        // here, cancels its call, and lets the job reach the next
+        // path's check. The park's id is the path, so a test's armed
+        // seam sees only its own build's paths.
+        #[cfg(test)]
+        crate::write::PARK_APPLY.park(String::from_utf8_lossy(path.as_bytes()));
     }
+    // The rows ride back to the caller: the settle folds them into its
+    // one write statement with the derived rows and the repo blobs
+    // (#1004). The id is the body's hash, so nothing here needs the
+    // rows stored before the caller goes on.
     let mut rows = Vec::new();
     let tree = root.store(&mut rows)?;
-    c.put_trees(&rows)?;
-    Ok(tree)
+    Ok((tree, rows))
 }
 
 /// Finds the entry at `path` under `root`.
@@ -170,10 +221,21 @@ impl Kind for RootTree {
         parents: Vec<TreeId>,
         lens: BlobLens<'_>,
     ) -> Result<TreeId> {
-        apply(c, parents.first().copied(), changeset.changes(), lens).map_err(|e| match e {
-            Error::Apply(e) => Error::Corrupt(format!("stored changeset {id} does not apply: {e}")),
-            other => other,
-        })
+        // Every caller but the land's settle stores its own rows here:
+        // the settle folds them into its one write statement instead
+        // (#1004), and passes them past this trait method's shape.
+        apply(c, parents.first().copied(), changeset.changes(), lens)
+            .map(|(tree, rows)| {
+                c.put_trees(&rows)?;
+                Ok(tree)
+            })
+            .map_err(|e| match e {
+                Error::Apply(e) => {
+                    Error::Corrupt(format!("stored changeset {id} does not apply: {e}"))
+                }
+                other => other,
+            })
+            .and_then(|inner| inner)
     }
 
     fn encode(tree: &TreeId) -> Vec<u8> {
@@ -202,6 +264,23 @@ pub fn root_tree(
     derived::get_by::<RootTree>(store, repo, cs, deadline)
 }
 
+/// [`root_tree`], for a caller that already holds a read transaction: the
+/// value rides it, and a miss fills in its own transactions, as every
+/// fill does (see [`derived::get_by_held`]).
+///
+/// # Errors
+///
+/// As [`root_tree`].
+pub(crate) fn root_tree_held(
+    store: &Backend,
+    c: &mut dyn MetaTx,
+    repo: RepoId,
+    cs: ChangesetId,
+    deadline: &Deadline,
+) -> Result<TreeId> {
+    derived::get_by_held::<RootTree>(store, c, repo, cs, deadline)
+}
+
 /// [`root_tree`] with no deadline: the caller has no request to serve, so
 /// nothing bounds the fill in time. For the `fsck` command and tests.
 ///
@@ -223,6 +302,23 @@ pub fn fill_root_tree(store: &Backend, repo: RepoId, cs: ChangesetId) -> Result<
     derived::fill::<RootTree>(store, repo, cs)
 }
 
+/// [`fill_root_tree`], but it stops between steps once `deadline` has
+/// passed, so a cancelled call's job frees its permit and its land's
+/// ref lock instead of filling to the end. The steps before the stop
+/// stay, and the land's retry resumes from them.
+///
+/// # Errors
+///
+/// As [`derive_root_tree`], and [`Error::DeadlineExceeded`].
+pub fn fill_root_tree_by(
+    store: &Backend,
+    repo: RepoId,
+    cs: ChangesetId,
+    deadline: &Deadline,
+) -> Result<TreeId> {
+    derived::fill_by::<RootTree>(store, repo, cs, deadline)
+}
+
 /// Derives the root tree of `cs` inside the caller's transaction, as the
 /// `derived` mechanism computes a kind's value.
 ///
@@ -236,7 +332,23 @@ pub fn derive_root_tree(
     cs: ChangesetId,
     lens: BlobLens<'_>,
 ) -> Result<TreeId> {
-    derived::derive::<RootTree>(c, repo, cs, lens)
+    derived::derive::<RootTree>(c, repo, cs, lens, None)
+}
+
+/// The walk checks the deadline per changeset, so a cancelled call's
+/// job stops between changesets and frees its permit.
+///
+/// # Errors
+///
+/// As [`derive_root_tree`].
+pub fn derive_root_tree_within(
+    c: &mut dyn MetaTx,
+    repo: RepoId,
+    cs: ChangesetId,
+    lens: BlobLens<'_>,
+    deadline: &Deadline,
+) -> Result<TreeId> {
+    derived::derive::<RootTree>(c, repo, cs, lens, Some(deadline))
 }
 
 /// Stores a changeset in `repo` with its root tree: the first parent's tree
@@ -245,9 +357,10 @@ pub fn derive_root_tree(
 ///
 /// If the first parent has no root tree, for example after a version bump,
 /// this derives it in the caller's transaction, with no bound, and holds
-/// the write connection while it runs. So a request calls [`fill_root_tree`]
-/// on the first parent before its transaction, and so does git import, for
-/// each first parent from before its batch.
+/// the write connection while it runs. So a request calls
+/// [`fill_root_tree_by`] on the first parent before its transaction,
+/// stopping at the call's deadline, and git import calls
+/// [`fill_root_tree`] for each first parent from before its batch.
 ///
 /// Like each fill step of the `derived` mechanism, it also removes a few
 /// root trees of older versions.
@@ -271,23 +384,223 @@ pub fn store_changeset(
     cs: &Changeset,
     lens: BlobLens<'_>,
 ) -> Result<(ChangesetId, TreeId)> {
-    let base = cs
-        .parents()
-        .first()
-        .map(|&parent| derive_root_tree(c, repo, parent, lens))
-        .transpose()?;
-    let tree = apply(c, base, cs.changes(), lens)?;
+    store_changeset_impl(c, repo, cs, lens, None, None)
+}
+
+/// The build checks the deadline per path, so a cancelled call's job
+/// stops between paths and frees its permit instead of building on.
+///
+/// `pre` carries the reads a caller ran before the transaction (the
+/// create's pre-read); `None` keeps the reads in the transaction, as
+/// the land's settle and the import do.
+///
+/// # Errors
+///
+/// As [`store_changeset`].
+pub fn store_changeset_within(
+    c: &mut dyn MetaTx,
+    repo: RepoId,
+    cs: &Changeset,
+    lens: BlobLens<'_>,
+    deadline: &Deadline,
+    pre: Option<PreRead>,
+) -> Result<(ChangesetId, TreeId)> {
+    store_changeset_impl(c, repo, cs, lens, Some(deadline), pre)
+}
+
+/// The reads a create ran before its write transaction began, on a
+/// reader: the derived values of the parents and the changeset, the
+/// stored trees on the changed paths, and the history node the build's
+/// path-history derive reads first. Every row is committed - the
+/// parent's own transaction wrote it - and content-addressed or written
+/// once at its own changeset's settle, so a pre-transaction answer
+/// cannot be stale; a miss falls through to the transaction's own read.
+/// The map carries no generation: the transaction reads the generation
+/// itself (the insert's own read), so the pre-read carries none.
+#[derive(Default)]
+pub struct PreRead {
+    /// The derived values, by (kind, version, changeset).
+    pub(crate) preload: DerivedValues,
+    /// The base tree, when the read decoded the first parent's root-tree
+    /// value. `None` leaves the base to the transaction's walk, as
+    /// before (a version bump the fill has not caught up with).
+    pub(crate) base: Option<TreeId>,
+    /// The stored trees on the changed paths, decoded and verified
+    /// against their ids.
+    pub(crate) trees: std::collections::HashMap<TreeId, Tree>,
+    /// The history-node bodies the build's derives read first, by node
+    /// id bytes.
+    pub(crate) history: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+}
+
+/// The reads of [`store_changeset_within`] that a create runs before its
+/// write transaction, on a reader: the derived values of the parents and
+/// the changeset, the stored trees on the changed paths, and the history
+/// node the path-history derive reads first. The build's own reads then
+/// answer from these without round trips on the write connection; every
+/// miss re-reads in the transaction, so a row that committed after the
+/// pre-read began is still seen.
+///
+/// The batching keeps its own shapes (its pending buffers answer the
+/// reads and its flush owns the writes), so a batched caller gets an
+/// empty pre-read.
+///
+/// # Errors
+///
+/// Database errors, and as [`prefetch`].
+pub(crate) fn pre_read(c: &mut dyn MetaTx, repo: RepoId, cs: &Changeset) -> Result<PreRead> {
+    if c.changeset_batching() {
+        return Ok(PreRead::default());
+    }
+    let mut css = cs.parents().to_vec();
+    css.push(cs.id());
+    let preload = c.read_derived_preload(
+        repo,
+        &[
+            (RootTree::NAME, RootTree::VERSION),
+            (CommitGraph::NAME, CommitGraph::VERSION),
+            (PathHistory::NAME, PathHistory::VERSION),
+        ],
+        &css,
+    )?;
+    // The base tree: the first parent's root-tree value, decoded. A
+    // value the read missed stays `None`, and the transaction's walk
+    // derives the base as before.
+    let base = cs.parents().first().and_then(|parent| {
+        preload
+            .get(&(
+                RootTree::NAME.to_owned(),
+                i64::from(RootTree::VERSION),
+                parent.as_bytes().to_vec(),
+            ))
+            .and_then(|bytes| <RootTree as Kind>::decode(bytes))
+    });
+    // The stored trees on the changed paths: the same level walk the
+    // build runs, here on the reader. The transaction's `get_trees`
+    // answers from these and re-reads a miss.
+    let trees = match base {
+        Some(base) => prefetch(c, Some(base), cs.changes())?,
+        None => std::collections::HashMap::new(),
+    };
+    // The history node the path-history derive reads first: the first
+    // parent's history root, by its content address. A deeper node - a
+    // directory on a changed path - re-reads in the transaction.
+    let mut history = std::collections::HashMap::new();
+    if let Some(parent) = cs.parents().first()
+        && let Some(root) = preload
+            .get(&(
+                PathHistory::NAME.to_owned(),
+                i64::from(PathHistory::VERSION),
+                parent.as_bytes().to_vec(),
+            ))
+            .and_then(|bytes| <PathHistory as Kind>::decode(bytes))
+    {
+        let (body, _) = c.get_history_node(root)?;
+        history.insert(root.0.to_vec(), body);
+    }
+    Ok(PreRead {
+        preload,
+        base,
+        trees,
+        history,
+    })
+}
+
+fn store_changeset_impl(
+    c: &mut dyn MetaTx,
+    repo: RepoId,
+    cs: &Changeset,
+    lens: BlobLens<'_>,
+    deadline: Option<&Deadline>,
+    pre: Option<PreRead>,
+) -> Result<(ChangesetId, TreeId)> {
+    // The build reads each kind's value for the parents, then deletes a
+    // few old rows per kind: the reads ride one preloaded statement and
+    // the deletes ride the commit's flush, so the transaction spends
+    // two round trips on both together instead of one per kind. The
+    // changeset's own rows ride along: a land rebases onto the head its
+    // input changeset already hangs from, so its derived rows exist and
+    // the build finds them instead of deriving them again. The history
+    // nodes the build writes ride the same flush. The import's
+    // batching owns both shapes already — its pending buffer answers
+    // the reads and its flush deletes once per kind — so it keeps them.
+    //
+    // A caller that ran the reads before the transaction (`pre`) has
+    // the build's values installed instead: the pre-read's map carries
+    // no generation, and the generation reads in the transaction - the
+    // walk's start for a parent the build walks, the insert's own read
+    // for a parent it does not. Every pre-read miss re-reads here.
+    let mut base_given = None;
+    if !c.changeset_batching() {
+        c.defer_derived_deletes();
+        if let Some(pre) = pre {
+            base_given = pre.base;
+            c.adopt_pre_read(pre)?;
+        } else {
+            let mut css = cs.parents().to_vec();
+            css.push(cs.id());
+            c.preload_derived(
+                repo,
+                &[
+                    (RootTree::NAME, RootTree::VERSION),
+                    (CommitGraph::NAME, CommitGraph::VERSION),
+                    (PathHistory::NAME, PathHistory::VERSION),
+                ],
+                &css,
+            )?;
+        }
+    }
+    let base = match base_given {
+        Some(base) => Some(base),
+        None => cs
+            .parents()
+            .first()
+            .map(|&parent| match deadline {
+                Some(deadline) => derive_root_tree_within(c, repo, parent, lens, deadline),
+                None => derive_root_tree(c, repo, parent, lens),
+            })
+            .transpose()?,
+    };
+    let (tree, tree_rows) = match deadline {
+        Some(deadline) => apply_within(c, base, cs.changes(), lens, deadline),
+        None => apply(c, base, cs.changes(), lens),
+    }?;
     let id = c.insert_changeset(repo, cs)?;
-    // One round trip for every blob the changeset puts, however many
-    // paths name the same one.
+    // The three kinds' rows: of this transaction's own changeset, so
+    // the batch's conflict guard keeps the single put's meaning, and
+    // the reads above answered from the preload before any row lands.
+    let mut rows = Vec::new();
+    derived::put_row::<RootTree>(&mut rows, id, &tree);
+    derived::remove_old::<RootTree>(c)?;
+    derived::on_write_into::<CommitGraph>(&mut rows, c, id, cs, lens)?;
+    derived::on_write_into::<PathHistory>(&mut rows, c, id, cs, lens)?;
+    // The write path trims older versions of every kind it writes, not
+    // only the root tree's: after a version bump, the old rows clear as
+    // the store is written, not only when a fill step or a backfill
+    // walks their changesets (#949). The calls ride the deferral this
+    // transaction turned on (tree.rs above the preload), so the commit's
+    // one-statement flush carries them and no round trip moves.
+    derived::remove_old::<CommitGraph>(c)?;
+    derived::remove_old::<PathHistory>(c)?;
+    // The settle's whole write in one statement: the trees, the derived
+    // rows and the repo's blob membership (#1004). The method checks
+    // the stored rows itself, before its memory write, so a stored
+    // value that differs from the computed one refuses as corrupt.
     let mut puts: Vec<BlobId> = db::puts(cs).map(|(_, blob)| blob).collect();
     puts.sort();
     puts.dedup();
-    c.add_repo_blobs(repo, &puts)?;
-    derived::put::<RootTree>(c, id, &tree)?;
-    derived::remove_old::<RootTree>(c)?;
-    derived::on_write::<CommitGraph>(c, id, cs, lens)?;
-    derived::on_write::<PathHistory>(c, id, cs, lens)?;
+    let rows: Vec<(String, u32, ChangesetId, Vec<u8>)> = rows
+        .into_iter()
+        .map(
+            |derived::PutRow {
+                 kind,
+                 version,
+                 cs,
+                 value,
+             }| { (kind.to_owned(), version, cs, value) },
+        )
+        .collect();
+    c.put_settle_rows(&tree_rows, &rows, repo, &puts)?;
     Ok((id, tree))
 }
 
@@ -523,10 +836,7 @@ impl Dir {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::Backend;
-    use crate::db::SqliteTx;
     use crate::meta::Meta as _;
-    use crate::store::Store;
     use scion_core::{BlobId, Changeset, IdentityTime};
     /// `(path, Some(content))` puts a regular file; `(path, None)` deletes.
     type Edits<'a> = &'a [(&'a str, Option<&'a str>)];
@@ -549,10 +859,21 @@ mod tests {
         RepoPath::new(p).unwrap()
     }
 
-    /// Runs `f` in one write transaction on a fresh store.
-    fn with_db<T>(f: impl FnOnce(&mut SqliteTx<'_>) -> Result<T>) -> T {
-        let dir = tempfile::tempdir().unwrap();
-        Store::open(dir.path()).unwrap().write(f).unwrap()
+    /// Runs `f` in one write transaction on a fresh test store.
+    fn with_db<T>(f: impl FnOnce(&mut crate::backend::BackendTx<'_>) -> Result<T>) -> T {
+        let dir = crate::test_support::private_tempdir();
+        crate::Backend::open_test(dir.path())
+            .unwrap()
+            .write(f)
+            .unwrap()
+    }
+
+    /// A test stand-in for the settle: apply no longer writes the
+    /// trees it built, so a test that reads them back stores them the
+    /// way the settle's one statement does.
+    fn store_trees(c: &mut dyn MetaTx, applied: &Applied) -> TreeId {
+        c.put_settle_rows(&applied.1, &[], RepoId(0), &[]).unwrap();
+        applied.0
     }
 
     fn files(c: &mut dyn MetaTx, root: TreeId) -> Vec<String> {
@@ -574,19 +895,22 @@ mod tests {
     #[test]
     fn puts_and_deletes_build_the_expected_tree() {
         with_db(|c| {
-            let t1 = apply(
+            let applied = apply(
                 c,
                 None,
                 &changes(&[("a/b/c", Some("1")), ("a/d", Some("2")), ("e", Some("3"))]),
                 &mut lens_none(),
             )?;
+            let t1 = store_trees(c, &applied);
             assert_eq!(files(c, t1), ["a/b/c", "a/d", "e"]);
-            let t2 = apply(
+            let applied = apply(
                 c,
                 Some(t1),
                 &changes(&[("a/b/c", None), ("f/g", Some("4"))]),
                 &mut lens_none(),
             )?;
+            let t2 = store_trees(c, &applied);
+
             assert_eq!(files(c, t2), ["a/d", "e", "f/g"], "empty a/b is pruned");
             assert_eq!(
                 lookup(c, t2, &path("a/d"))?,
@@ -644,7 +968,7 @@ mod tests {
     #[test]
     fn lookup_tree_entry_answers_what_the_full_decode_answers() {
         with_db(|c| {
-            let t = apply(
+            let applied = apply(
                 c,
                 None,
                 &changes(&[
@@ -659,6 +983,8 @@ mod tests {
                 ]),
                 &mut lens_none(),
             )?;
+            let t = store_trees(c, &applied);
+
             // Every directory level of the tree, with its id.
             let mut dirs = vec![t];
             for p in ["aB", "b", "deep", "deep/x", "\u{3bb}"] {
@@ -688,14 +1014,16 @@ mod tests {
     #[test]
     fn same_content_gives_same_tree_id() {
         with_db(|c| {
-            let direct = apply(c, None, &changes(&[("x/y", Some("1"))]), &mut lens_none())?;
-            let t = apply(
+            let direct = apply(c, None, &changes(&[("x/y", Some("1"))]), &mut lens_none())?.0;
+            let applied = apply(
                 c,
                 None,
                 &changes(&[("x/y", Some("1")), ("z", Some("2"))]),
                 &mut lens_none(),
             )?;
-            let via_delete = apply(c, Some(t), &changes(&[("z", None)]), &mut lens_none())?;
+            let t = store_trees(c, &applied);
+
+            let via_delete = apply(c, Some(t), &changes(&[("z", None)]), &mut lens_none())?.0;
             assert_eq!(direct, via_delete);
             Ok(())
         });
@@ -704,20 +1032,25 @@ mod tests {
     #[test]
     fn file_and_directory_swap_in_one_changeset() {
         with_db(|c| {
-            let t = apply(c, None, &changes(&[("a", Some("1"))]), &mut lens_none())?;
-            let t = apply(
+            let applied = apply(c, None, &changes(&[("a", Some("1"))]), &mut lens_none())?;
+            let t = store_trees(c, &applied);
+            let applied = apply(
                 c,
                 Some(t),
                 &changes(&[("a", None), ("a/b", Some("2"))]),
                 &mut lens_none(),
             )?;
+            let t = store_trees(c, &applied);
+
             assert_eq!(files(c, t), ["a/b"]);
-            let t = apply(
+            let applied = apply(
                 c,
                 Some(t),
                 &changes(&[("a", Some("3")), ("a/b", None)]),
                 &mut lens_none(),
             )?;
+            let t = store_trees(c, &applied);
+
             assert_eq!(files(c, t), ["a"]);
             Ok(())
         });
@@ -726,12 +1059,14 @@ mod tests {
     #[test]
     fn structural_conflicts_are_rejected() {
         with_db(|c| {
-            let t = apply(
+            let applied = apply(
                 c,
                 None,
                 &changes(&[("a", Some("1")), ("d/x", Some("2"))]),
                 &mut lens_none(),
             )?;
+            let t = store_trees(c, &applied);
+
             let cases: [(Edits<'_>, ApplyError); 6] = [
                 (
                     &[("a/b", Some("x"))],
@@ -838,11 +1173,13 @@ mod tests {
                         })
                         .collect();
                     let flat_changes = edits.iter().map(|(p, c)| ((*p).to_owned(), *c)).collect();
+                    let outcome = apply(c, tree, &changes, &mut lens_none());
                     match (
                         apply_flat(&model, &flat_changes),
-                        apply(c, tree, &changes, &mut lens_none()),
+                        outcome,
                     ) {
                         (Some(next), Ok(next_tree)) => {
+                            let next_tree = store_trees(c, &next_tree);
                             assert_eq!(snapshot(c, next_tree), next);
                             model = next;
                             tree = Some(next_tree);
@@ -872,8 +1209,8 @@ mod tests {
             "b4717ab9e5bbd8b20c844a4236fededbea08e83cedbd871731fa9e948a0cbac8",
         ];
         for stored in [true, false] {
-            let dir = tempfile::tempdir().unwrap();
-            let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+            let dir = crate::test_support::private_tempdir();
+            let store = Backend::open_test(dir.path()).unwrap();
             // The chain's six puts name blobs "1".."6"; their files feed the
             // real lens, so stored and re-derived trees carry true lengths.
             for c in ["1", "2", "3", "4", "5", "6"] {
@@ -919,8 +1256,8 @@ mod tests {
     /// the deadline, `read_file` returned the file's bytes.
     #[test]
     fn a_read_with_a_past_deadline_derives_nothing() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
         store.blobs().put(b"1").unwrap();
         // A changeset with no root tree row yet.
         let cs = store
@@ -947,8 +1284,8 @@ mod tests {
     /// could lose a tree that the client was told about.
     #[test]
     fn get_root_tree_flushes_once_after_it_derives() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
         store.blobs().put(b"1").unwrap();
         // A changeset with no root tree row yet.
         let cs = store
@@ -974,8 +1311,8 @@ mod tests {
 
     #[test]
     fn root_tree_derives_a_long_chain_and_caches_it() {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
         let author = IdentityTime::new(b"a".to_vec(), b"a@x".to_vec(), 0, 0)
             .expect("identity fits the format");
         // Every put of the chain names its index as the blob; their files

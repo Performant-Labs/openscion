@@ -19,12 +19,10 @@
 //! The layers, bottom up. The private ones carry no links: they are not
 //! API, and their names here are orientation, not references.
 //!
-//! - `backend` and `meta`: one metadata trait over two backends: a data
-//!   directory on this machine (`store`: SQLite for metadata and trees),
-//!   and a Postgres database (`pg`) for the metadata instead. The blob
-//!   files stay on local disk in both: one blob folder per server. One
-//!   server runs per database: a second one is refused at open. What a
-//!   user touches is [`Backend`].
+//! - `backend` and `meta`: one metadata trait over the Postgres backend
+//!   (`pg`), with the blob files on local disk (one blob folder per
+//!   server). One server runs per database: a second one is refused at
+//!   open. What a user touches is [`Backend`].
 //! - `derived`: one mechanism for every kind of derived data, which
 //!   `backfill_root_tree` and its two sibling functions drive.
 //! - `tree`: apply changesets to trees and derive each changeset's root
@@ -58,13 +56,13 @@
 //! enabling it in a build is at the user's own risk.
 
 pub(crate) mod access;
+pub mod admin;
 pub(crate) mod audit;
 pub(crate) mod auth;
 pub(crate) mod backend;
 pub use backend::Backend;
 pub mod archive;
 pub(crate) mod blame;
-pub(crate) mod db;
 pub(crate) mod deadline;
 pub(crate) mod derived;
 pub(crate) mod error;
@@ -74,6 +72,7 @@ pub(crate) mod error;
 #[cfg(any(test, feature = "test-hooks"))]
 #[path = "test_support/docs.rs"]
 pub(crate) mod docs_hooks;
+pub mod floor;
 pub mod fsck;
 pub mod gc;
 pub(crate) mod graph;
@@ -85,9 +84,13 @@ pub(crate) mod meta;
 pub(crate) mod metrics;
 pub(crate) mod names;
 pub(crate) mod objects;
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) mod pause;
 mod pg;
+pub mod preflight;
 pub(crate) mod quotas;
 pub(crate) mod read;
+pub(crate) mod reply;
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) mod seed;
 pub(crate) mod service;
@@ -107,8 +110,87 @@ pub(crate) mod write;
 /// than the modules themselves: the modules are pub(crate), and a pub
 /// re-export of a pub(crate) module is refused (E0365), while a re-export
 /// of the items inside a public submodule is fine.
-#[cfg(feature = "test-hooks")]
+#[cfg(any(test, feature = "test-hooks"))]
 pub mod test_support {
+    /// A temp directory the run owns outright: mode 0700, whatever the
+    /// umask. The server refuses a data directory that group or others
+    /// can read, and a plain `tempfile::tempdir()` is 0777 less the
+    /// umask, so a test that opens a store in the temp directory
+    /// directly must hold a private one.
+    ///
+    /// The name carries 16 random characters, not tempfile's 6: a test
+    /// schema is the hash of this path, and a deleted directory's name
+    /// is reusable at once, so a short name let two tests' directories
+    /// - one live, one a leftover store - hash to one schema (#1162).
+    ///   62^16 makes a reuse in a job impossible in practice.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the temp directory cannot be made: a test wants to
+    /// stop at once anyway.
+    #[allow(dead_code)]
+    #[must_use]
+    pub fn private_tempdir() -> tempfile::TempDir {
+        use std::os::unix::fs::PermissionsExt as _;
+        let dir = tempfile::Builder::new()
+            .prefix(".tmp")
+            .rand_bytes(16)
+            .tempdir()
+            .unwrap();
+        std::fs::set_permissions(dir.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        dir
+    }
+
+    /// The name's random part carries 16 characters, so a deleted
+    /// directory's name is not redrawn within a job's lifetime: the
+    /// test schema is the hash of this path (#1162).
+    #[test]
+    fn a_private_tempdir_name_carries_16_random_characters() {
+        let dir = private_tempdir();
+        let name = dir.path().file_name().unwrap().to_string_lossy();
+        let random = name.strip_prefix(".tmp").unwrap_or(&name);
+        assert_eq!(random.len(), 16, "{name}");
+        assert!(random.bytes().all(|b| b.is_ascii_alphanumeric()), "{name}");
+    }
+
+    /// The reader pool the nightly's two proof tests open with: their
+    /// per-case checks run as independent reads, and the pool serves them
+    /// concurrently. The nightly's runner shares its 4 vCPUs with the
+    /// Postgres container; ten readers pay there because the checks are
+    /// round-trip bound, not CPU bound. The suite's Postgres keeps its
+    /// `max_connections` (100) well above the pools of the tests that run
+    /// in parallel: the nightly's worst case is the two proofs (2 + 10 +
+    /// 1 connections each) plus two other lib tests at the suite default
+    /// of two (3 each), over 4 test threads: 32 connections of 100.
+    pub const PROOF_READERS: usize = 10;
+
+    /// Runs `work` on every item of `items` with `workers` fixed threads:
+    /// each worker takes the next item from one atomic index until the
+    /// items run out. The item count can be hundreds a case, so a thread
+    /// per item is not the shape; the pool's connections are. A panic in
+    /// `work` propagates through the scope when the workers end, like a
+    /// panic in the case body does.
+    pub fn for_each_item<T, F>(items: &[T], workers: usize, work: F)
+    where
+        T: Sync,
+        F: Fn(&T) + Sync,
+    {
+        let next = std::sync::atomic::AtomicUsize::new(0);
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| {
+                    loop {
+                        let i = next.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        if i >= items.len() {
+                            break;
+                        }
+                        work(&items[i]);
+                    }
+                });
+            }
+        });
+    }
+
     /// The caller behind an authenticated RPC, for tests that name one.
     pub mod auth {
         pub use crate::auth::Caller;
@@ -139,6 +221,14 @@ pub mod test_support {
         #[allow(unreachable_pub)]
         pub fn read_changesets(path: &Path) -> crate::error::Result<Changesets> {
             crate::archive::read_changesets(path)
+        }
+
+        /// The transactions the restores of this process committed so
+        /// far: a test that must see a restore commit many transactions
+        /// reads it before and after.
+        #[allow(unreachable_pub)]
+        pub fn restore_tx_count() -> u64 {
+            crate::archive::RESTORE_TXS.load(std::sync::atomic::Ordering::Relaxed)
         }
 
         /// Reads the blob members of `path`.
@@ -201,55 +291,51 @@ pub mod test_support {
     pub mod deadline {
         pub use crate::deadline::*;
     }
-    /// The opaque backend, for the tests that build one from a store
-    /// they prepared, or read the data directory's own store out of
-    /// one. The backend itself carries no test methods: the facade
-    /// type stays clean, and the seams live here.
+    /// The backend's schema version, so a test pins the migration story
+    /// without naming a literal that the next migration turns stale.
     pub mod backend {
-        /// Wraps a store the test prepared ([`Store::open`], or
-        /// `open_with_walks` for a capped walk) into a backend, as the
-        /// engine-agnostic constructors cannot: they open their own.
-        /// The engine the store holds is the test's choice, not part
-        /// of the API.
-        #[must_use]
-        pub fn from_store(store: crate::test_support::store::Store) -> crate::Backend {
-            crate::Backend::sqlite(store)
-        }
-
-        /// The test-only reads of a backend: the data directory's own
-        /// store, when the backend is one. [`None`] on Postgres, whose
-        /// rows a test reads through the [`MetaTx`] queries.
-        pub trait BackendExt {
-            /// The store of a data-directory backend, for the tests
-            /// that assert the storage's internals (its raw rows, its
-            /// page caps).
-            fn sqlite(&self) -> Option<&crate::test_support::store::Store>;
-        }
-
-        impl BackendExt for crate::Backend {
-            fn sqlite(&self) -> Option<&crate::test_support::store::Store> {
-                self.as_sqlite()
-            }
-        }
-
-        /// The schema versions this build migrates to, so a test pins
+        /// The schema version the Postgres schema ships, so a test pins
         /// the migration story without naming a literal that the next
         /// migration turns stale.
         pub mod schema_version {
-            /// The SQLite store's schema version ([`crate::store`]).
-            pub const SQLITE: u32 = crate::store::SCHEMA_VERSION;
-            /// The Postgres schema's version ([`crate::pg`]).
+            /// The Postgres schema's version, for the tests that pin it.
             pub const POSTGRES: u32 = crate::pg::PG_SCHEMA_VERSION;
+        }
+
+        use std::path::Path;
+
+        /// Arms the marker write's directory fsync of `data` to fail
+        /// with EIO, once: the next open that writes `data`'s marker
+        /// must refuse with the disk's error. The store's fsync gate
+        /// cannot carry this hook, because the marker writes before any
+        /// store exists to arm.
+        #[allow(unreachable_pub)]
+        pub fn fail_marker_dir_fsync(data: &Path) {
+            crate::backend::test_hooks::fail_marker_dir_fsync(data);
         }
     }
     /// The error a changeset apply can end in, and the conversion the
     /// tests share with the crate, for the write tests.
     pub mod error {
-        pub use crate::error::{ApplyError, from_sqlite};
+        pub use crate::error::ApplyError;
+    }
+    /// The Postgres connect's bound and the write transaction's
+    /// history-node buffer: their seams, so a test drives them without
+    /// a database or reads the buffer's peak.
+    pub mod pg {
+        pub use crate::pg::{
+            connect_on_deadline_for_tests, test_history_pending_peak_bytes,
+            test_reset_parked_connects, test_set_history_pending_bound_for_tests,
+        };
     }
     /// The counters the import tests read between retries.
     pub mod import {
-        pub use crate::import::{BUSY_TRIES, CHECKS, STRUCTURE_CAPS};
+        pub use crate::import::{BUSY_TRIES, CHECKS, ROLLED_CHECKS, STRUCTURE_CAPS, TX_CHECKS};
+    }
+    /// The memory floor: the check and the path override a test points
+    /// at a temporary directory.
+    pub mod floor {
+        pub use crate::floor::*;
     }
     /// The land operation: its queue, requests and outcomes.
     pub mod land {
@@ -271,13 +357,9 @@ pub mod test_support {
     pub mod service {
         pub use crate::service::*;
     }
-    /// The on-disk store, so tests open and inspect one directly.
+    /// The blob folder, so tests read its limits directly.
     pub mod store {
         pub use crate::store::*;
-        /// The schema version this build ships, and the migration runner,
-        /// for a test that makes a store of an older version.
-        #[allow(unreachable_pub)]
-        pub use crate::store::{SCHEMA_VERSION, migrate};
     }
     /// The guide's own commands, so a Proof's test runs the block under
     /// its runbook's heading instead of retyping it.
@@ -291,6 +373,11 @@ pub mod test_support {
     /// The write path: changeset decode and apply, and its limits.
     pub mod write {
         pub use crate::write::*;
+    }
+    /// The view derivations behind the filtered reads, and their
+    /// part-flush seam.
+    pub mod views {
+        pub use crate::views::*;
     }
     /// The bulk seed for deep file-less ladders, for the tests that
     /// measure the queries instead of the seeding.
@@ -313,7 +400,9 @@ pub use history::{PathHistory, backfill_path_history};
 #[cfg(any(test, feature = "test-hooks"))]
 pub use import::set_import_per_commit_txs;
 pub use import::{ImportOptions, ImportReport, import_git};
+pub use pg::{SchemaCheck, check_db_url, check_schema, migrate_store};
 pub use quotas::Quotas;
+pub use reply::REPLY_MEMORY_BUDGET;
 pub use scion_proto::runtime::metrics::Metrics;
 pub use service::{ServeOptions, serve};
 // `ServeOptions` is public and holds the audit handle, so the handle is

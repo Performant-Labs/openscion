@@ -5,10 +5,9 @@ members = ["crates/*"]
 [workspace.package]
 version = "0.1.0"
 edition = "2024"
-rust-version = "1.88"
+rust-version = "1.89"
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/bnsd55/openscion"
-homepage = "https://github.com/bnsd55/openscion"
 keywords = ["vcs", "version-control", "monorepo", "git", "source-control"]
 categories = ["development-tools"]
 authors = ["Ben Shaharizad <bnsd55@gmail.com>"]
@@ -32,15 +31,17 @@ hyper-util = { version = "0.1", features = ["tokio"] }
 tower = "0.5"
 blake3 = "1.8"
 clap = { version = "4.6", features = ["derive", "env"] }
-gix = "0.89"
+gix = "0.90"
 hashlink = "0.12"
 nfsserve = "0.11"
 prost = "0.14"
 proptest = "1.12"
+# Kept for scion-tier: its client-side cache keeps its own SQLite index.
+rusqlite = { version = "0.41", features = ["bundled"] }
 rcgen = "0.14"
-rusqlite = { version = "0.40", features = ["bundled"] }
 rustix = { version = "1.1", features = ["fs", "process"] }
 serde_json = "1.0"
+base64 = "0.23"
 signal-hook = { version = "0.4", default-features = false }
 tempfile = "3.27"
 thiserror = "2.0"

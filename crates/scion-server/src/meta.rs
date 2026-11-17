@@ -1,12 +1,13 @@
-//! The metadata storage that a server needs, as one trait, with SQLite
-//! behind it ([#47](https://github.com/bnsd55/openscion/issues/47)).
+//! The metadata storage that a server needs, as one trait, with Postgres
+//! behind it.
 //!
-//! [`Store`] is the SQLite implementation: one data directory, one write
-//! connection, readers around it, and the group flush that makes a reply
-//! wait for durability. Its queries are [`MetaTx`] methods, split by table
-//! owner: the shared tables in `db.rs`, the tables of lands in `land.rs`,
-//! and so on. A backend that many servers share implements the same traits
-//! with its own transaction type, and the callers do not change.
+//! [`Pg`] is the implementation: one shared database, one write
+//! connection per server, readers around it, and the group flush that
+//! makes a reply wait for durability. Its queries are [`MetaTx`] methods,
+//! split by table owner: the shared tables in `pg.rs`, the tables of
+//! lands in `land.rs`, and so on. Callers match behavior through the
+//! methods, never the engine, so the engine is a private change of the
+//! server crate.
 //!
 //! The seven methods of [`Meta`] keep today's semantics, because the
 //! durability rules of protocol section 4 must hold in every backend:
@@ -36,11 +37,13 @@ use scion_core::{BlobId, Changeset, ChangesetId, Entry, Tree, TreeId};
 use gix::ObjectId;
 
 use crate::auth::Caller;
-use crate::db::SqliteTx;
 use crate::error::{Error, Result};
 use crate::history::NodeId;
-use crate::land::{LandOutcome, LandRequest, LandState};
-use crate::store::Store;
+use crate::land::{LandOutcome, LandRejectReason, LandRequest, LandState};
+
+/// The derived values a transaction preloaded, by (kind, version,
+/// changeset): the write path's memory of the rows it reads first.
+pub(crate) type DerivedValues = std::collections::HashMap<(String, i64, Vec<u8>), Vec<u8>>;
 
 /// One pending land the stale-land sweep found, with everything the
 /// answer to its intent line names: the repo (by ID for the ref's lock,
@@ -77,6 +80,26 @@ pub trait Meta: Send + Sync + 'static {
     /// What `f` returns, or a flush error.
     fn read<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T>;
 
+    /// [`Meta::read`], with the read transaction's idle bound set from
+    /// `idle`: a caller that holds one transaction across work between
+    /// statements (a blame's diffs run between its reads) raises the
+    /// bound from the backend's default, so a slow step cannot idle the
+    /// transaction past it and lose the reader mid-walk. The bound is
+    /// the caller's own deadline, so an abandoned walk still gives its
+    /// reader back when the call is gone.
+    ///
+    /// # Errors
+    ///
+    /// What `f` returns, or a flush error.
+    fn read_long<T>(
+        &self,
+        idle: std::time::Duration,
+        f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>,
+    ) -> Result<T> {
+        let _ = idle;
+        self.read(f)
+    }
+
     /// Like [`Meta::read`], but returns before what `f` saw is durable,
     /// with a count that covers every commit `f` could see. The caller
     /// passes that count to [`Meta::wait_durable`] before it replies.
@@ -103,6 +126,21 @@ pub trait Meta: Send + Sync + 'static {
     /// What `f` returns, or a database error from taking the connection.
     fn read_unflushed<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T>;
 
+    /// A read that sees the newest committed state per statement, on a
+    /// client that no writer queues behind. The caller's writes happen
+    /// later, in their own transaction, and whatever guard its rows
+    /// carry is what stops a double write - not this read.
+    ///
+    /// The default runs a plain read: a backend whose reads already see
+    /// the newest committed state needs no override.
+    ///
+    /// # Errors
+    ///
+    /// What `f` returns, or a database error from taking the client.
+    fn read_latest<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
+        self.read(f)
+    }
+
     /// Runs `f` in one write transaction. It commits when `f` returns `Ok`
     /// and rolls back otherwise, and returns before the commit is durable.
     /// Every backend runs `f` exactly once; a retryable error comes back
@@ -120,6 +158,20 @@ pub trait Meta: Send + Sync + 'static {
     ///
     /// As [`Meta::commit`] and [`Meta::flush`].
     fn write<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T>;
+
+    /// A write transaction for a caller that holds its ref's slot: a
+    /// land between taking and dropping the slot's lock (the settle's
+    /// commit, the sweep's reject), or the land's finish read while it
+    /// still rides the write client. The backend may let it enter ahead
+    /// of other waiting writers: what it writes is what its ref's next
+    /// land needs, and its wait costs the whole queue of its ref.
+    ///
+    /// # Errors
+    ///
+    /// As [`Meta::write`].
+    fn write_slot_holder<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
+        self.write(f)
+    }
 
     /// Returns once every commit made before this call is durable. No
     /// reply shows a commit that is not durable.
@@ -139,6 +191,17 @@ pub(crate) const DERIVED_BATCH: usize = 1_000;
 /// [`DERIVED_BATCH`] as the chain limit the statements take.
 #[allow(clippy::cast_possible_wrap)] // 1,000, far from any wrap
 pub(crate) const DERIVED_BATCH_I64: i64 = DERIVED_BATCH as i64;
+
+/// What the walk's start read: the stored bytes of the value, or the
+/// generation to walk from when none is stored.
+pub enum StartRead {
+    /// The value is stored (or the transaction holds it): the walk
+    /// breaks on it, and no generation was read.
+    Stored(Vec<u8>),
+    /// The repo has the changeset and nothing is stored for it: the
+    /// walk starts from this generation.
+    Generation(i64),
+}
 
 /// The queries on the metadata tables. Every query fails with a database
 /// error, or with the `NotFound` or `Corrupt` error that its doc says; the
@@ -198,17 +261,31 @@ pub trait MetaTx {
     /// Reads a changeset of `repo`, and checks it against its ID.
     fn get_changeset(&mut self, repo: RepoId, id: ChangesetId) -> Result<Changeset>;
 
+    /// The changesets of `repo` that the ids name, in the order asked:
+    /// each one read and checked against its ID, as
+    /// [`MetaTx::get_changeset`] does. One statement where the backend
+    /// can, so a page of entries costs one read, not one per entry. An id
+    /// that `repo` may not see, or that has no stored body, is
+    /// [`Error::NotFound`]; an id asked twice in the batch is answered
+    /// once per ask.
+    fn get_changeset_many(&mut self, repo: RepoId, ids: &[ChangesetId]) -> Result<Vec<Changeset>>;
+
     /// `start` and up to `limit - 1` of its first-parent ancestors, as
     /// (id, generation, body), newest first, in walk order: the page one
-    /// statement fetches where the backend can. Every row is an ancestor
-    /// of `start`, so the repo check rides the start row alone, as
-    /// [`MetaTx::get_changeset`] checks it. The page is short at the root
-    /// of the history.
+    /// statement fetches where the backend can. Every row is a member of
+    /// `repo`: the chain follows only the rows the repo may see, so a
+    /// tampered first-parent row that names another repo's changeset
+    /// ends the page instead of serving that changeset. The page is
+    /// short at the root of the history; a short page that is not a
+    /// root - a last changeset whose first parent the repo does not
+    /// hold - is corruption, and is refused with [`Error::Corrupt`].
     ///
     /// # Errors
     ///
     /// [`Error::NotFound`] if `repo` does not hold `start`.
-    /// [`Error::Corrupt`] if a row's id is not a changeset id.
+    /// [`Error::Corrupt`] if a row's id is not a changeset id, or the
+    /// page's last changeset names a first parent the repo does not
+    /// hold.
     fn first_parent_page(
         &mut self,
         repo: RepoId,
@@ -218,6 +295,14 @@ pub trait MetaTx {
 
     /// Whether `repo` may see changeset `id`.
     fn has_changeset(&mut self, repo: RepoId, id: ChangesetId) -> Result<bool>;
+
+    /// The repo a name names, and whether each of `ids` is in it, one
+    /// statement. [`None`] when no repo carries the name.
+    fn repo_and_membership(
+        &mut self,
+        name: &str,
+        ids: &[ChangesetId],
+    ) -> Result<Option<(RepoId, Vec<bool>)>>;
 
     /// The generation of a changeset that `repo` may see.
     fn generation(&mut self, repo: RepoId, id: ChangesetId) -> Result<i64>;
@@ -271,6 +356,21 @@ pub trait MetaTx {
     fn get_derived(&mut self, kind: &str, version: u32, cs: ChangesetId)
     -> Result<Option<Vec<u8>>>;
 
+    /// The generation of a changeset that `repo` may see, and the stored
+    /// bytes of a derived value for it, one statement. The join with the
+    /// repo's membership is the check that a stored value does not leak
+    /// to a repo that cannot see the changeset; no row is
+    /// [`Error::NotFound`], the same words `generation` answers with. A
+    /// value the transaction already holds comes back as
+    /// [`StartRead::Stored`] without a statement.
+    fn generation_and_stored(
+        &mut self,
+        repo: RepoId,
+        kind: &str,
+        version: u32,
+        cs: ChangesetId,
+    ) -> Result<StartRead>;
+
     /// The stored bytes of up to [`DERIVED_BATCH`] derived values, in the
     /// order asked. One read transaction, one statement: a land between two
     /// ids of the batch cannot mix two states.
@@ -298,13 +398,28 @@ pub trait MetaTx {
         limit: i64,
     ) -> Result<Vec<(ChangesetId, Vec<u8>)>>;
 
+    /// Every link of the first-parent chain that starts at `start`, up to
+    /// `limit` of them, newest first, each as (changeset, value) where the
+    /// value is `None` when no value of this kind is stored for it. One
+    /// statement: the chain follows the indexed first-parent rows, as
+    /// [`MetaTx::get_derived_chain`] does, and the left join keeps every
+    /// link, also where no value is stored. The caller follows the chain
+    /// past the links without values, so a missing value is the caller's
+    /// corruption to report, not a gap to skip.
+    fn get_derived_chain_links(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, Option<Vec<u8>>)>>;
+
     /// Writes a test seed: `css` oldest first, every parent before its
     /// children, file-less (no tree entries, no blobs), and the derived
     /// values to store beside them. One statement per batch, not per
-    /// changeset, where the backend can. The default writes them one by
-    /// one through the ordinary path; backends where a round trip costs
-    /// real time override it. The rows must find an empty schema: the
-    /// bulk write does not replay the ordinary write's conflict checks.
+    /// changeset, where the backend can. The rows must find an empty
+    /// schema: the bulk write does not replay the ordinary write's
+    /// conflict checks.
     ///
     /// Returns the ids, in `css` order.
     #[cfg(any(test, feature = "test-hooks"))]
@@ -313,16 +428,7 @@ pub trait MetaTx {
         repo: RepoId,
         css: &[scion_core::Changeset],
         derived: &[(&'static str, u32, ChangesetId, Vec<u8>)],
-    ) -> Result<Vec<ChangesetId>> {
-        let mut ids = Vec::with_capacity(css.len());
-        for cs in css {
-            ids.push(self.insert_changeset(repo, cs)?);
-        }
-        for (kind, version, cs, value) in derived {
-            self.put_derived(kind, *version, *cs, value)?;
-        }
-        Ok(ids)
-    }
+    ) -> Result<Vec<ChangesetId>>;
 
     /// Records a derived value. A second write must agree with the first.
     fn put_derived(
@@ -333,8 +439,99 @@ pub trait MetaTx {
         value: &[u8],
     ) -> Result<()>;
 
+    /// Records derived values, one statement for the whole batch. The
+    /// callers write rows of changesets this transaction just stored, so
+    /// a stored row that differs from the batch's value is corrupt state
+    /// and fails the call; an agreeing stored row (a fill that stored the
+    /// same value first) is legal.
+    fn put_derived_all(&mut self, rows: &[(String, u32, ChangesetId, Vec<u8>)]) -> Result<()>;
+
+    /// The settle's whole write: the trees, the derived rows and the
+    /// repo's blob membership, one statement where the backend can
+    /// (#1004). The method owns the disagreeing-row check
+    /// `put_derived_all` applies: a stored derived row that differs
+    /// from the computed one refuses as corrupt, before the
+    /// transaction's memory follows the writes.
+    fn put_settle_rows(
+        &mut self,
+        trees: &[(TreeId, Vec<u8>)],
+        rows: &[(String, u32, ChangesetId, Vec<u8>)],
+        repo: RepoId,
+        blobs: &[BlobId],
+    ) -> Result<()>;
+
     /// Deletes up to `limit` derived values of `kind` below `version`.
     fn delete_derived_below(&mut self, kind: &str, version: u32, limit: usize) -> Result<usize>;
+
+    /// Whether the transaction itself inserted this changeset. A write
+    /// path asks to skip a stored-value read that cannot find anything:
+    /// the row of a changeset the transaction inserted can only have
+    /// been written by the transaction itself, and the transaction's
+    /// memory of its derived writes answers that read instead.
+    fn inserted_this_tx(&self, cs: ChangesetId) -> bool;
+    /// Reads the derived values of the named kinds, at the kind's own
+    /// version, for the named changesets into the transaction's own
+    /// memory, one statement, so the write path's per-value reads answer
+    /// without round trips. A backend that holds no such memory does
+    /// nothing, which stays correct: the reads then go to the database
+    /// as before.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn preload_derived(
+        &mut self,
+        _repo: RepoId,
+        _kinds: &[(&'static str, u32)],
+        _css: &[ChangesetId],
+    ) -> Result<()> {
+        Ok(())
+    }
+
+    /// Makes the write path's per-row flushes wait for the commit:
+    /// [`delete_derived_below`](Self::delete_derived_below) collects
+    /// its calls and the commit deletes with one statement, honoring
+    /// each call's limit summed per kind, and the history nodes the
+    /// write path buffers wait for the commit's own flush. The
+    /// deferral lasts to the commit and is one-way - a transaction
+    /// that turns it on cannot turn it off, so a caller that needs
+    /// `delete_derived_below`'s count must not share a transaction
+    /// with a write path that defers. A backend that does not defer
+    /// keeps writing per call, which is also right.
+    fn defer_derived_deletes(&mut self) {}
+
+    /// The derived values a pre-transaction phase read, by (kind,
+    /// version, changeset), for the write path to install with
+    /// [`adopt_pre_read`](Self::adopt_pre_read). The map carries no
+    /// generation: the transaction reads the generation itself (the
+    /// insert's own read), so the pre-read carries none. The values are
+    /// written once at their own changeset's settle, so a committed
+    /// answer cannot be stale.
+    /// A backend that reads nothing returns an empty map, which stays
+    /// correct: the transaction's reads then go to the store as before.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn read_derived_preload(
+        &mut self,
+        repo: RepoId,
+        kinds: &[(&'static str, u32)],
+        css: &[ChangesetId],
+    ) -> Result<DerivedValues>;
+
+    /// Installs a pre-transaction read's results on the transaction:
+    /// the derived values, and the history-node bodies the build's
+    /// derives read first. The tree bodies ride the pre-read value
+    /// itself. Every miss re-reads in the transaction, so a backend
+    /// that ignores the install stays correct, only slower.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn adopt_pre_read(&mut self, _pre: crate::tree::PreRead) -> Result<()> {
+        Ok(())
+    }
 
     /// The view that a rule-set digest of `version` derives for the real
     /// tree `tree` under the path-context digest `ctx`, if derived already.
@@ -377,22 +574,9 @@ pub trait MetaTx {
 
     /// Stores pre-encoded trees, whose ids are their content hashes. Safe
     /// to repeat. The batch is one round trip per table on Postgres,
-    /// however deep the tree chain was; a store that has no batch form
-    /// stores the rows one by one. No id may differ from its body's
+    /// however deep the tree chain was. No id may differ from its body's
     /// hash: the callers take each id from `encode_with_id`.
-    fn put_trees(&mut self, trees: &[(TreeId, Vec<u8>)]) -> Result<()> {
-        for (id, body) in trees {
-            let (tree, body_id) = Tree::decode_with_id(body)
-                .map_err(|e| Error::Corrupt(format!("tree {id}: {e}")))?;
-            if body_id != *id {
-                return Err(Error::Corrupt(format!(
-                    "tree {id} does not match its body's id {body_id}"
-                )));
-            }
-            self.put_tree(&tree)?;
-        }
-        Ok(())
-    }
+    fn put_trees(&mut self, trees: &[(TreeId, Vec<u8>)]) -> Result<()>;
 
     /// Reads a tree, and checks it against its ID.
     fn get_tree(&mut self, id: TreeId) -> Result<Tree>;
@@ -418,19 +602,17 @@ pub trait MetaTx {
     /// The length of a tree's stored bytes, without reading them.
     fn tree_size(&mut self, id: TreeId) -> Result<usize>;
 
+    /// The number of distinct blobs the store's metadata names: the
+    /// authoritative count, whatever the blob folder holds.
+    fn blob_count(&mut self) -> Result<u64>;
+
     /// Adds a blob to the blobs that `repo` may name. `Ok(true)` if new.
     fn add_repo_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool>;
 
     /// Adds every blob to the blobs that `repo` may name. The batch is
     /// one round trip on Postgres, however many blobs the changeset
-    /// puts; a store that has no batch form adds them one by one. Each
-    /// blob that is already there stays as it is.
-    fn add_repo_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<()> {
-        for blob in blobs {
-            self.add_repo_blob(repo, *blob)?;
-        }
-        Ok(())
-    }
+    /// puts. Each blob that is already there stays as it is.
+    fn add_repo_blobs(&mut self, repo: RepoId, blobs: &[BlobId]) -> Result<()>;
 
     /// Inserts a land, or finds the land for the same request key. Returns
     /// the repo and the land's outcome, pending or final. `pending_limit`
@@ -457,9 +639,25 @@ pub trait MetaTx {
     fn expire_lands(&mut self) -> Result<()>;
 
     /// Reads a land that `caller` started in `repo`.
-    fn land_outcome(&mut self, repo: RepoId, caller: &Caller, land_id: i64) -> Result<LandOutcome>;
+    /// Reads a land's outcome, the ref's state when `ref_name` names
+    /// one, and whether the ref's target's root tree is stored: one
+    /// read sees the land, the ref and the tree's presence together, so
+    /// a ref deleted between the record and the finish leaves the
+    /// land's outcome standing beside a missing ref, and the finish
+    /// knows whether the head's tree needs its fill before the write
+    /// transaction - the answer rides the same snapshot the head rode.
+    fn land_outcome(
+        &mut self,
+        repo: RepoId,
+        caller: &Caller,
+        land_id: i64,
+        ref_name: Option<&str>,
+    ) -> Result<(LandOutcome, Option<RefState>, bool)>;
 
     /// Moves a pending land to its final state, and returns the outcome.
+    /// `reject_reason` says why a REJECTED land can never succeed; the
+    /// other states carry [`LandRejectReason::Unspecified`].
+    #[allow(clippy::too_many_arguments)] // the one row's own columns: state, result, detail, paths and reason land together
     fn set_land_state(
         &mut self,
         repo: RepoId,
@@ -468,10 +666,8 @@ pub trait MetaTx {
         result: Option<ChangesetId>,
         detail: String,
         conflict_paths: Vec<RepoPath>,
+        reject_reason: LandRejectReason,
     ) -> Result<LandOutcome>;
-
-    /// Records that a git commit became the changeset. Safe to repeat.
-    fn put_git_import(&mut self, repo: RepoId, oid: ObjectId, cs: ChangesetId) -> Result<()>;
 
     /// Records that the git commits became the changesets, all of the
     /// pairs, in one statement where the backend can. Safe to repeat.
@@ -484,9 +680,8 @@ pub trait MetaTx {
     ) -> Result<std::collections::HashMap<ObjectId, ChangesetId>>;
 
     /// Stores a node of a path history under its content address. Safe to
-    /// repeat. Returns whether the row was new, so a caller can charge only
-    /// bytes that actually landed.
-    fn put_history_node(&mut self, id: NodeId, body: Vec<u8>) -> Result<(NodeId, bool)>;
+    /// repeat.
+    fn put_history_node(&mut self, id: NodeId, body: Vec<u8>) -> Result<NodeId>;
 
     /// Reads a history node's stored bytes, and returns them with the
     /// length of their stored form.
@@ -556,15 +751,18 @@ pub trait MetaTx {
     /// A database error.
     fn restore_ref(&mut self, repo: RepoId, name: &str, target: &[u8], version: i64) -> Result<()>;
 
-    /// Removes the row that names `blob` for `repo`.
-    fn delete_repo_blob(&mut self, repo: RepoId, blob: &[u8]) -> Result<()>;
-
     /// Removes the rows that name any of `blobs` for `repo`, all of
     /// them, in one statement where the backend can.
     fn delete_repo_blobs(&mut self, repo: RepoId, blobs: &[Vec<u8>]) -> Result<()>;
 
     /// Whether any repo names `blob`.
     fn any_repo_names(&mut self, blob: &[u8]) -> Result<bool>;
+
+    /// The repos whose `repo_blobs` row names `blob`, so the dry run's
+    /// sweep can subtract the pairs its prune would remove: the real run
+    /// deletes those rows before it sweeps, and the dry run must report
+    /// the same files. Same shape as `any_repo_names`.
+    fn repos_naming(&mut self, blob: &[u8]) -> Result<Vec<RepoId>>;
 
     /// The `(changeset ID, body)` of the changesets after `from`, in ID
     /// order, at most `limit`. `fsck`'s walk over every stored changeset.
@@ -610,6 +808,14 @@ pub trait MetaTx {
         cs: &[u8],
         limit: usize,
     ) -> Result<Vec<FsckDerivedRow>>;
+
+    /// Removes the restore's staging mark, in the caller's transaction.
+    /// Publication is atomic with this: a store that answers reads
+    /// never carries the mark a later restore would drop it by.
+    /// # Errors
+    ///
+    /// A database error.
+    fn clear_restore_mark(&mut self) -> Result<()>;
 }
 
 /// The row ID of a repository, private to the backend.
@@ -651,37 +857,151 @@ pub struct RefState {
     pub version: i64,
 }
 
-impl Meta for Store {
-    type Tx<'a>
-        = SqliteTx<'a>
-    where
-        Self: 'a;
+/// The error of a repo that does not exist. A caller that may not read a
+/// repo gets it too (`access::Access::check_read`).
+pub(crate) fn no_repo(name: &str) -> Error {
+    Error::NotFound(format!("repo {name:?}"))
+}
 
-    fn read<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
-        Store::read(self, |c| f(&mut SqliteTx(c)))
+/// The puts of a changeset's changes: each path and its blob, in path
+/// order, with repeats. A gitlink names no blob, whatever its bytes.
+pub(crate) fn puts(cs: &Changeset) -> impl Iterator<Item = (&RepoPath, BlobId)> + '_ {
+    cs.changes()
+        .iter()
+        .filter_map(|(path, state)| Some((path, state.as_ref()?.blob()?)))
+}
+
+/// Commit graphs for tests.
+#[cfg(test)]
+pub(crate) mod testing {
+    use std::collections::BTreeMap;
+
+    use proptest::prelude::{Strategy, any};
+    use proptest::sample::Index;
+    use scion_core::{BlobId, FileState, RepoPath};
+
+    use crate::error::Result;
+    use crate::meta::MetaTx;
+    use crate::meta::{Changeset, ChangesetId, RepoId};
+
+    /// Stores a graph of changesets in `repo`, so with no derived rows.
+    /// Changeset `i` has the parents `parents[i]`, in order, each an
+    /// earlier changeset, and puts the file `f{i}`. Returns the IDs.
+    pub(crate) fn insert_graph(
+        c: &mut dyn MetaTx,
+        repo: RepoId,
+        parents: &[Vec<usize>],
+    ) -> Result<Vec<ChangesetId>> {
+        insert_each(c, repo, parents, |i| {
+            let path = format!("f{i}");
+            let state = FileState::Regular {
+                content: BlobId::of(path.as_bytes()),
+                executable: false,
+            };
+            let message = path.clone().into_bytes();
+            (
+                message,
+                [(RepoPath::new(path).unwrap(), Some(state))].into(),
+            )
+        })
     }
 
-    fn read_counted<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> (Result<T>, u64) {
-        Store::read_counted(self, |c| f(&mut SqliteTx(c)))
+    /// Stores a graph as [`insert_graph`] does, where changeset `i` has the
+    /// message and the changes that `make(i)` returns.
+    fn insert_each(
+        c: &mut dyn MetaTx,
+        repo: RepoId,
+        parents: &[Vec<usize>],
+        make: impl Fn(usize) -> (Vec<u8>, BTreeMap<RepoPath, Option<FileState>>),
+    ) -> Result<Vec<ChangesetId>> {
+        let mut ids: Vec<ChangesetId> = Vec::new();
+        for (i, of) in parents.iter().enumerate() {
+            let (message, changes) = make(i);
+            let cs = Changeset::new(
+                of.iter().map(|&p| ids[p]).collect(),
+                scion_core::IdentityTime::new(b"a".to_vec(), b"a@x".to_vec(), 0, 0)
+                    .expect("identity fits the format"),
+                None,
+                message,
+                changes,
+            )
+            .expect("changeset fits the format");
+            ids.push(c.insert_changeset(repo, &cs)?);
+        }
+        Ok(ids)
     }
 
-    fn wait_durable(&self, seen: u64) -> Result<()> {
-        Store::wait_durable(self, seen)
+    /// Paths that [`histories`] change. Some are files and directories of
+    /// others, so a path is a file at one time and a directory at another,
+    /// or both in one changeset.
+    pub(crate) const PATHS: [&str; 8] = ["a", "b", "a/b", "a/c", "b/a", "a/b/c", "a/b/d", "c/a/b"];
+
+    /// The changes of one changeset of [`histories`]: an index in
+    /// [`PATHS`], and whether it puts the file there or deletes it.
+    pub(crate) type Edits = Vec<(usize, bool)>;
+
+    /// Graphs as [`graphs`] makes them, with random puts and deletes of
+    /// [`PATHS`] in each changeset, or none. A change need not apply to a
+    /// tree, for example a delete of a missing file, so only kinds that read
+    /// the changes and not the trees can derive these histories.
+    pub(crate) fn histories(max: usize) -> impl Strategy<Value = (Vec<Vec<usize>>, Vec<Edits>)> {
+        graphs(max).prop_flat_map(|parents| {
+            let edit = (0..PATHS.len(), any::<bool>());
+            let edits =
+                proptest::collection::vec(proptest::collection::vec(edit, 0..4), parents.len());
+            (proptest::strategy::Just(parents), edits)
+        })
     }
 
-    fn read_unflushed<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
-        Store::read_unflushed(self, |c| f(&mut SqliteTx(c)))
+    /// Stores a history of [`histories`] as [`insert_graph`] does, where
+    /// changeset `i` makes the changes `edits[i]`. Returns the IDs.
+    pub(crate) fn insert_history(
+        c: &mut dyn MetaTx,
+        repo: RepoId,
+        parents: &[Vec<usize>],
+        edits: &[Edits],
+    ) -> Result<Vec<ChangesetId>> {
+        insert_each(c, repo, parents, |i| {
+            let changes = edits[i]
+                .iter()
+                .map(|&(path, put)| {
+                    let state = put.then(|| FileState::Regular {
+                        content: BlobId::of(i.to_string().as_bytes()),
+                        executable: false,
+                    });
+                    (RepoPath::new(PATHS[path]).unwrap(), state)
+                })
+                .collect();
+            (i.to_string().into_bytes(), changes)
+        })
     }
 
-    fn commit<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
-        Store::commit(self, |c| f(&mut SqliteTx(c)))
-    }
-
-    fn write<T>(&self, f: impl FnOnce(&mut Self::Tx<'_>) -> Result<T>) -> Result<T> {
-        Store::write(self, |c| f(&mut SqliteTx(c)))
-    }
-
-    fn flush(&self) -> Result<()> {
-        Store::flush(self)
+    /// Graphs of 1 to `max` changesets for [`insert_graph`]. Most have a
+    /// first parent a few changesets back, so first-parent histories are
+    /// long. Some have no parent, and some have up to two more parents
+    /// anywhere before them, so there are several roots, merges and
+    /// criss-crosses.
+    pub(crate) fn graphs(max: usize) -> impl Strategy<Value = Vec<Vec<usize>>> {
+        let node = (
+            proptest::option::weighted(0.9, 1..4_usize),
+            proptest::collection::vec(any::<Index>(), 0..3),
+        );
+        proptest::collection::vec(node, 1..=max).prop_map(|nodes| {
+            (0..)
+                .zip(nodes)
+                .map(|(i, (back, others))| {
+                    let mut parents: Vec<usize> = Vec::new();
+                    if i > 0 {
+                        let first = back.map(|back| i - back.min(i));
+                        for p in first.into_iter().chain(others.iter().map(|o| o.index(i))) {
+                            if !parents.contains(&p) {
+                                parents.push(p);
+                            }
+                        }
+                    }
+                    parents
+                })
+                .collect()
+        })
     }
 }

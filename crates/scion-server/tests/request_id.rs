@@ -36,7 +36,7 @@ impl Drop for Server {
 
 /// Starts the real binary on a fresh data directory.
 fn spawn() -> Server {
-    let data = tempfile::tempdir().unwrap();
+    let data = scion_server::test_support::private_tempdir();
     let dir = data.path().join("log");
     fs::create_dir(&dir).unwrap();
     let log = dir.join("server.log");
@@ -48,7 +48,14 @@ fn spawn() -> Server {
     let child = Command::new(env!("CARGO_BIN_EXE_scion-server"))
         .arg("--data")
         .arg(data.path())
-        .args(["serve", "--token", "t", "--listen", "127.0.0.1:0"])
+        .args(["serve", "--listen", "127.0.0.1:0"])
+        .env("SCION_TOKEN", "t")
+        // The serve opens the store: the URL rides the env, quietly,
+        // and the schema is the data directory's own.
+        .env(
+            "SCION_POSTGRES_URL",
+            scion_server::Backend::test_postgres_url(data.path()).unwrap(),
+        )
         // Plain log lines, so the test can read the address back.
         .env("NO_COLOR", "1")
         .stdout(log_file.try_clone().unwrap())

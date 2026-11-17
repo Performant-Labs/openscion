@@ -10,6 +10,12 @@ use scion_core::{BlobId, Changeset, ChangesetId, FileState, IdentityTime, RepoPa
 use scion_server::test_support::meta::{Meta as _, MetaTx as _};
 use scion_server::{Backend, archive, fsck, test_support::tree};
 
+/// The URL a store on `dir` opens with: the test database, under the
+/// directory's own schema, created first.
+fn url_of(dir: &std::path::Path) -> String {
+    scion_server::Backend::test_postgres_url(dir).unwrap()
+}
+
 const REPO: &str = "main";
 
 fn path(p: &str) -> RepoPath {
@@ -75,7 +81,7 @@ fn source(data: &Path) -> (Backend, ChangesetId) {
 /// archive names a ref target it does not hold.
 #[test]
 fn a_section_holds_one_snapshot_when_a_writer_lands_between_its_statements() {
-    let data = tempfile::tempdir().unwrap();
+    let data = scion_server::test_support::private_tempdir();
     let (store, _) = source(data.path());
 
     // The blob the hook's changeset names, stored before the export: the
@@ -107,7 +113,9 @@ fn a_section_holds_one_snapshot_when_a_writer_lands_between_its_statements() {
             .unwrap();
     })));
 
-    let out = tempfile::tempdir().unwrap().path().join("archive");
+    let out = scion_server::test_support::private_tempdir()
+        .path()
+        .join("archive");
     let manifest = archive::export(&store, data.path(), None, true, &out)
         .unwrap_or_else(|e| panic!("export failed: {e:#}"));
     archive::set_section_hook(None);
@@ -122,17 +130,23 @@ fn a_section_holds_one_snapshot_when_a_writer_lands_between_its_statements() {
     assert!(damages.is_empty(), "{damages:?}");
 
     // And a restore replays it into an empty store with a clean fsck.
-    let restored_dir = tempfile::tempdir().unwrap();
-    let report = archive::restore(&out, restored_dir.path(), None, None).unwrap();
+    let restored_dir = scion_server::test_support::private_tempdir();
+    let report = archive::restore(
+        &out,
+        restored_dir.path(),
+        &url_of(restored_dir.path()),
+        None,
+    )
+    .unwrap();
     assert_eq!(report.repos, vec![REPO]);
-    let restored = Backend::open(restored_dir.path(), None, None).unwrap();
+    let restored = Backend::open(restored_dir.path(), &url_of(restored_dir.path()), None).unwrap();
     let problems = fsck::run(&restored, fsck::BATCH, &mut |_| {}).unwrap();
     assert!(problems.problems.is_empty(), "{problems:?}");
 }
 
 #[test]
 fn an_export_beside_a_writer_verifies_and_restores_resolving_main() {
-    let data = tempfile::tempdir().unwrap();
+    let data = scion_server::test_support::private_tempdir();
     let (store, snapshot_main) = source(data.path());
 
     // A writer lands more changesets on `dev` while the export runs: the
@@ -163,7 +177,9 @@ fn an_export_beside_a_writer_verifies_and_restores_resolving_main() {
         }
     });
 
-    let out = tempfile::tempdir().unwrap().path().join("archive");
+    let out = scion_server::test_support::private_tempdir()
+        .path()
+        .join("archive");
     let manifest = match archive::export(&store, data.path(), None, true, &out) {
         Ok(manifest) => manifest,
         Err(e) => panic!("export failed: {e:#}"),
@@ -180,10 +196,16 @@ fn an_export_beside_a_writer_verifies_and_restores_resolving_main() {
     // A restore into an EMPTY data directory: the same refs, the same
     // generations, a clean fsck, and a main that resolves to what the
     // snapshot read.
-    let restored_dir = tempfile::tempdir().unwrap();
-    let report = archive::restore(&out, restored_dir.path(), None, None).unwrap();
+    let restored_dir = scion_server::test_support::private_tempdir();
+    let report = archive::restore(
+        &out,
+        restored_dir.path(),
+        &url_of(restored_dir.path()),
+        None,
+    )
+    .unwrap();
     assert_eq!(report.repos, vec![REPO]);
-    let restored = Backend::open(restored_dir.path(), None, None).unwrap();
+    let restored = Backend::open(restored_dir.path(), &url_of(restored_dir.path()), None).unwrap();
     let problems = fsck::run(&restored, fsck::BATCH, &mut |_| {}).unwrap();
     assert!(problems.problems.is_empty(), "{problems:?}");
     let repo = restored.read(|c| c.repo_id(REPO)).unwrap();
@@ -212,9 +234,11 @@ fn an_export_beside_a_writer_verifies_and_restores_resolving_main() {
 
 #[test]
 fn a_verify_names_a_blob_whose_bytes_someone_corrupted() {
-    let data = tempfile::tempdir().unwrap();
+    let data = scion_server::test_support::private_tempdir();
     let (store, _main) = source(data.path());
-    let out = tempfile::tempdir().unwrap().path().join("archive");
+    let out = scion_server::test_support::private_tempdir()
+        .path()
+        .join("archive");
     archive::export(&store, data.path(), Some(REPO), false, &out).unwrap();
     drop(store);
 
@@ -232,8 +256,8 @@ fn a_verify_names_a_blob_whose_bytes_someone_corrupted() {
         damages[0].contains(&BlobId::of(b"b").to_string()),
         "{damages:?}"
     );
-    let empty = tempfile::tempdir().unwrap();
-    match archive::restore(&out, empty.path(), None, None) {
+    let empty = scion_server::test_support::private_tempdir();
+    match archive::restore(&out, empty.path(), &url_of(empty.path()), None) {
         Err(scion_server::Error::Corrupt(why)) => {
             assert!(why.contains("not sound"), "{why}");
         }
@@ -245,9 +269,11 @@ fn a_verify_names_a_blob_whose_bytes_someone_corrupted() {
 fn a_manifest_name_that_escapes_the_archive_is_refused() {
     // The archive is input from outside the server: a repo name the
     // manifest holds must be one path component before it ever joins one.
-    let data = tempfile::tempdir().unwrap();
+    let data = scion_server::test_support::private_tempdir();
     let (store, _main) = source(data.path());
-    let out = tempfile::tempdir().unwrap().path().join("archive");
+    let out = scion_server::test_support::private_tempdir()
+        .path()
+        .join("archive");
     archive::export(&store, data.path(), Some(REPO), false, &out).unwrap();
     drop(store);
     let manifest_path = out.join("manifest.json");
@@ -264,8 +290,8 @@ fn a_manifest_name_that_escapes_the_archive_is_refused() {
             Err(other) => panic!("expected Corrupt for {name:?}, got {other:?}"),
             Ok(damages) => panic!("expected a refusal for {name:?}, got {damages:?}"),
         }
-        let empty = tempfile::tempdir().unwrap();
-        match archive::restore(&out, empty.path(), None, None) {
+        let empty = scion_server::test_support::private_tempdir();
+        match archive::restore(&out, empty.path(), &url_of(empty.path()), None) {
             Err(scion_server::Error::Corrupt(why)) => {
                 assert!(why.contains(name), "{why}");
             }
@@ -279,9 +305,11 @@ fn a_blob_file_that_expands_past_the_cap_is_refused() {
     // A decompression bomb: a tiny zstd frame whose content is far past
     // the server's cap for one blob. The reader refuses it without
     // holding the expansion.
-    let data = tempfile::tempdir().unwrap();
+    let data = scion_server::test_support::private_tempdir();
     let (store, _main) = source(data.path());
-    let out = tempfile::tempdir().unwrap().path().join("archive");
+    let out = scion_server::test_support::private_tempdir()
+        .path()
+        .join("archive");
     archive::export(&store, data.path(), Some(REPO), false, &out).unwrap();
     drop(store);
     // Pick a member, and replace its file with a frame of zeros that is
@@ -306,8 +334,8 @@ fn a_blob_file_that_expands_past_the_cap_is_refused() {
         damages.iter().any(|d| d.contains("expands past the cap")),
         "{damages:?}"
     );
-    let empty = tempfile::tempdir().unwrap();
-    match archive::restore(&out, empty.path(), None, None) {
+    let empty = scion_server::test_support::private_tempdir();
+    match archive::restore(&out, empty.path(), &url_of(empty.path()), None) {
         Err(scion_server::Error::Corrupt(why)) => {
             assert!(why.contains("not sound"), "{why}");
         }
@@ -323,11 +351,13 @@ fn data_path_of(archive: &Path, id: BlobId) -> std::path::PathBuf {
 
 #[test]
 fn a_restore_refuses_a_data_directory_that_already_holds_a_store() {
-    let data = tempfile::tempdir().unwrap();
+    let data = scion_server::test_support::private_tempdir();
     let (store, _main) = source(data.path());
-    let out = tempfile::tempdir().unwrap().path().join("archive");
+    let out = scion_server::test_support::private_tempdir()
+        .path()
+        .join("archive");
     archive::export(&store, data.path(), Some(REPO), false, &out).unwrap();
-    match archive::restore(&out, data.path(), None, None) {
+    match archive::restore(&out, data.path(), &url_of(data.path()), None) {
         Err(scion_server::Error::FailedPrecondition(why)) => {
             assert!(why.contains("already holds a store"), "{why}");
         }
@@ -337,9 +367,9 @@ fn a_restore_refuses_a_data_directory_that_already_holds_a_store() {
 
 #[test]
 fn an_export_refuses_an_out_that_exists_and_a_repo_that_is_not_stored() {
-    let data = tempfile::tempdir().unwrap();
+    let data = scion_server::test_support::private_tempdir();
     let (store, _main) = source(data.path());
-    let out_dir = tempfile::tempdir().unwrap();
+    let out_dir = scion_server::test_support::private_tempdir();
     let out = out_dir.path().join("archive");
     match archive::export(&store, data.path(), None, false, &out) {
         Err(scion_server::Error::InvalidArgument(why)) => {
@@ -354,7 +384,7 @@ fn an_export_refuses_an_out_that_exists_and_a_repo_that_is_not_stored() {
         }
         other => panic!("expected FailedPrecondition, got {other:?}"),
     }
-    let out_dir = tempfile::tempdir().unwrap();
+    let out_dir = scion_server::test_support::private_tempdir();
     match archive::export(
         &store,
         data.path(),
@@ -371,9 +401,11 @@ fn an_export_refuses_an_out_that_exists_and_a_repo_that_is_not_stored() {
 fn a_verify_names_a_changeset_a_ref_points_past() {
     // A ref whose target the changeset stream does not hold: exactly the
     // torn-snapshot case the one-read rule exists for.
-    let data = tempfile::tempdir().unwrap();
+    let data = scion_server::test_support::private_tempdir();
     let (store, _main) = source(data.path());
-    let out = tempfile::tempdir().unwrap().path().join("archive");
+    let out = scion_server::test_support::private_tempdir()
+        .path()
+        .join("archive");
     archive::export(&store, data.path(), Some(REPO), false, &out).unwrap();
     drop(store);
     let path = out.join("repos").join(REPO).join("refs.json");
@@ -398,13 +430,39 @@ fn snapshot_main_hex(archive: &Path) -> String {
     value[0]["target"].as_str().expect("a target").to_owned()
 }
 
+/// The manifest's counts are the archive's own summary, and the format
+/// doc's table says what each one means: totals over the archive. An
+/// operator reads them without the store's code, so they must be the
+/// sums the sections hold - not a running arithmetic the export could
+/// get wrong on its way through the sections.
+#[test]
+fn the_manifest_counts_what_the_sections_hold() {
+    let data = scion_server::test_support::private_tempdir();
+    let (store, _main) = source(data.path());
+    let out = scion_server::test_support::private_tempdir()
+        .path()
+        .join("archive");
+    archive::export(&store, data.path(), Some(REPO), false, &out).unwrap();
+    drop(store);
+    let value: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(out.join("manifest.json")).unwrap()).unwrap();
+    let counts = &value["counts"];
+    assert_eq!(counts["repos"], 1, "the one repo the archive holds");
+    assert_eq!(counts["changesets"], 3, "main's three changesets");
+    assert_eq!(counts["refs"], 1, "main's one ref");
+    assert_eq!(counts["pending_lands"], 0, "no land was pending");
+    assert_eq!(counts["blobs"], 3, "main's three blobs");
+}
+
 #[test]
 fn a_changeset_a_parent_points_past_is_named() {
     // Drop a middle changeset's record from the stream: its child names
     // a parent the archive does not hold, and verify names it.
-    let data = tempfile::tempdir().unwrap();
+    let data = scion_server::test_support::private_tempdir();
     let (store, _main) = source(data.path());
-    let out = tempfile::tempdir().unwrap().path().join("archive");
+    let out = scion_server::test_support::private_tempdir()
+        .path()
+        .join("archive");
     archive::export(&store, data.path(), Some(REPO), false, &out).unwrap();
     drop(store);
     // Rewrite the stream without the record whose generation is 2.
@@ -440,9 +498,11 @@ fn a_changeset_a_parent_points_past_is_named() {
 #[cfg(target_os = "macos")]
 #[test]
 fn an_archive_naming_two_repos_that_fold_to_one_is_refused() {
-    let data = tempfile::tempdir().unwrap();
+    let data = scion_server::test_support::private_tempdir();
     let (store, _main) = source(data.path());
-    let out = tempfile::tempdir().unwrap().path().join("archive");
+    let out = scion_server::test_support::private_tempdir()
+        .path()
+        .join("archive");
     archive::export(&store, data.path(), None, true, &out).unwrap();
     drop(store);
 
@@ -466,8 +526,8 @@ fn an_archive_naming_two_repos_that_fold_to_one_is_refused() {
             .any(|d| d.contains("MAIN") && d.contains("fold")),
         "verify must name the folded pair: {damages:?}"
     );
-    let empty = tempfile::tempdir().unwrap();
-    let restored = archive::restore(&out, empty.path(), None, None);
+    let empty = scion_server::test_support::private_tempdir();
+    let restored = archive::restore(&out, empty.path(), &url_of(empty.path()), None);
     assert!(
         restored.is_err(),
         "a restore that would replay one repo's data under two names must refuse"
@@ -481,9 +541,11 @@ fn an_archive_naming_two_repos_that_fold_to_one_is_refused() {
 /// reader refuses a section that is not a plain directory, on every OS.
 #[test]
 fn a_section_that_is_a_symlink_to_another_is_refused() {
-    let data = tempfile::tempdir().unwrap();
+    let data = scion_server::test_support::private_tempdir();
     let (store, _main) = source(data.path());
-    let out = tempfile::tempdir().unwrap().path().join("archive");
+    let out = scion_server::test_support::private_tempdir()
+        .path()
+        .join("archive");
     archive::export(&store, data.path(), None, true, &out).unwrap();
     drop(store);
 
@@ -510,8 +572,8 @@ fn a_section_that_is_a_symlink_to_another_is_refused() {
             .any(|d| d.contains("linked") && d.contains("not a plain directory")),
         "verify must refuse a section that is a symlink: {damages:?}"
     );
-    let empty = tempfile::tempdir().unwrap();
-    let restored = archive::restore(&out, empty.path(), None, None);
+    let empty = scion_server::test_support::private_tempdir();
+    let restored = archive::restore(&out, empty.path(), &url_of(empty.path()), None);
     assert!(restored.is_err(), "a named damage must refuse the replay");
 }
 
@@ -522,8 +584,12 @@ fn a_section_that_is_a_symlink_to_another_is_refused() {
 #[cfg(target_os = "macos")]
 #[test]
 fn an_export_of_two_repos_that_fold_to_one_is_refused() {
-    let data = tempfile::tempdir().unwrap();
+    let data = scion_server::test_support::private_tempdir();
     let store = Backend::open_test(&data.path().join("store")).unwrap();
+    // The blob is really put: the export copies every member blob, and
+    // a missing blob file would fail the export before the fold ever
+    // gets its turn.
+    let blob = store.blobs().put(b"a").unwrap();
     for name in ["main", "MAIN"] {
         store
             .write(|c| {
@@ -531,15 +597,142 @@ fn an_export_of_two_repos_that_fold_to_one_is_refused() {
                 let cs = changeset(vec![], &[("a", Some(regular("a")))]);
                 let id = tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0;
                 assert!(c.cas_ref(repo, "main", None, id)?);
-                c.add_repo_blob(repo, BlobId::of(b"a"))?;
+                c.add_repo_blob(repo, blob)?;
                 Ok(())
             })
             .unwrap();
     }
-    let out = tempfile::tempdir().unwrap().path().join("archive");
-    let error = archive::export(&store, data.path(), None, true, &out).unwrap_err();
+    let out = scion_server::test_support::private_tempdir()
+        .path()
+        .join("archive");
+    let error = archive::export(&store, &data.path().join("store"), None, true, &out).unwrap_err();
     assert!(
-        error.to_string().contains("fold"),
-        "the export must name the fold: {error:#}"
+        error
+            .to_string()
+            .contains("the repos main and MAIN fold to one directory on this disk"),
+        "the export must name the fold and both names, the first repo the partner: {error:#}"
+    );
+}
+
+/// A section that is a plain file, not a directory and not a symlink:
+/// the reader must name the shape - a section the manifest names has
+/// to be a plain directory - not fall through to a read error that
+/// says only that the section cannot be read.
+#[test]
+fn a_section_that_is_a_plain_file_is_refused() {
+    let data = scion_server::test_support::private_tempdir();
+    let (store, _main) = source(data.path());
+    let out = scion_server::test_support::private_tempdir()
+        .path()
+        .join("archive");
+    archive::export(&store, data.path(), Some(REPO), false, &out).unwrap();
+    drop(store);
+    let section = out.join("repos").join(REPO);
+    std::fs::remove_dir_all(&section).unwrap();
+    std::fs::write(&section, b"not a section\n").unwrap();
+
+    let damages = archive::verify(&out).unwrap();
+    assert!(
+        damages
+            .iter()
+            .any(|d| d.contains(REPO) && d.contains("not a plain directory")),
+        "verify must name the file where a section should be: {damages:?}"
+    );
+    let empty = scion_server::test_support::private_tempdir();
+    let restored = archive::restore(&out, empty.path(), &url_of(empty.path()), None);
+    assert!(restored.is_err(), "a named damage must refuse the replay");
+}
+
+/// The cap's exact edge: the store accepts an object of exactly
+/// `MAX_OBJECT_BYTES`, so the archive holds one, and the reader must
+/// decode it back. A reader that refuses the cap's own edge - the
+/// comparison past the cap, not at it - names a damage in a complete
+/// store, and an archive with the largest legal file fails to restore.
+/// One byte more and the store itself refuses the put.
+#[test]
+fn a_blob_at_the_cap_passes_verify_and_one_past_it_is_refused() {
+    let data = scion_server::test_support::private_tempdir();
+    let store = Backend::open_test(&data.path().join("store")).unwrap();
+    let cap = scion_server::test_support::store::MAX_OBJECT_BYTES;
+    let at_cap = vec![0u8; cap];
+    let blob = store.blobs().put(&at_cap).unwrap();
+    store
+        .write(|c| {
+            let repo = c.create_repo("cap")?;
+            let cs = changeset(
+                vec![],
+                &[(
+                    "the-big-file",
+                    Some(FileState::Regular {
+                        content: blob,
+                        executable: false,
+                    }),
+                )],
+            );
+            let id = tree::store_changeset(c, repo, &cs, &mut |_| Ok(0))?.0;
+            assert!(c.cas_ref(repo, "main", None, id)?);
+            c.add_repo_blob(repo, blob)?;
+            Ok(())
+        })
+        .unwrap();
+    let out = scion_server::test_support::private_tempdir()
+        .path()
+        .join("archive");
+    archive::export(&store, &data.path().join("store"), None, true, &out).unwrap();
+
+    // One byte more: the store's own guard refuses the put, so the
+    // archive can never hold it.
+    let past = vec![0u8; cap + 1];
+    let refused = store.blobs().put(&past);
+    assert!(
+        refused.is_err(),
+        "the store must refuse an object past the cap"
+    );
+    drop(store);
+
+    let damages = archive::verify(&out).unwrap();
+    assert!(
+        damages.is_empty(),
+        "the cap's own edge is sound: {damages:?}"
+    );
+}
+
+/// A member line that is hex but the wrong length: an ID's hex is
+/// always 64 chars, and a line one longer parses, under a shape check
+/// that only refuses when both the length and the alphabet are wrong,
+/// to the same ID the first 64 chars spell - the archive would verify
+/// with a malformed members file. The shape check refuses either
+/// wrongness on its own.
+#[test]
+fn a_members_line_of_the_wrong_length_is_refused() {
+    let data = scion_server::test_support::private_tempdir();
+    let (store, _main) = source(data.path());
+    let out = scion_server::test_support::private_tempdir()
+        .path()
+        .join("archive");
+    archive::export(&store, data.path(), Some(REPO), false, &out).unwrap();
+    drop(store);
+    let members = out.join("repos").join(REPO).join("members.txt");
+    let text = std::fs::read_to_string(&members).unwrap();
+    let tampered: String = text
+        .lines()
+        .map(|line| {
+            if line.len() == 64 {
+                format!("{line}0")
+            } else {
+                line.to_owned()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    std::fs::write(&members, tampered).unwrap();
+
+    // The shape refusal is hard: the reader fails, it does not name a
+    // damage - an archive whose member lines are not blob IDs is not
+    // readable at all.
+    let error = archive::verify(&out).unwrap_err();
+    assert!(
+        error.to_string().contains("not a blob ID"),
+        "verify must refuse a member line that is not a blob ID: {error:#}"
     );
 }

@@ -6,34 +6,39 @@
 #![forbid(unsafe_code)]
 
 use std::path::Path;
+use std::time::Duration;
 
-use super::{
-    Backend, BackendTx, Inner, Marker, PG_READERS, Store, marker_agrees, refuse_damaged_marker,
-    refuse_postgres_marker, refuse_sqlite_dir,
-};
+use super::{Backend, Marker, marker_agrees, refuse_damaged_marker, refuse_sqlite_dir};
 use crate::error::Result;
-use crate::pg::Pg;
+#[cfg(any(test, feature = "test-hooks"))]
+use crate::pg::test_hooks::TEST_SCHEMA_PREFIX;
+use crate::pg::{Pg, map_pg_error};
+
+/// The reader-pool size of a test backend. Tests run many backends at
+/// once - the lib suite runs its tests on threads, and each backend
+/// holds one write connection plus its readers - so the pool is far
+/// under the server's [`READERS`](crate::store::READERS): a pool of the
+/// server's size saturates the test database's `max_connections` before
+/// the suite finishes (E53300, "too many clients").
+const PG_TEST_READERS: usize = 2;
 
 impl Backend {
-    /// A backend on the data directory's own store, for the crate's
-    /// tests: they prepare a store (a walk cap, a page cap) and then
-    /// wrap it.
+    /// Runs the stale-schema sweep out of band, without the
+    /// once-per-process gate: the run's own sweep runs once, at the
+    /// first test open; a test calls this to run the sweep again
+    /// against a database it shaped. It waits for the cleanup lock,
+    /// and answers the schemas it dropped and the eligible ones it
+    /// left for a later sweep.
+    ///
+    /// # Errors
+    ///
+    /// A missing test URL, or what the database returns.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn sqlite(store: Store) -> Self {
-        Self {
-            inner: Inner::Sqlite(store),
-        }
+    pub fn sweep_stale_test_schemas() -> Result<(usize, usize)> {
+        crate::pg::test_hooks::sweep_stale_test_schemas(&test_url()?)
     }
-    /// The data directory's own store, when this backend is one.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    pub(crate) fn as_sqlite(&self) -> Option<&Store> {
-        match &self.inner {
-            Inner::Sqlite(store) => Some(store),
-            Inner::Postgres(_) => None,
-        }
-    }
+
     /// The advisory-lock key of the test schema's one-server lock, for
     /// the test that takes the lock from its own connection, as a
     /// second server process would.
@@ -42,28 +47,53 @@ impl Backend {
     pub fn test_server_lock(data: &Path) -> Result<i64> {
         Ok(crate::pg::schema_lock_key(&test_schema(data)))
     }
-    /// [`Backend::open_test`], as a process that does not land: on the
-    /// data directory this is a shared [`Store`](crate::store::Store).
+    /// The advisory-lock key of the test schema's migrations, for the
+    /// test that takes it from its own connection, as a wedged
+    /// migration would.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_migration_lock(data: &Path) -> Result<i64> {
+        Ok(crate::pg::migration_lock_key(&test_schema(data)))
+    }
+    /// The database's bare migration key, which an older build takes
+    /// exclusive: a test holds it to stand in for an older migrator
+    /// mid-migration.
+    #[doc(hidden)]
+    #[must_use]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_bare_migration_lock() -> i64 {
+        crate::pg::SCHEMA_LOCK
+    }
+    /// The migration key of a schema name, for the test that pins the
+    /// key spaces apart.
+    #[doc(hidden)]
+    #[must_use]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_migration_lock_for(schema: &str) -> i64 {
+        crate::pg::migration_lock_key(schema)
+    }
+    /// The one-server key of a schema name, for the same pin.
+    #[doc(hidden)]
+    #[must_use]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_server_lock_for(schema: &str) -> i64 {
+        crate::pg::schema_lock_key(schema)
+    }
+    /// A test backend of `data`, as a process that does not land: it
+    /// takes no one-server lock, like an import beside a server.
     ///
     /// # Errors
     ///
-    /// What the store or the database returns, and a missing test URL.
+    /// What the database returns, and a missing test URL.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn open_test_shared(data: &Path) -> Result<Self> {
-        if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
-            refuse_damaged_marker(data)?;
-            let marker = Marker::read(data);
-            refuse_sqlite_dir(data)?;
-            let pg =
-                Pg::open_test_shared(&test_url()?, &test_schema(data), PG_READERS, data, marker)?;
-            marker_agrees(data, pg.store_uuid())?;
-            return Ok(Self {
-                inner: Inner::Postgres(pg),
-            });
-        }
-        refuse_postgres_marker(data)?;
-        Self::open_shared(data, None, None)
+        Self::open_test_in_schema_with(
+            data,
+            &test_schema(data),
+            PG_TEST_READERS,
+            Pg::open_test_shared,
+        )
     }
     /// [`Backend::open_test_shared`], for a store the suite reopens from
     /// another path than the one its first open used: the power suite
@@ -73,62 +103,202 @@ impl Backend {
     ///
     /// # Errors
     ///
-    /// What the store or the database returns, and a missing test URL.
+    /// What the database returns, and a missing test URL.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn open_test_shared_in_schema(data: &Path, schema: &str) -> Result<Self> {
-        if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
-            refuse_damaged_marker(data)?;
-            let marker = Marker::read(data);
-            refuse_sqlite_dir(data)?;
-            let pg = Pg::open_test_shared(&test_url()?, schema, PG_READERS, data, marker)?;
-            marker_agrees(data, pg.store_uuid())?;
-            return Ok(Self {
-                inner: Inner::Postgres(pg),
-            });
-        }
-        refuse_postgres_marker(data)?;
-        Self::open_shared(data, None, None)
+        Self::open_test_in_schema_with(data, schema, PG_TEST_READERS, Pg::open_test_shared)
     }
-    /// Opens the backend that `SCION_TEST_BACKEND` names, for the
-    /// integration tests: `postgres` runs them against a Postgres database,
-    /// whose URL comes from `SCION_TEST_POSTGRES_URL`; any other value, or
-    /// none, opens the data directory. The URL is never logged.
+    /// Makes an existing test data directory private, as the operator's
+    /// `chmod 700` does: the tests pre-create their directories with the
+    /// process umask, and the open refuses one that other users can reach.
+    /// The refusal tests set the open modes after this runs, so they still
+    /// exercise it.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn ensure_private_dir(data: &Path) {
+        use std::os::unix::fs::PermissionsExt as _;
+        // A fresh open makes the data directory it names: the first open
+        // on a new host writes its marker into a directory that exists.
+        if !data.exists() {
+            let _ = scion_proto::runtime::auth::create_private_dir_all(data);
+            return;
+        }
+        if data.is_dir() {
+            let _ = std::fs::set_permissions(data, std::fs::Permissions::from_mode(0o700));
+        }
+    }
+
+    /// Opens a test backend on `data`, with the reader pool the suite
+    /// runs: far under the server's pool, so the test database's
+    /// `max_connections` holds.
     ///
     /// # Errors
     ///
-    /// What the store or the database returns, and a missing test URL.
+    /// What the database returns, and a missing test URL.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn open_test(data: &Path) -> Result<Self> {
-        if std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres") {
-            refuse_damaged_marker(data)?;
-            let marker = Marker::read(data);
-            refuse_sqlite_dir(data)?;
-            let pg = Pg::open_test(&test_url()?, &test_schema(data), PG_READERS, data, marker)?;
-            marker_agrees(data, pg.store_uuid())?;
-            return Ok(Self {
-                inner: Inner::Postgres(pg),
-            });
-        }
-        refuse_postgres_marker(data)?;
-        Self::open(data, None, None)
+        Self::open_test_with_readers(data, PG_TEST_READERS)
     }
-    /// Whether `SCION_TEST_BACKEND` names Postgres. A test that asserts the
-    /// rows of the data directory's database skips itself on Postgres: its
-    /// assertions are about the SQLite schema, which the schema drift test
-    /// covers for Postgres.
+
+    /// Sets the test's own short cleanup-lock bound, in seconds, so the
+    /// red proof of the bound stays fast; 0 restores the const's. The
+    /// caller holds the override until it sets 0 back - drop a guard.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    pub fn test_is_postgres() -> bool {
-        std::env::var("SCION_TEST_BACKEND").as_deref() == Ok("postgres")
+    pub fn set_clean_lock_wait_secs(secs: u64) {
+        crate::pg::test_hooks::set_clean_lock_wait_for_test(secs);
+    }
+
+    /// [`Backend::open_test`], with the reader pool the caller names: the
+    /// tests of a pool's cap need the server's pool size, while the rest
+    /// of the suite runs far under it so the test database's
+    /// `max_connections` holds.
+    ///
+    /// # Errors
+    ///
+    /// As [`Backend::open_test`].
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn open_test_with_readers(data: &Path, readers: usize) -> Result<Self> {
+        Self::open_test_in_schema_with(data, &test_schema(data), readers, Pg::open_test)
+    }
+
+    /// [`Backend::open_test`], after a drop of a store on the same
+    /// directory: the one-server lock rides the dropped store's write
+    /// connection, and the worker thread closes that connection after
+    /// the drop has returned. Until the session ends, the database
+    /// answers "another server holds this store". This reopen retries
+    /// that one error for a short bound and returns the last result, so
+    /// a test that drops and reopens at once waits for the real
+    /// condition instead of racing the worker's clock.
+    ///
+    /// # Errors
+    ///
+    /// What [`Backend::open_test`] returns: any error that is not the
+    /// holder message at once, and the holder message if no reopen
+    /// succeeds within the bound.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn reopen_test(data: &Path) -> Result<Self> {
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
+        loop {
+            match Self::open_test(data) {
+                Err(crate::error::Error::FailedPrecondition(message))
+                    if message.contains(crate::pg::HOLDER_MESSAGE)
+                        && std::time::Instant::now() < deadline =>
+                {
+                    std::thread::sleep(Duration::from_millis(20));
+                }
+                result => return result,
+            }
+        }
+    }
+
+    /// [`Backend::open_test`], with the opener chosen: the one seam the
+    /// open shapes share.
+    fn open_test_in_schema_with(
+        data: &Path,
+        schema: &str,
+        readers: usize,
+        open: impl FnOnce(&str, &str, usize, &Path, Marker) -> Result<Pg>,
+    ) -> Result<Self> {
+        Self::ensure_private_dir(data);
+        refuse_damaged_marker(data)?;
+        let marker = Marker::read(data);
+        refuse_sqlite_dir(data)?;
+        let pg = open(&test_url()?, schema, readers, data, marker)?;
+        marker_agrees(data, pg.store_uuid())?;
+        Ok(Self { pg })
+    }
+
+    /// [`Backend::open_test`], with the derive walks built for `walks`
+    /// in flight and `walk_bytes` of shared budget, for the tests of the
+    /// walk caps. The flights are built before the backend opens:
+    /// production types stay immutable.
+    ///
+    /// # Errors
+    ///
+    /// What `open_test` returns.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn open_test_with_walks(
+        data: &Path,
+        walks: usize,
+        walk_bytes: crate::memory::Bytes,
+    ) -> Result<Self> {
+        Self::ensure_private_dir(data);
+        let flights = crate::derived::DeriveFlights::with_walk_bytes(walks, walk_bytes);
+        refuse_damaged_marker(data)?;
+        let marker = Marker::read(data);
+        refuse_sqlite_dir(data)?;
+        let pg = Pg::open_test_shared_with_flights(
+            &test_url()?,
+            &test_schema(data),
+            PG_TEST_READERS,
+            data,
+            marker,
+            flights,
+        )?;
+        marker_agrees(data, pg.store_uuid())?;
+        Ok(Self { pg })
+    }
+
+    /// The backend's write-yield, for the yield-bound test: the wait a
+    /// derivation step runs, through the backend the step runs on.
+    /// Named apart from the crate-internal method it calls.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn yield_to_writers(
+        &self,
+        deadline: Option<&crate::deadline::Deadline>,
+    ) -> crate::error::Result<()> {
+        Backend::wait_for_writers(self, deadline)
+    }
+
+    /// The URL a server, an import or a restore on `data` takes: the
+    /// test database, with the data directory's own schema as the
+    /// search path, which this creates first. The name is the one
+    /// [`Backend::open_test`] gives the same directory, so a pre-seeded
+    /// store and the process that serves it share one schema.
+    ///
+    /// # Errors
+    ///
+    /// A missing test URL.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_postgres_url(data: &Path) -> Result<String> {
+        // The connect is one blocking call at setup; some callers run
+        // inside an async runtime, and the client blocks its own thread,
+        // so the call runs on a thread of its own to stay out of the
+        // runtime's way.
+        let data = data.to_path_buf();
+        std::thread::spawn(move || {
+            let url = test_url()?;
+            let schema = test_schema(&data);
+            let dir = canonical_test_dir(&data);
+            let mut client =
+                postgres::Client::connect(&url, postgres::NoTls).map_err(map_pg_error)?;
+            client
+                .batch_execute(&format!("CREATE SCHEMA IF NOT EXISTS {schema}"))
+                .map_err(map_pg_error)?;
+            // Register the schema and record the directory in its
+            // comment, exactly as an open does: a store opened through
+            // this URL leaves a schema the sweep can name and decide
+            // about, not an orphan the registry never saw.
+            crate::pg::test_hooks::register_test_schema(&mut client, &schema, &dir)
+                .map_err(map_pg_error)?;
+            let sep = if url.contains('?') { '&' } else { '?' };
+            Ok(format!("{url}{sep}options=--search_path%3D{schema}"))
+        })
+        .join()
+        .expect("the URL helper never panics")
     }
 
     /// The Postgres statements this process has run since the last
     /// reset. The land round-trip guard measures the delta around one
-    /// land; on SQLite the count is always zero, which is why the guard
-    /// skips there.
+    /// land.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
@@ -146,8 +316,7 @@ impl Backend {
     /// The body fetches the gc's prune made since the last reset: one
     /// call to `stored_changeset_bodies` is one fetch. A test with a
     /// small byte budget asserts this is more than one, so the prune
-    /// really goes through the byte-budget chunker. Backend-neutral:
-    /// the counter sits at the gc's call site.
+    /// really goes through the byte-budget chunker.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
@@ -187,84 +356,77 @@ impl Backend {
     pub fn test_statement_log() -> Vec<String> {
         crate::pg::test_statement_log()
     }
-    /// The schema that [`Backend::open_test`] gave this data directory on
-    /// Postgres: a test that counts rows through its own Postgres client
-    /// names it the same way. A result, so the callers unwrap one shape.
-    /// The schema a test backend of this directory uses, when the tests
-    /// run on Postgres. Hidden: a test holds a lock in it from a
-    /// connection of its own.
+
+    /// The readers this backend has taken since the last reset. A walk
+    /// that holds one transaction takes one reader, whatever it steps.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
-    pub fn test_schema(data: &Path) -> Option<String> {
-        if Self::test_is_postgres() {
-            Some(test_schema(data))
-        } else {
-            None
-        }
+    pub fn test_reader_takes(&self) -> u64 {
+        crate::pg::test_reader_takes()
     }
-    /// Write transactions run so far. SQLite only.
+
+    /// Sets the reader-take count back to zero.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub fn test_reset_reader_takes() {
+        crate::pg::test_reset_reader_takes();
+    }
+
+    /// How many of this backend's readers sit idle in its pool. A walk
+    /// that leaked its transaction leaves the pool short.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn test_idle_readers(&self) -> usize {
+        crate::pg::test_idle_readers(&self.pg)
+    }
+    /// The schema that [`Backend::open_test`] gave this data directory:
+    /// a test that counts rows through its own Postgres client names it
+    /// the same way. A test holds a lock in it from a connection of its
+    /// own.
+    #[doc(hidden)]
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub fn test_schema(data: &Path) -> String {
+        test_schema(data)
+    }
+    /// Write transactions run so far: the tests of the batching watch
+    /// the count.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn txes(&self) -> u64 {
-        match &self.inner {
-            Inner::Sqlite(store) => store.txes(),
-            Inner::Postgres(_) => 0,
-        }
+        self.pg.txes()
     }
-    /// Commits made so far. SQLite only: it counts the transactions of the
-    /// write connection, which is what the tests of the batching watch.
+    /// Commits made so far: the transactions of the write connection.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     pub fn commits(&self) -> u64 {
-        match &self.inner {
-            Inner::Sqlite(store) => store.commits(),
-            Inner::Postgres(_) => 0,
-        }
+        self.pg.commits()
     }
-    /// The commit count a completed flush last covered, so every commit
-    /// below it is durable. SQLite only: a Postgres commit is durable when
-    /// it returns (`synchronous_commit = on`).
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    pub fn flushed_upto(&self) -> u64 {
-        match &self.inner {
-            Inner::Sqlite(store) => store.flushed_upto(),
-            Inner::Postgres(_) => u64::MAX,
-        }
-    }
-    /// Sets how many of the next commits of the data directory fail as a
-    /// busy database. A Postgres database has no busy error, so this only
-    /// reaches SQLite.
+    /// Sets how many of the next commits fail as a busy database: the
+    /// transaction ran and rolled back, so the retry re-runs it whole.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     pub fn fail_next_commits(&self, n: u32) {
-        if let Inner::Sqlite(store) = &self.inner {
-            store.fail_next_commits(n);
-        }
+        self.pg.fail_next_commits(n);
     }
-    /// Sets how long the write connection of the data directory waits for
-    /// a busy database.
+    /// Sets how many of the next commits fail as a database out of
+    /// space: the transaction ran and rolled back, so the retry re-runs
+    /// it whole. The audit's why reads disk_full, not busy.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
-    pub fn set_busy_timeout(&self, timeout: std::time::Duration) {
-        if let Inner::Sqlite(store) = &self.inner {
-            store.set_busy_timeout(timeout);
-        }
+    pub fn fail_next_commits_disk_full(&self, n: u32) {
+        self.pg.fail_next_commits_disk_full(n);
     }
-    /// The import's test hooks and busy-retry count, the same state on
-    /// both backends.
+    /// The import's test hooks and busy-retry count.
     #[doc(hidden)]
     #[cfg(any(test, feature = "test-hooks"))]
     #[must_use]
     fn hooks(&self) -> &crate::store::test_hooks::ImportHooks {
-        match &self.inner {
-            Inner::Sqlite(store) => store.hooks(),
-            Inner::Postgres(pg) => pg.hooks(),
-        }
+        self.pg.hooks()
     }
     /// Sets the step the tests run after each batch of the import commits.
     #[doc(hidden)]
@@ -294,22 +456,6 @@ impl Backend {
     }
 }
 
-impl BackendTx<'_> {
-    /// The connection of the data directory, for a test that asserts its
-    /// rows. [`None`] on Postgres, whose rows a test reads through the
-    /// [`MetaTx`] queries.
-    #[doc(hidden)]
-    #[cfg(any(test, feature = "test-hooks"))]
-    #[must_use]
-    pub fn sqlite(&self) -> Option<&rusqlite::Connection> {
-        match self {
-            // SqliteTx derefs to the connection.
-            Self::Sqlite(tx) => Some(tx),
-            Self::Postgres(_) => None,
-        }
-    }
-}
-
 /// The URL of the test database. Its callers sit behind the test-hooks
 /// feature, and so does this.
 #[cfg(any(test, feature = "test-hooks"))]
@@ -326,13 +472,27 @@ pub(crate) fn test_url() -> Result<String> {
 /// test-hooks feature, and so does this.
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) fn test_schema(data: &Path) -> String {
+    let path = canonical_test_dir(data);
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    std::hash::Hash::hash(&path, &mut hasher);
+    format!(
+        "{TEST_SCHEMA_PREFIX}{:016x}",
+        std::hash::Hasher::finish(&hasher)
+    )
+}
+
+/// The canonical form `test_schema` hashes, spelled the same way the
+/// schema's comment records it: the canonical form of the deepest
+/// existing ancestor, with the missing tail spelled as the caller
+/// spelled it. A first open of a data directory that does not exist yet
+/// and every open after the directory exists see one name.
+#[cfg(any(test, feature = "test-hooks"))]
+fn canonical_test_dir(data: &Path) -> std::path::PathBuf {
     // The hash must not move when the leaf directory appears: a first
     // open of a data directory that does not exist yet would otherwise
     // hash the raw path (on macOS /var is a symlink to /private/var, so
     // the raw and the canonical spellings hash apart), and every open
-    // after the directory exists would hash the canonical one. The
-    // canonical form of the deepest existing ancestor, with the missing
-    // tail spelled as the caller spelled it, is one name for both.
+    // after the directory exists would hash the canonical one.
     let mut tail: Vec<std::ffi::OsString> = Vec::new();
     let mut cur = data.to_path_buf();
     let base = loop {
@@ -348,8 +508,15 @@ pub(crate) fn test_schema(data: &Path) -> String {
         }
     };
     let tail: std::path::PathBuf = tail.into_iter().rev().collect();
-    let path = base.join(tail);
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    std::hash::Hash::hash(&path, &mut hasher);
-    format!("scion_test_{:016x}", std::hash::Hasher::finish(&hasher))
+    base.join(tail)
+}
+
+/// Arms the marker write's directory fsync of `data` to fail with EIO,
+/// once: the next open that writes `data`'s marker must refuse with the
+/// disk's error. The store's own fsync gate cannot carry this hook: the
+/// marker writes before any store exists to arm.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn fail_marker_dir_fsync(data: &Path) {
+    super::arm_marker_dir_fsync_failure(data);
 }

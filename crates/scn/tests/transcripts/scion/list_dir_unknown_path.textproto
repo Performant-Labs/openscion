@@ -1,0 +1,11 @@
+# A directory the snapshot does not hold is NOT_FOUND.
+since: v0.1
+method: Scion/ListDir
+fixture: landed
+
+request.repo: r
+request.changeset_id: $cs
+request.path: no/such/dir
+
+status: not_found
+message: path "no/such/dir" not found

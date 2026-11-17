@@ -17,9 +17,9 @@ proposal ([`design/scalable-backend.md`](design/scalable-backend.md)).
 |---|---|
 | [`scion-core`](../crates/scion-core) | Object model (`Changeset`, `Tree`, IDs, `RepoPath`) and the v1 encoder and strict decoder. No I/O. |
 | [`scion-proto`](../crates/scion-proto) | gRPC types generated from [`proto/scion.proto`](../proto/scion.proto): the `Scion` and `Objects` services, whose contract is [`protocol-v1.md`](protocol-v1.md). Largest message 64 MiB, stream chunk 1 MiB; a `GetObjects` reply message holds one part of an object, at most 1 MiB plus its header. Also the code that the server and the tiers share: the bearer-token check (`auth.rs`), how an object travels in parts and encodings (`object.rs`), and the `GetObjects` reply rules (`reply.rs`). |
-| [`scion-server`](../crates/scion-server) | One binary: `serve` (the API), `import` (git import), `fsck`, `gc`, `derive`, `hash-token`, `ticket-key`. |
+| [`scion-server`](../crates/scion-server) | One binary: `serve` (the API), `migrate` (the schema moves), `import` (git import), `create-repo`, `create-ref`, `fsck`, `export`, `verify`, `restore`, `gc`, `derive`, `hash-token`, `ticket-key`. |
 | [`scion-tier`](../crates/scion-tier) | The cache tiers (section 7): a `Tier` library and two binaries, `scion-cache` (memory) and `scion-daemon` (disk, Unix socket). |
-| [`scn`](../crates/scn) | Command-line client: `cat`, `ls`, `log`, `blame`, `show`, `merge-base`, `is-ancestor`, `diff`, `checkout`, `commit`, `land`, `bench`. |
+| [`scn`](../crates/scn) | Command-line client: `cat`, `ls`, `log`, `blame`, `show`, `merge-base`, `is-ancestor`, `diff`, `checkout`, `mount`, `unmount`, `commit`, `land`, `bench`. |
 
 ```mermaid
 flowchart LR
@@ -29,7 +29,7 @@ flowchart LR
         ops --> tree["tree.rs: apply, root trees<br/>graph.rs: commit graph<br/>history.rs: path history<br/>derived.rs: derived data"]
         ops --> db["db.rs, store.rs"]
         tree --> db
-        db --> sqlite[("metadata: SQLite, or Postgres")]
+        db --> pg[("metadata: Postgres")]
         ops --> blobs[("objects/blob: zstd files")]
     end
     git[("git repository")] --> imp["scion-server import"]
@@ -40,8 +40,11 @@ flowchart LR
 How one request flows through the server:
 
 1. The server serves at most 128 connections at once (`--max-connections`).
-   A client beyond that waits, unread, until a connection closes, and the
-   process logs a warning. One connection has at most 256 calls open at
+   A client beyond that is accepted, and waits at most 5 s for another
+   connection to close; if none frees in time, the server closes it and
+   counts it in `scion_connections_refused_total`. At most that many
+   connections wait at once: one over that is closed at once, and counts
+   too. One connection has at most 256 calls open at
    once (`--max-streams`, HTTP/2 `SETTINGS_MAX_CONCURRENT_STREAMS`). Every
    connection closes in time, so a waiting one gets a place:
    - A client that sends no HTTP/2 preface within 20 s of getting its
@@ -53,8 +56,8 @@ How one request flows through the server:
    - After 30 min, the server asks a connection to close (`GOAWAY`). The
      client connects again for new calls. The calls in it get 10 min more
      (at least the 600 s of the longest call), and then the connection is
-     closed. So a connection beyond the cap waits at most 40 min for
-     another to close.
+     closed. So a connection beyond the cap waits at most 5 s for another
+     to close.
 
    Each TCP connection has Nagle's algorithm off, so a small reply does not
    wait for the client's ACK. The tiers share this code
@@ -66,7 +69,7 @@ How one request flows through the server:
    a `Caller`.
 3. `service.rs` (the `Scion` service) or `objects.rs` (the `Objects` service)
    checks names, IDs and paths, then runs `write.rs`, `land.rs`, `read.rs`
-   or `blame.rs` on a blocking thread (SQLite and the blob folder are
+   or `blame.rs` on a blocking thread (the database and the blob folder are
    synchronous). Both services share one bound: at most 256 run at once,
    and at most 4 of them are `Blame` calls. A
    request times out after 600 s; for a streamed reply that covers only its
@@ -112,8 +115,9 @@ with the repository. The full snapshot is derived data (section 4).
 A file state is a regular file (blob and executable flag), a symlink (blob
 that holds the target), or a gitlink (a git commit ID, no blob). Only git
 import sets `committer`, creates a changeset with zero or several parents, or
-creates a repo or a ref. No RPC creates a repo or a ref, so a new repo starts
-with `scion-server import`.
+creates a repo or a ref. No RPC creates a repo or a ref: a new repo starts
+with `scion-server create-repo` (its first ref at the root changeset), or
+with an import, which creates the repo it needs.
 
 ```mermaid
 flowchart LR
@@ -141,22 +145,18 @@ and the decoder rules.
 
 ## 3. Storage
 
-This section describes the SQLite backend: the metadata lives in
-`scion.db` inside one data directory. With `--postgres-url` the server
-keeps the same metadata in a Postgres database instead (same tables, one
-server per database; the Postgres schema is checked against these tables
-by a test), and its rules are in the operations guide
-([`operations.md`](operations.md), "The metadata in Postgres"). The blob
-files stay in the data directory in every backend. What follows is the
-SQLite backend:
+The metadata lives in a Postgres database, at the schema the server's
+URL names (same tables, one server per database), and its rules are in
+the operations
+guide ([`operations.md`](operations.md), "The metadata in Postgres").
+The blob files stay in the data directory:
 
 ```text
-<data>/lock                    shared by every process that uses <data>
 <data>/open.lock               held while a process opens <data>
-<data>/server.lock             held by the one server process
-<data>/scion.db                metadata and trees (SQLite)
+<data>/backend                 names the backend and the store's UUID
 <data>/objects/blob/ab/cd..    one zstd file per blob, named by its ID in hex
-<data>/tmp/                    staging for atomic blob writes and uploads
+<data>/tmp/                    staging for atomic blob writes and uploads,
+                               one folder per process, held with a lock
 ```
 
 **Checking a data directory.** `scion-server --data <dir> fsck` reports the
@@ -172,7 +172,7 @@ it did, 2 when it could not run. Rows of a derived version this build
 does not know are reported as `derived-old`, and are not damage: the
 steps of the kind remove them (section 4).
 
-**SQLite tables** ([`migrations/`](../crates/scion-server/migrations)):
+**Tables** ([`migrations/`](../crates/scion-server/migrations)):
 
 | Table | Holds |
 |---|---|
@@ -188,37 +188,32 @@ steps of the kind remove them (section 4).
 | `derived` | Derived values by (kind, version, changeset), as bytes that each kind encodes. Rebuildable (section 4). |
 | `git_import` | Git commit ID to changeset, per repo, so a re-import skips known commits. |
 
-Trees live in SQLite, not in the blob folder, so a derivation that writes many
-trees commits them in one transaction. The schema version is
-`PRAGMA user_version`. When a database opens, each migration in
-`migrations/` that is newer than its version runs, in order, in its own
-transaction. A released migration never changes. A build refuses a database
-with a newer version. Version 3 lets a derived value have any length; the
-upgrade copies every row. Version 4 adds `repo_blobs`. SQL cannot read the
-blob IDs inside changeset bytes, so the upgrade runs a step in Rust
-(`db::fill_repo_blobs`) in the same transaction: it reads each changeset of
-each repo once and adds the blobs that its changes put. A changeset lists
-every path that differs from its first parent, so these are every blob that
-the repo's trees name. It logs its progress every 10,000 changesets. It is
-one transaction, not resumable: a crash rolls it back, and the next open runs
-it again from its start. A blob uploaded before the upgrade and named by no
-changeset must be uploaded again. Version 5 adds `history_nodes`.
+Trees live in the database, not in the blob folder, so a derivation that
+writes many trees commits them in one transaction. The schema moves only
+when the operator asks: `scion-server migrate`, or `serve --migrate`, runs
+each migration in `migrations/postgres/` that is newer than the database's
+version, in order, in its own transaction. A released migration never
+changes. Every other open refuses a database with a newer version, and one
+that is behind, and names the migrate command. The released schema is 0001
+(the metadata's tables, `repo_blobs` among them), then 0002 adds the
+derived roots' own table, 0003 the derived trees, 0004 the store's UUID,
+0005 the first-parent numbering, 0006 the land's reject reason. There is
+no data-carrying
+upgrade step: `repo_blobs` is created with its rows' table, and a
+database a build cannot migrate to is refused, not rewritten.
 
-**Connections.** Each process has one write connection behind a mutex, and
-8 read-only connections (`store::READERS`). Write transactions use
-`BEGIN IMMEDIATE`. The migrations run on the write connection before the
-read connections open. In WAL mode a read connection reads beside a write, so a
-read never waits for a write, and a long read never makes a write wait.
-`Store::read` takes an idle read connection, or waits for one. It runs
-outside any explicit transaction, so each statement sees its own snapshot:
-every commit that it can see when it starts. A caller that needs one
-consistent view reads it in one statement. (A snapshot held across the
-statements of back-to-back reads would keep the auto-checkpoint from ever
-copying the whole log, so the log would never restart and its file would
-grow.) `Store::read_unflushed` runs
-on the write connection. Writes use it to read what they are about to
-change, under the same lock. The read connections close first, so the write
-connection closes last and moves the log into `scion.db`.
+**Connections.** Each process holds one write connection behind a mutex
+and a pool of read-only clients (at most `store::READERS` at once). The
+schema check runs on the write connection before the readers open; the
+migrations run only when the operator asks (above). A read
+takes an idle read connection, or waits for one; every read runs in one
+transaction at repeatable read (`pg.rs` opens it with `BEGIN TRANSACTION
+ISOLATION LEVEL REPEATABLE READ READ ONLY`), so its statements see one
+snapshot of the database. Writes that must read what they are
+about to change run on the write connection, under the same lock. The
+database is fenced: the first open takes the one-server advisory lock, and
+a process that loses it stops answering (the operations guide, "The
+metadata in Postgres").
 
 **Blob folder.** One zstd file per blob, at most 100 MiB uncompressed. A write
 goes to a temp file in `tmp/`, is flushed, and is renamed into place. The zstd
@@ -253,91 +248,59 @@ lock is per process: an import shares the data directory with a server, and
 its writes go through their own stripes. `fsync_dir` covers the rename's
 directory entry.
 
-**Durability rules** (the SQLite backend; on Postgres a returned commit
-is durable: `synchronous_commit=on` is checked at open, so
-`Store::write` returning is the durability point, and the full-flush
-machinery below does not apply).
+**Durability rules.** A metadata commit is durable when the transaction
+returns: every connection runs `synchronous_commit = on`, and the server
+refuses to open a database that turned it off. So a reply that names a
+commit — a ref target from `ResolveRef`, a land state from `GetLand`, a
+tree ID from a derivation — names a commit the database will not lose,
+and the database's own durability rules carry it from there.
 
-- Group commit: concurrent callers share one full drive flush (`F_FULLFSYNC`
-  on macOS). Each caller first makes its writes reach the drive with a plain
-  `fsync`, then waits for a full flush that starts after that, and one
-  waiting caller runs it for all. A failed flush fails every caller that
-  waited for it.
-- A database transaction is durable when `Store::write` returns, or after a
-  later `Store::flush`. WAL with `synchronous = FULL` ends each commit with a
-  plain `fsync`. On macOS that can leave the commit in the drive cache, so
-  `flush` waits for a shared full flush. In the server, SQLite runs no full
-  flush of its own (`fullfsync = OFF`), except in checkpoints
-  (`checkpoint_fullfsync`). An import process is different (below).
-  Elsewhere the commit's `fsync` already flushes the cache. A land waits for
-  the flush after it releases the ref's lock, so queued lands share it.
-- A read waits too. If `Store::read` saw a commit that no full flush covers
-  yet, it waits for one after it gives back its connection. So no reply
-  shows a commit that a power loss can undo, such as a ref target from
-  `ResolveRef` or a land state from `GetLand`. Where `fsync` already flushes
-  the drive cache, no read waits. A land reads with `Store::read_unflushed`,
-  because it flushes before it replies.
-- A read can see a commit before `commit` returns. So each commit is
-  counted twice, under the write lock: in `committing` before its COMMIT
-  runs, and in `committed` after it ends. A read loads `committing` after it
-  ends, so the count covers every commit it saw. A flush covers only
-  `committed`: a commit still in its COMMIT may not have written its log.
-  With `synchronous = FULL`, a commit's log reaches the drive before the
-  commit is visible, so a flush that starts after a read covers what the
-  read saw. The proof is in `Store::wait_durable`.
 - A read that derives a value, such as the root tree for `GetRootTree`,
-  waits for a full flush of that derivation before it replies (section 4).
-  So a client never gets a tree ID that a power loss can undo.
-- A blob is durable after `BlobBatch::sync`: a plain `fsync` of each blob file
-  when written, then of each changed fan-out directory, then a shared full
-  flush.
+  commits the derivation before it replies (section 4). So a client never
+  gets a tree ID that a power loss can undo.
+- A blob is durable after `BlobBatch::sync`: a plain `fsync` of each blob
+  file when written, then of each changed fan-out directory, then a full
+  flush of the drive (`F_FULLFSYNC` on macOS, where a plain `fsync` can
+  leave the bytes in the drive's cache).
 - No committed metadata may name a blob that a crash could lose. `PutBlob`
   syncs its blob before it replies. `CreateChangeset` reads back, hashes and
   syncs every blob it names before its transaction. Git import syncs one blob
-  batch per 1,000 commits before the transaction that records them. A
-  `repo_blobs` row is the exception: `PutBlob` commits it after a plain
-  `fsync` of the blob, and one full flush then covers both before the reply.
-  A crash can keep the row and lose the blob, which grants nothing, because
-  `CreateChangeset` still reads every blob back.
+  batch per 1,000 commits before the transaction that records them.
 - A stored blob still costs a full flush when it is put again or named by a
   changeset: another batch may have written it and not synced yet.
 
 Unit tests check where each flush comes. No test cuts the power: the crash
 suite kills the process, and the kernel keeps what it wrote (section 10).
 
-**Processes that share a data directory** (SQLite backend only: on
-Postgres, one `serve` runs per database — a second fails at open — and an
-import runs beside it without taking that lock). `scion-server import` can run
-while the server runs. The server opens the directory with `Store::open`, an
-import with `Store::open_shared`. Each holds its `flock`s until the last
-`Store` clone is dropped:
+**Processes that share a data directory.** One `serve` runs per database —
+a second fails at open, refused by the database's one-server advisory lock
+(`pg.rs`: "another server holds this store") — and an `import` runs beside
+it, as do `create-repo`, `create-ref`, `gc`, `export` and `fsck`: they take
+no one-server lock, they write through their own database session and
+stage their blob files in the same directory. `serve` and `derive` take
+the one-server lock, held for the process's life: `derive` removes rows
+of older versions of a kind, which a running server of an older build may
+still read. Each process holds its `flock`s on the directory until the
+last `Store` clone is dropped:
 
 | Lock file | Held by |
 |---|---|
-| `<data>/server.lock` | The server, exclusive. Lands are serialized in its memory (section 5), so a second server is refused. `derive` opens as the server too: it removes rows of older versions of a kind, which a running server of an older build may still read. |
-| `<data>/lock` | Every process, shared, for its whole life. An open first tries to take it exclusive, to learn whether another process uses the directory. An older build holds it exclusive for its whole life, so it and this build keep each other out. The file holds the build of the processes that use the directory (below). |
 | `<data>/open.lock` | A process while it opens the directory, so opens take turns. |
 
-- **Alone at open.** A process that opens the directory alone also removes
-  files in `tmp/` of a build older than the folders, and runs schema
-  migrations. Every open, alone or not, removes the folders of `tmp/` that
-  no process holds: each process stages its temp files in its own folder,
-  which it holds with a `flock` for as long as it lives, so the temp files
-  of a crashed import are removed by the next open, of any process
+- **Every open sweeps `tmp/`.** Each process stages its temp files in its
+  own folder of `tmp/`, which it holds with a `flock` for as long as it
+  lives, so the temp files of a crashed import are removed by the next
+  open, of any process
   ([#101](https://github.com/bnsd55/openscion/issues/101)).
-  A shared open of an older schema fails: stop the other processes to
-  upgrade it.
-- **One build.** Each process removes the derived rows of older versions of
-  a kind (section 4), which a process of an older build may still read. So
-  the first process writes its build into `<data>/lock`: the schema version
-  and the version of each kind (`store::build`). An open while other
-  processes run fails unless its build is the same.
-- **Writes take turns.** SQLite in WAL mode lets one process read while the
-  other writes. A write waits for the write transaction of the other
-  process, up to `busy_timeout` (5 s), and then fails with `UNAVAILABLE`, so
-  the client retries. An import ends a write transaction after 1 s, so a
-  server write waits for at most that plus one commit, and the import stays
-  off the lock 100 ms between two transactions
+- **The schema lives in the database.** An open refuses a database whose
+  schema is newer than this build's, and one that is behind it, and names
+  the migrate command (above). No open migrates: the schema moves only
+  when the operator asks (`scion-server migrate`, or `serve --migrate`).
+- **Writes take turns.** Each write transaction holds the database's rows
+  it touches; a write that waits for another writer's lock gives up after
+  5 s and fails with `UNAVAILABLE`, so the client retries. An import ends a
+  write transaction after 1 s, so a server write waits for at most that
+  plus one commit
   ([#100](https://github.com/bnsd55/openscion/issues/100)). While a server
   write waits, it holds the server's write connection, so the server's
   other writes wait too. Its reads do not: they use the read connections.
@@ -345,17 +308,8 @@ import with `Store::open_shared`. Each holds its `flock`s until the last
   each in a write transaction. The server sees a move that the import made at
   its next land on the ref: each plan reads the head from the database and
   advances the path index to it (section 5).
-- **Durability.** Each process counts and flushes its own commits, and group
-  commit shares a full flush only within one process. A server reply that
-  only reads does not flush for a commit of another process. So a shared
-  `Store` commits with `fullfsync = ON`: SQLite syncs the log with a full
-  flush of the drive cache before the commit becomes visible. The server
-  never sees an import commit that a power loss can undo. In turn, a server
-  commit reaches the drive before the import can see it. So the import runs
-  a full flush before it reports, which covers every write that reached the
-  drive. Its report rests on no server commit that a power loss can undo.
 - **Blobs.** The import syncs each blob batch before the transaction that
-  names its blobs, as in one process. So a blob that the server reaches
+  names its blobs, as the server does. So a blob that the server reaches
   through metadata is durable. The server reads blob files directly, and
   checks each against its ID.
 
@@ -423,8 +377,7 @@ of a directory, and on a put where a file or a directory is in the way.
 read prefixes (`views.rs`). The derivation is a pure function of the rule set
 and the real trees, so its results are a rebuildable cache: one `view_trees`
 row per (repo, rule-set digest, projection version, real tree, path-context
-digest), in the same shape on both backends (SQLite migration 0009, Postgres
-0003). A derivation asks the table at every directory, so a new changeset
+digest), in the same shape on both backends. A derivation asks the table at every directory, so a new changeset
 re-derives only the folders on its changed paths; the rest of the view comes
 from the rows, and the changeset's root row is the row of its real root tree
 under the rule set's full context. Each derivation's write also sweeps at
@@ -486,8 +439,9 @@ names stores about 47 KiB of new rows, not the 6.3 MB node of every name
 the directory ever had, and a change rewrites only the chunks its names
 land in. As with trees, no node is ever deleted for a draft that never
 lands, or for a changeset that a land stored again on a new head — but a
-version bump may drop the old-format rows, as migration 0007 did for
-trees, and the new version derives them again. The value is stored when a
+version bump drops the old-format rows: each step deletes up to `STEP`
+rows of older versions of its kind (above), and the new version derives
+them again. The value is stored when a
 changeset is written, if its first parent has one.
 In a database from before path history, the first query that needs it
 derives it in steps. A golden test pins the root nodes of a fixed history.
@@ -559,7 +513,7 @@ sequenceDiagram
     autonumber
     participant A as scn
     participant L as land.rs
-    participant DB as backend (SQLite, or Postgres)
+    participant DB as the metadata database
     A->>L: Land(changeset, ref, request key)
     L->>DB: transaction: insert a pending row and expire old lands, or find the row for this key
     alt row is not pending
@@ -597,9 +551,7 @@ sequenceDiagram
   7 days after it finished (`LAND_RETENTION_SECS`). A pending land is kept
   until a retry finishes it. Each new land deletes up to 100 expired lands,
   oldest first, in the transaction that records it. The newest land always
-  stays, so a land ID is never given out twice. The upgrade to schema
-  version 2 gives older finished lands the time of the upgrade, so their
-  7 days start then.
+  stays, so a land ID is never given out twice.
 - **A retry after expiry** is a new land with a new ID, and `GetLand` with
   the old ID returns `NOT_FOUND`. It cannot land the changeset twice: the
   landed copy changed every path of the changeset after its base, so the new
@@ -751,11 +703,20 @@ it stay. If the head still has no path history after that, the land fails
 with `INTERNAL`.
 
 **Not planned now:** a lander that rebases a batch of pending lands and moves
-the ref once ([#18](https://github.com/bnsd55/openscion/issues/18), closed: one
-machine already gives about 200 durable lands/s). The
-[scalable backend design](design/scalable-backend.md) says when it would be
-needed: many servers on one database, which the Postgres backend does not
-give yet (one server runs per database).
+the ref once ([#18](https://github.com/bnsd55/openscion/issues/18)). One
+machine gives 23 to 25 durable lands per second to one ref with no
+readers, flat from 2 to 200 writers — 7.8 to 11.1 with 5 or 20 readers
+beside them (section 7 of [operations.md](operations.md), the capacity
+table). #18 was closed on about 200 a second, eight times the measured
+rate. The reason batching stays unplanned is the cheaper levers first.
+The land's statements (37 when [#769](https://github.com/bnsd55/openscion/issues/769)
+counted them) fold one PR at a time, fewer round trips under the ref
+lock first ([#782](https://github.com/bnsd55/openscion/issues/782)). The
+[scalable backend design](design/scalable-backend.md) says when batching
+itself would be needed: many servers on one database, which the Postgres
+backend does not give yet (one server runs per database). When the folds
+are spent, whether the measured rate still carries the demand is open
+again.
 
 ## 6. Git import
 
@@ -1144,8 +1105,8 @@ is not an error: it removes what it wrote and then dies by the signal, so
 a shell reports 128 plus the signal number, and a shell loop stops too.
 
 `ReadFile` and `ListDir` get the changeset's root tree from `derived`
-(deriving it if the row is missing), then walk trees from SQLite one path part
-at a time. Every read checks that the repo has the changeset. `scn` checks
+(deriving it if the row is missing), then walk trees from the database one
+path part at a time. Every read checks that the repo has the changeset. `scn` checks
 that each changeset it receives hashes to its ID.
 
 `ReadFile` streams the blob from the zstd decoder in parts of 1 MiB:
@@ -1303,8 +1264,6 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
 
 | Call | What a tier does |
 |---|---|
-| Call | What a tier does |
-|---|---|
 | `ResolveRef` | Refused with `UNIMPLEMENTED`: a caller resolves on the server, then brings the ticket of the root tree. |
 | `GetRootTree` | Refused with `UNIMPLEMENTED`: only the server mints tickets. A tier that answered it could mint a ticket for any repo. |
 | `GetObjects` | Serves hits from its store. Fetches the misses from upstream in batched calls, checks each object against its ID, stores it, then sends it. A blob stays one zstd frame from the server's disk to the client. |
@@ -1396,7 +1355,8 @@ Both binaries are thin wrappers around one type, `Tier`. It serves the
   one just ends the reply, and the fetch goes on for the callers that still
   wait. A caller with a later deadline whose fetch failed on a shorter one
   asks again with its own.
-- **Auth.** A tier requires its own bearer token (`--token`, `SCION_TOKEN`),
+- **Auth.** A tier requires its own bearer token (`SCION_TOKEN` or
+  `--token-file`),
   checked by the server's code, and sends its own token upstream
   (`--upstream-token`, `SCION_UPSTREAM_TOKEN`). A tier does not ask whether
   a repo exists: it serves a stored object for any valid repo name
@@ -1564,15 +1524,15 @@ it to an untrusted network.
 
 | Area | Today | Limit |
 |---|---|---|
-| Authentication | The server knows the principal of each of its tokens: `--token T` makes one principal, `default`, which may read and write every repo, and `--access FILE` maps the BLAKE3 digest of each token to a principal, with which repos it may read and which paths of a repo it may write (a write rule needs a read rule without a prefix, refused at load otherwise: a partial reader cannot write in v0.1). A read rule MAY name a path prefix: a principal whose read rules are all prefixes is a *partial reader* and reads through the view the server derives for it (the `Repo isolation` row). A principal with no rule for a repo cannot see it, so every call answers `NOT_FOUND`, as for a repo that does not exist. The server and each tier compare BLAKE3 digests of the tokens in constant time, and `scion-server hash-token` prints the digest that an access file wants, so the file never holds a token. A tier sends its own token upstream. | A tier knows one token, so one principal upstream. `GetObjects` carries no token: its permission is the read ticket, which the walk of every serving tier checks (see "Read tickets" below). Per-principal caps are on with `--access` (section 2 of protocol-v1); the request and upload-byte counts live in memory. A ticket is not checked against the rules in force: after a reload that narrows its principal, the old ticket works for at most 15 minutes from signing, on the server and the caches; to cut it at once, rotate the ticket key. |
-| Network | The server listens on `127.0.0.1:7878` and `scion-cache` on `127.0.0.1:7879` by default. A non-loopback address is refused unless `--insecure-listen` is given, or the process serves TLS (`--tls-cert` and `--tls-key`; a private CA is trusted by `scn` with `--tls-ca`). With `--tls-client-ca`, a tier must present a client certificate that CA signed. `scion-daemon` listens only on a Unix socket with mode 0600, in a directory that only its user can reach; it refuses any other. `scn` refuses a socket that another user owns. Both refuse a socket or data directory under a directory that another user can change: one that another user owns, or that group or others can write and has no sticky bit. | With TLS, the process trusts the server's certificate only if a CA is given; there are no public roots. Without TLS, the token and all data travel unencrypted: a bearer token over plain TCP to a non-loopback address stays refused. TLS certificates are not checked against hostnames beyond what the CA signs, and there is no revocation ([#14](https://github.com/bnsd55/openscion/issues/14) tracks TLS; revocation has no issue). By choice, as OpenSSH's `StrictModes`, the directory checks refuse a group-writable directory (`chmod go-w` fixes it; with umask 002, new directories are group-writable), and read only the owner and the mode bits, not ACLs: an ACL that lets other users write a directory gets past them. |
-| Data directory | The server's `--data` directory holds the blob files and the ticket key, and the SQLite metadata, unless the metadata is in Postgres (`--postgres-url`; then the directory holds only the blobs and the ticket key). The blobs are content-addressed files, and the metadata answers who may read what only through the server. Every open of a data directory (serve, import, fsck, gc, derive) refuses one that group or others can write, and one under a directory that another user can change (`check_ancestors`, as for a socket). The ticket key is wherever `--ticket-key` points, made mode 0600, with the same chain check. | The server does not demand mode 0700: a directory that only group or others can write is refused, the rest is the operator's choice. Whoever can read the directory has every blob and every row, and a copied data directory is a full copy of every repo. The same holds for a daemon's store (see "Read tickets"). The machine must be trusted, as the intro says. |
-| Repo isolation | Every call first checks the caller's read rule for the repo, and a repo it may not read answers `NOT_FOUND`. A principal whose read rules name prefixes (a *partial reader*) reads `ReadFile` and `ListDir` through the view the server derives from its prefixes, and a path outside them answers exactly as a missing one: the same code and the same text as the same path in a repo where it does not exist. `ResolveRef` resolves as for any caller, and `GetRootTree` mints the read ticket on the view root, so the walk behind the ticket cannot reach a hidden entry. Its history reads (`GetChangeset`, `Log`, `Blame`, `MergeBase`, `IsAncestor`, `Diff`) and every write answer `UNIMPLEMENTED` with one text, before any data is read. For a whole-repo reader, changesets and derived root trees are reached only through `repo_changesets`. A changeset names only blobs of its own repo (`repo_blobs`, section 5), so the path reads reach only the repo's own content. Path history nodes are reached only through the derived value of a changeset that the repo has, and name only changesets on its first-parent history. No answer of the write calls shows whether another repo has a blob: `CreateChangeset` gives the error of content that no repo stored, before any file is read, and `PutBlob` of such content takes the same write path as for new content. Two leaks stay: the rename frees the old file, and the page cache makes a shared blob fast. | `GetObjects` reads only what a read ticket's walk reaches; see "Read tickets" below. |
-| Lands | `GetLand` and request keys are scoped by the caller's principal: two tokens of one principal share a scope, and the retry of a land finds the outcome of its request key. | With `--token`, every caller is the same principal, `default`, so all callers share one scope. |
+| Authentication | The server knows the principal of each of its tokens: `SCION_TOKEN` or `--token-file` makes one principal, `default`, which may read and write every repo, and `--access FILE` maps the BLAKE3 digest of each token to a principal, with which repos it may read and which paths of a repo it may write (a write rule needs a read rule without a prefix, refused at load otherwise: a partial reader cannot write in v0.1). A read rule MAY name a path prefix: a principal whose read rules are all prefixes is a *partial reader* and reads through the view the server derives for it (the `Repo isolation` row). A principal with no rule for a repo cannot see it, so every call answers `NOT_FOUND`, as for a repo that does not exist. The server and each tier compare BLAKE3 digests of the tokens in constant time, and `scion-server hash-token` prints the digest that an access file wants, so the file never holds a token. A tier sends its own token upstream. | A tier knows one token, so one principal upstream. `GetObjects` carries no token: its permission is the read ticket, which the walk of every serving tier checks (see "Read tickets" below). Per-principal caps are on with `--access` (section 2 of protocol-v1); the request and upload-byte counts live in memory. A ticket is not checked against the rules in force: after a reload that narrows its principal, the old ticket works for at most 15 minutes from signing, on the server and the caches; to cut it at once, rotate the ticket key. |
+| Network | The server listens on `127.0.0.1:7878` and `scion-cache` on `127.0.0.1:7879` by default. A non-loopback address is refused unless `--insecure-listen` is given, or the process serves TLS (`--tls-cert` and `--tls-key`; a private CA is trusted by `scn` with `--tls-ca`). With `--tls-client-ca`, a tier must present a client certificate that CA signed. `scion-daemon` listens only on a Unix socket with mode 0600, in a directory that only its user can reach; it refuses any other. `scn` refuses a socket that another user owns. Both refuse a socket or data directory under a directory that another user can change: one that another user owns, or that group or others can write and has no sticky bit. | With TLS, the process trusts the server's certificate only if a CA is given; there are no public roots. Without TLS, the token and all data travel unencrypted: a bearer token over plain TCP to a non-loopback address stays refused. TLS certificates are not checked against hostnames beyond what the CA signs, and there is no revocation (the `crates/scion-proto/src/runtime/tls.rs` row of section 9 holds the ceiling and the trigger). By choice, as OpenSSH's `StrictModes`, the directory checks refuse a group-writable directory (`chmod go-w` fixes it; with umask 002, new directories are group-writable), and read only the owner and the mode bits, not ACLs: an ACL that lets other users write a directory gets past them. |
+| Data directory | The server's `--data` directory holds the blob files, the ticket key and the marker; the metadata is in Postgres (`--postgres-url-file` or `SCION_POSTGRES_URL`). The blobs are content-addressed files, and the metadata answers who may read what only through the server. Every open of a data directory (serve, import, fsck, gc, derive, restore) refuses one that group or others can write, one they can read, and one under a directory that another user can change (`check_ancestors`, as for a socket). The ticket key is wherever `--ticket-key` points, made mode 0600, with the same chain check. A restore makes the target mode 0700, whatever the umask: the staging it renames into place is private (`create_private_dir_all`). An export holds every repo it was exported from whole, so a new `export --out` directory is made mode 0700 whatever the umask, as the data directory is. | The server demands mode 0700 and nothing else: store files keep their own modes, and the private directory guards them. Whoever can read the directory has every blob and every row, and a copied data directory is a full copy of every repo. The same holds for a daemon's store (see "Read tickets"). The machine must be trusted, as the intro says. |
+| Repo isolation | Every call first checks the caller's read rule for the repo, and a repo it may not read answers `NOT_FOUND`. A principal whose read rules name prefixes (a *partial reader*) reads `ReadFile` and `ListDir` through the view the server derives from its prefixes, and a path outside them answers exactly as a missing one: the same code and the same text as the same path in a repo where it does not exist. `ResolveRef` resolves as for any caller, and `GetRootTree` mints the read ticket on the view root, so the walk behind the ticket cannot reach a hidden entry. Its history reads (`GetChangeset`, `Log`, `Blame`, `MergeBase`, `IsAncestor`, `Diff`) and every write answer `UNIMPLEMENTED` with one text, before any data is read. A write rule covers the paths of a change by parts, and a move is a delete plus a put, two paths, both checked. For a whole-repo reader, changesets and derived root trees are reached only through `repo_changesets`. A changeset names only blobs of its own repo (`repo_blobs`, section 5), so the path reads reach only the repo's own content. Path history nodes are reached only through the derived value of a changeset that the repo has, and name only changesets on its first-parent history. No answer of the write calls shows whether another repo has a blob: `CreateChangeset` gives the error of content that no repo stored, before any file is read, and `PutBlob` of such content takes the same write path as for new content. A third leak a partial reader holds by itself: the existence of any changeset id it has, including one whose changes all sit outside its prefixes. `GetRootTree` answers a view root for a real id and `NOT_FOUND` for one the repo does not have, and on `ReadFile` and `ListDir` the id's two answers carry different texts - a hidden path answers `path "x" not found`, an id the repo does not have answers `changeset <id> not found`. One bit per id: the caller already held the 32 bytes, and no content or path name moves. Pinned by `a_partial_reader_can_probe_a_changeset_ids_existence` (tests/access.rs). A deployment that treats the changeset ids themselves as secret sits outside the v1 partial-reader model. Two other leaks stay: the rename frees the old file, and the page cache makes a shared blob fast. | `GetObjects` reads only what a read ticket's walk reaches; see "Read tickets" below. |
+| Lands | `GetLand` and request keys are scoped by the caller's principal: two tokens of one principal share a scope, and the retry of a land finds the outcome of its request key. | In the single-principal mode (`SCION_TOKEN` or `--token-file`), every caller is the same principal, `default`, so all callers share one scope. |
 | Checkout | `scn checkout` writes into a private temp directory with a random name. It renames it onto a new destination, or moves its entries up into an existing empty directory that the user owns, never over an entry already there. It never follows a symlink while writing or removing, fails on names that the filesystem folds together, and refuses control characters, bidirectional text controls, `.git` and `.scion` before it writes anything (section 7). On failure, or on SIGINT, SIGTERM or SIGHUP, the destination stays as it was. | The directory that gets the checkout (an existing destination, or a new one's parent) must not be writable by all users, unless it has the sticky bit: they could swap parts of the checkout. An existing destination that breaks this is refused. Members of a group that can write it are trusted. Where the filesystem has no rename that never replaces (NFS), any empty mode 0700 directory of the user at a top-level directory name counts as the checkout's claim after `mkdirat` fails with `EEXIST`, and is replaced. Where it has no hard links either (some FUSE filesystems), any symlink of the user with the same target at a top-level symlink name counts as made after `symlinkat` fails with `EEXIST`, and is kept. This is for a lost NFS version 3 reply, but a trusted user (the owner, a group member, root) can also put such an entry there: it is taken, and no data is lost. A filesystem that shows one owner for every entry (a FUSE or SMB mount with `-o uid=`) passes every ownership check. In the temp directory, an entry found after `EEXIST` that is what the call makes counts as made, unless a recorded path in the same directory has its inode. A filesystem that folds names but shows another inode number under each name (CIFS with `noserverino`, FUSE without `use_ino`) would let such a fold through only for two empty files or two symlinks with one target: the two paths then share one entry, with the same content. A folded directory always fails: each directory that the checkout made already holds an entry. The check reads only the mode bits, not ACLs: an ACL that lets other users add or delete entries gets past it. No Windows rules: Windows is unsupported, so device names and names that end
 | Cache tiers | A tier refuses every call but `GetObjects` with `UNIMPLEMENTED`, and `GetObjects` serves only what the read ticket's walk reaches (see "Read tickets" below). A snapshot file (`--snapshot`) holds whole objects of the repos named, and whoever can read the file can read them: a snapshot is a full-repo credential, so `scion-daemon --seed` refuses it unless the operator passes `--seed-full-repo`, which says every user of the node may read the repo whole. | The file is mode 0600 in a directory made with mode 0700, but a node gets it by any copy tool or a shared mount. Two side channels stay for a partial reader: the real changeset IDs of its view, so a new ID with the same view root shows that a hidden-only change landed, and the tiers' walk metrics count such refusals. Metrics are for the operator, not for the readers. |
 | Virtual checkout | `scn mount` binds to 127.0.0.1 on a free port, and every mount path and file handle carries a secret of 16 random bytes: a mount of a wrong path is refused (`MNT3ERR_NOENT`), and a handle that was not made by this mount is refused (`NFS3ERR_STALE`). The mount point's directory is the user's, and the overlay lives in a mode 0700 directory of the system's temporary directory. `scn mount` says at start, and in `--help`, that it is for single-user machines. The mount sends its read ticket with every `GetObjects`, and refreshes it through `GetRootTree` of the mounted changeset before it expires. | Single-user machines only, and the secret is not a protection: the NFS server sees neither the caller's user ID nor its source port (`nfsserve` passes neither to the file system), so it cannot tell local users apart, and the mount path with its secret is in the mount table that every local user can read. Any local user who can read the mount table can reach the mounted content through the NFS port, and root always can ([#11](https://github.com/bnsd55/openscion/issues/11)). |
-| Client machine | `scn` takes its bearer token from `SCION_TOKEN` or `--token`, and never writes it to a file or a log. It trusts the server's certificate only through `--tls-ca` (the Network row). Its `--help` says to pass the token in the environment. | The command line is readable by every local user through `ps`; the environment of a process is not readable by other users. So a token passed as `--token` is a secret from no one: pass it in `SCION_TOKEN`. `scion-cache --token` and `scion-daemon --token` sit in argv for the same reason, and a daemon or cache that serves several users must read its token from its environment or a mode 0600 file instead. |
+| Client machine | `scn` takes its bearer token from `SCION_TOKEN` or `--token-file`, and never writes it to a file or a log. It trusts the server's certificate only through `--tls-ca` (the Network row). Its `--help` says to pass the token in the environment. | The command line is readable by every local user through `ps`; the environment of a process is not readable by other users. So a token passed on the command line is a secret from no one: no binary takes one, and a call that still passes the removed flag fails at once. `scion-cache` and `scion-daemon` read their tokens the same way, from the environment or a mode 0600 file. |
 | Errors | Internal errors reply `internal error`. The detail stays in the server or tier log. | |
 
 ### Read tickets
@@ -1631,49 +1591,56 @@ The owner of every row is the project owner.
 
 | File | Shortcut | Risk class | Limit | Upgrade trigger | Upgrade | Test | Owner |
 |---|---|---|---|---|---|---|---|
+| `crates/scn/tests/transcripts.rs` (the `fixture` field) | The transcript runner parses each file's `fixture:` name and serves one fixture, so the field rides along unread. | bounded | One parsed string per file. | A transcript needs a fixture the runner does not serve today (the read-only caller slice). | The runner dispatches on the fixture name and serves that fixture. | the corpus test's own file count | the project owner |
 | `crates/scion-server/src/store.rs` (BlobBatch::keep) | Keeping a stored blob costs a full flush, because another batch may not have synced it. | bounded | One extra full flush per batch; the blob count is the store's, and the flush cost is the drive's. | The capacity trial misses its write-amplification promise. | Track the blobs written but not yet synced, and flush every blob directory and the drive at open. | the store suite's flush tests | the project owner |
 | `crates/scion-server/src/store.rs` (flush_dirs) | LazyFS persists a rename at rename time, so the power-loss cut never drops a directory entry: the directory `fsync` after a rename (section 3) is invisible there. The dm-log-writes suite covers it: a real ext4 log replayed to each reply's last flush, and the mutation that deletes the directory fsync turns it red. | bounded | The LazyFS harness proves the reply path, not the directory-entry path; dm-log-writes proves that one on real ext4. | A bug report says a directory entry was lost on a filesystem whose fsync does not force a journal commit. | A suite over such a filesystem. | the dm-log-writes runbook row (section 9) | the project owner |
 | `crates/scion-server/src/main.rs` (Command) | The `Serve` subcommand holds its flags by value: 309 bytes against `Import`'s 109, 20 bytes over `clippy::large_enum_variant`, so the lint is off for the enum. | bounded | 20 bytes over the lint's threshold; nothing grows unbounded. | A variant grows further. | Box the TLS and ticket paths of `Serve`. | clippy::large_enum_variant (held off for the enum, watched in review) | the project owner |
 | `crates/scion-server/src/import.rs` (TX_BUDGET) | A transaction of an import ends at 1 s, but one commit's record and check can run longer, and a server write then waits for it. | bounded | The changes and trees of the biggest commit. | The desired capacity envelope exceeds the biggest commit's write. | A separate write connection for the import, or per-statement yields. | the import suite's transaction tests | the project owner |
 | `crates/scion-server/src/import.rs` (Importer::blob) | The skip sees only the target repo's rows, one probe per distinct blob, and stats the file: a blob another repo names, or whose row is missing, still goes through put with its read-back and fsyncs. | bounded | One probe per distinct blob of the import; the cost is bounded by the input tree. | A cross-repo import is measured slow. | An index on `repo_blobs` (`blob`), then `any_repo_names`. | the import suite's skip tests | the project owner |
+| `crates/scion-server/src/read.rs` (the rename cache's sweep) | The rename cache drops the maps no page asked for within the TTL when the cache is next called, not on a timer: a server whose diffs all ended holds the last maps up to the cap for their TTL's length. | bounded | The maps and their entries of the diffs of one TTL, to `RENAME_CACHE_MAX_BYTES`. | An idle server's held bytes show in the gauge while no diff runs. | A sweep on the runtime's own interval, when the gauge says the hold matters. | the rename_cache tests | the project owner |
 | `crates/scion-server/src/pg.rs` (the collector's key in `Pg::commit`) | One advisory key per schema orders every writer of the schema against one collector, so the stores of a test database (one schema each) do not serialize against each other; a slow batch of the collector is bounded by its `PRUNE_BATCH` rows and its 100 ms budget warn. | out-of-profile | One writer of the schema holds the key at a time; the collector's batch is `PRUNE_BATCH` rows within 100 ms. | More than one server shares a schema in production. | Per-repo keys, or the collector's batches reading a snapshot instead of holding a lock. | the Postgres suite's collector tests | the project owner |
+| `crates/scion-server/src/pg.rs` (PgWriteWaiter's release) | One condvar wakes every waiting writer when the write client is back, so a release costs O(waiters) wake-ups and a commit's grant re-checks every waiter's class. | bounded | The waiters of one write client; a commit's grant is a count check per waiter. | Waiting writers often pass about 50. | Per-class condvars: slot holders and other writers wake their own. | the write lane's tests | the project owner |
+| `crates/scion-server/src/pg.rs` (the parked connects) | A connect that outlives its deadline registers as parked on a socket that never answered, and once `CONNECT_PARKED_MAX` sit parked every new connect fails at once, naming the host and the oldest park's age. This ends the FD storm a reconnecting server would grow against a database that stalls its connects: a batch is bounded by the worker count, not a thread an hour. | bounded | `CONNECT_PARKED_MAX` sockets and threads, one each, until the caller gives up on them. | Connects that stall far more often than they answer, or a worker count that grows past the cap. | A connector whose stream takes the deadline itself, so no thread parks at all, when tokio-postgres offers one for the whole connect. | the pg_connect_bound tests | the project owner |
 | `crates/scion-server/src/pg.rs` (begin_read) | Every read runs at repeatable read for one snapshot per read, even reads that touch only immutable rows, which would be safe at read committed with a shorter snapshot hold. Nobody has measured the gain. | bounded | The snapshot hold of one read; no measurement says it costs. | The snapshot hold shows in the Postgres metrics. | Measure first; then split the reads by the rows they touch, keeping repeatable read where a walk re-reads a ref. | the Postgres suite's read tests | the project owner |
 | `crates/scion-server/src/gc.rs` (prune_rows (the ID re-read)) | A prune chunk re-loads every changeset ID of its repo to pin what committed while it waited for the collector's key, so a repo with many changesets pays that walk per chunk. | bounded | One ID walk per chunk; the chunk count is the repo's rows over `PRUNE_BATCH`. | A GC sweep shows in the p99 of concurrent writes. | Load the IDs once per repo per sweep and share them across chunks, at the cost of a wider pin window. | the gc suite's prune tests | the project owner |
 | `crates/scion-server/src/land.rs` (Lands::land) | An in-process lock serializes lands per ref, so this works with one server process. | out-of-profile | One server process holds the lock; the profile promises exactly that. | A second server process shares a store in production. | Per-ref serialization in a shared database ([design](design/scalable-backend.md)). | the land suite's claim tests | the project owner |
-| `crates/scion-server/src/service.rs` (into_server) | A unary reply's bytes stay in HTTP/2 uncounted until the client reads them or the connection closes. Every reply that can grow with its input streams and takes the counted stall path instead, so the largest unary reply left is `Diff` (at most 1,000 paths, about 120 KB) and the rest are KBs: at the defaults, a client that never reads holds at most 128 connections x 256 streams x about 120 KB of unary replies, until its connections close. The encoder's message limit (64 MiB) refuses anything over it. | must-replace | The counted bound covers streamed replies only; the unary residual is bounded by the encoder's 64 MiB, not by accounting. | Before v1.0's resource-safety gate. | A new unary RPC streams, or bounds its reply, before it ships. | the service suite's reply-bound tests | the project owner |
-| `crates/scion-server/src/service.rs` (whole_share) | A `ListDir` or `GetChangeset` reply holds its whole object even when its share is capped at the budget, so a directory whose bytes are over the budget holds what the budget cannot pay for. The budget bounds how many such replies run at once, not their size. | must-replace | The budget bounds the count, not the size: one reply can hold a whole directory tree object in RAM. | Before v1.0's resource-safety gate. | Cap the encoded size of a directory or changeset reply if that ever matters. | the service suite's budget tests | the project owner |
-| `crates/scion-server/src/objects.rs` (find) | Two blocking hops per object (size, then read) and no read-ahead, so many small objects are read one after another. | bounded | Two hops per object; the hop count is the read's object count. | The capacity trial misses its p99 for many-small-object reads. | Read a batch capped by bytes per hop, or keep a few reads in flight. | the read suite's object tests | issue [#6](https://github.com/bnsd55/openscion/issues/6) |
+| `crates/scion-server/src/service.rs` (into_server) | The reply-memory budget (#586) bounds the unary replies parked in HTTP/2: a client that never reads holds `REPLY_MEMORY_BUDGET` (128 MiB across every connection), not the server's memory; a spent budget refuses further unary replies with `resource_exhausted`, and a committed write's reply always goes out. A whole-object reply (`ListDir`, `GetChangeset`; `ReadFile` streams part by part and takes the read budget per part) is bounded twice, by design: its built body takes the read budget (`READ_BUDGET_BYTES`, 256 MiB) before the body is built, and the parts it has sent ride the per-connection stalled-bytes cap (64 MiB, the connection is closed over it) and the process's 1 GiB stall total over every connection (listen.rs `STALLED_TOTAL_BYTES`) - the sent parts stay outside the read budget on purpose, so a few slow clients cost their own connections and not a share every reader needs. | bounded | The count is the reply's encoded length set by its handler, not the wire bytes: the 5-byte gRPC frame prefix of each parked reply is uncounted, and a committed write's reply goes out uncounted by design (a few dozen bytes). | The budget's refusals show as routine in the metrics, or a reply's bytes must be counted to the frame. | Per-frame accounting in the reply body wrapper. | crates/scion-server/tests/reply_budget_h2.rs; the stall tests of the log and blame streams (log_stream.rs) | the project owner |
+| `crates/scion-server/src/objects.rs` (find) | Each read is two blocking hops (plan, then read). The reply keeps `READS_IN_FLIGHT` (4) reads running ahead of its sends, so the hops of many small objects overlap; the pair of hops within one object stays serialized. | bounded | At most `READS_IN_FLIGHT` reads in flight per reply, each holding its share of the reply budget, plus one share for the object being sent; the in-flight semaphore bounds the memory across every reply. | The capacity trial misses its p99 for many-small-object reads. | One hop that plans and reads together (a store API that returns the object in one call). | the reply window's tests (reply.rs), the read suite's object tests | the project owner |
 | `crates/scion-server/src/tree.rs` (Dir::store) | A change rewrites each directory on its paths whole: a tree of every live name. With names of 12 bytes, a write in a directory of 10,000 names stores 500 KB of tree. | bounded | About 500 KB of tree per write at 10,000 names of 12 bytes; the cost scales with the directory width. | The capacity envelope promises wider directories than this. | Trees cut into chunks, so a write stores only the chunks it changes. Trees need a new format for it. | the tree suite's width tests | the project owner |
 | `crates/scion-server/src/history.rs` (Edit::stored) | An edit of a chunked level holds and re-encodes the whole chunk index of the level, so a write re-stores the index row that changed: about 32 KB at 100,000 names, about 2.7 MB at 10M. | bounded | About 2.7 MB of index row per write at 10M names; the cost scales with the level's size. | The capacity envelope promises histories larger than this. | Keep the index stacked in the edit, and edit one index chunk per level of the stack. | the history suite's chunk tests | the project owner |
 | `crates/scion-server/src/history.rs` (Nodes::row) | A check's cache clears all its rows once they pass the cap, so a check whose paths share nodes re-reads them. A check reads each path once, so the re-reads are rare. | bounded | The cap bounds the cache; the re-read cost is the shared nodes of one check's paths. | The node-read metrics show one check's re-reads. | A per-entry LRU. | the history suite's cache tests | the project owner |
 | `crates/scion-server/src/blame.rs` (MAX_BLAME_VERSIONS) | One call diffs at most 100 versions of a file. A file with more versions costs more calls. | bounded | 100 versions per call; an API bound, not an implementation debt. | A caller names it. | Blame as derived data, kept per file version. | the blame suite's version-cap tests | the project owner |
 | `crates/scion-server/src/blame.rs` (MAX_BLAME_DIFF_LINES) | One call diffs about 1M lines, and a long line counts once per 64 bytes. A diff of many repeated lines grows faster than its lines, so one diff of two files of 1,048,576 lines is the worst case of a call. A rename search shares the budget and goes on over calls, so a changeset that deletes many large files costs one call per about 64 MiB of them. | bounded | About 1M lines, or about 64 MiB of deleted files per call; an API bound. | A caller names it. | Blame from derived data, so a call does not diff whole versions, and an index of each changeset's deleted files by chunk, so a search reads only files that share chunks with the new file. | the blame suite's line-cap tests | the project owner |
-| `crates/scion-tier/src/lib.rs` (produce (the two hops)) | Two blocking hops per hit (size, then read) and no read-ahead, as on the server. | bounded | Two hops per object; the hop count is the read's object count. | The capacity trial misses its p99 for many-small-object reads. | Read a batch capped by bytes per hop, or keep a few reads in flight. | the tier suite's produce tests | the project owner |
+| `crates/scion-tier/src/lib.rs` (produce (the two hops)) | Each hit is two blocking hops (size, then read), as on the server. The reply keeps `READS_IN_FLIGHT` (4) hits running ahead of its sends, so the hops of many small objects overlap; a miss's fetch stays bounded by `FETCH_SLOTS`. | bounded | At most `READS_IN_FLIGHT` hits in flight per reply, each holding its share of the reply budget, plus one for the hit being sent; `FETCH_SLOTS` and `FETCH_BYTES` bound the misses. | The capacity trial misses its p99 for many-small-object reads. | One hop that sizes and reads together (a store API that returns the object in one call). | the reply window's tests (reply.rs), the tier suite's produce tests | the project owner |
 | `crates/scion-tier/src/lib.rs` (produce (the ticket)) | A daemon checks no ticket and runs no walk: it forwards the ticket and paths upstream, whose check and walk keep unproven reads out. Safe only while one daemon serves one OS user over its 0600 socket in a private directory; that user can read the daemon's store files anyway. | out-of-profile | One OS user per daemon; the profile promises exactly that. | A daemon serves several OS users in production. | A daemon that serves several OS users must check tickets and walk, like a cache. | the tier suite's ticket tests | the project owner |
 | `crates/scion-server/src/quotas.rs` (Quotas) | The request and upload-byte caps live in memory, so a restart forgets them; only the pending-lands cap counts rows of the store. A restart also frees every count. | out-of-profile | One server process holds the counts; the profile promises exactly that, and the caps are in-flight limits, not durable usage quotas. | A second server process shares a store, or a cap must survive a restart. | Count the in-flight work in the store, or share the counts across processes. | the quota suite's cap tests | the project owner |
-| `crates/scn/src/client.rs` (lossy) | Non-UTF-8 names and messages print with replacement characters, also in JSON. | must-replace | JSON silently changes valid non-UTF-8 bytes, so scripts cannot round-trip names and messages. | Before the 1.x JSON contract freezes. | Escape or base64 raw bytes in JSON. | the CLI suite's JSON tests | the project owner |
-| `crates/scn/src/vfs.rs` (open_overlay_write) | Only the overlay file's final name refuses a planted symlink; a symlink one level up still redirects a write below it. The mount is read-only without `scn mount --unstable-writable` for exactly this reason, so the exposure is only behind the flag. | must-replace | The check covers the final name only; a planted parent symlink redirects a write. | Before the writable mount returns (out until v1.0.0 passes, D24). | Open every parent through handles, as `scn/src/materialize.rs` does. | the vfs suite's symlink tests | the project owner |
-| `crates/scion-server/src/archive.rs` (read_changesets) | A restore holds the whole changeset stream of a repo in memory, bodies included: one repo's history in RAM. | must-replace | The RSS of a restore is the repo's whole history. | Before v1.0's resource-safety gate. | Stream the frames from a `BufReader`, one record at a time, into the replay transaction. | the archive suite's restore tests | the project owner |
-| `crates/scn/src/cmd/commit.rs` (commit (regular files)) | Reads each local file whole, so memory caps the file size. | must-replace | Memory is the file-size support: 'whatever fits in RAM'. | Before the 1.x protocol freezes its file-size answer. | Stream chunks from the file, or reject above an explicit protocol limit before reading. | the CLI suite's commit tests | the project owner |
-| `crates/scn/src/cmd/commit.rs` (commit (symlink targets)) | Reads each symlink target whole, so memory caps the target length. | bounded | The target length of one symlink; targets are short by nature and the kernel caps them. | A caller reports a long target. | Stream chunks from the file. | the CLI suite's symlink tests | the project owner |
+| `crates/scion-server/src/floor.rs` (check_startup_memory) | At start the server reads the host's memory limit (the process's cgroup, then the host's total, then `hw.memsize`), sets it and the floor as gauges, and when the host is under the floor writes one error line naming the limit, its source, the floor, and the shares. The shares stay fixed whatever the host has, and the server starts anyway: the budgets are caps, not reservations, so they keep their promises on a smaller host until the memory runs out. | bounded | A host under the floor degrades the page cache first, and the line and gauges say so at start; the profile states the host size the floor is derived for. | An operator reports a server that served on a host under the floor and was killed by the OOM killer. | Scale the shares to the host limit when a host under the floor is a supported shape, or refuse to start when the memory is a capacity promise, not a budget. | the floor suite's reader and check tests | the project owner |
+| `crates/scn/src/client.rs` (put_blob_file's after-check) | The rewrite check compares the file's mtime, so a same-size rewrite inside the filesystem's timestamp granularity passes the check and a torn mix commits with no error. | bounded | A coarse-mtime filesystem: FAT/exFAT (2 s), some NFS/FUSE mounts (1 s); ext4 and APFS are nanosecond, so a production cell cannot hit it. | A user commits from a coarse-mtime filesystem and reports a mixed commit. | Compare ctime too, or re-read and hash the file after the read. | the client suite's torn-read tests | the project owner |
+| `crates/scn/src/vfs.rs` (open_overlay_write) | Only the overlay file's final name refuses a planted symlink; a symlink one level up still redirects a write below it. The write path sits behind the `unstable-writable-mount` cargo feature, off by default: a default or release build has no write path at all, and the read-only mount stays. | out-of-profile | The production profile (section 8) never builds the feature: the exposure exists only in a build that names it. | Before the write path returns: a rewrite that opens each path step by handle must first pass the hostile tests. | Open every parent through handles, as `scn/src/materialize.rs` does. | the vfs suite's symlink tests (the feature build); the default build's no-writable-mount tests | the project owner |
+| `crates/scn/src/cmd/commit.rs` (commit (symlink targets)) | Reads each symlink target whole, so memory caps the target length. | bounded | A target is one path: the kernel caps it at PATH_MAX (4096 bytes on Linux, 1024 on macOS). | A caller reports a long target. | None short of the protocol renaming symlink targets to blob ids. | the CLI suite's symlink tests | the project owner |
 | `crates/scn/src/cmd/commit.rs` (parse_author) | The author time zone is always UTC, since `std` cannot read the local time zone. | bounded | A product choice: every author time is UTC. | A caller reports a wrong local time. | A time zone crate. | the CLI suite's author tests | the project owner |
 | `crates/scn/src/vfs.rs` (io_err) | Takes the error by value so `.map_err(io_err)` reads clean. | bounded | Style only; nothing changes behavior. | The lint allows it one day. | Take it by reference if the lint allows it one day. | the vfs suite's error tests | the project owner |
+| `crates/scion-server/src/preflight.rs` (DISK_MARGIN) | The preflight's free-bytes threshold is the constant 1 GiB, about 10,000 lands of headroom by the capacity table (about 35 to 87 MB of database and 5.6 MB of blobs per 1,000 lands, section 5's table), not a size read from the store's own growth. | bounded | A store growing faster than the table's per-land spend reaches the 1 GiB warn sooner than an operator expects; the warn names the headroom and the check never refuses. | The capacity table's disk row or a field report disagrees with the constant. | A size taken from the store's own growth, wired into the preflight's answer. | the preflight suite's disk tests | the project owner |
 | `crates/scion-server/tests/disk_full.rs` (the tmpfs witness) | The env var is the small disk's only witness: a local run against a big disk would fill for hours before the error. | bounded | The test's disk is the CI tmpfs; a local run on a big disk is slow, not wrong. | A bug report says the check passed on a machine it should not have. | A size probe that refuses a disk bigger than the test's. | the disk_full suite (Linux, `SCION_DISK_REQUIRE=1`) | the project owner |
 | `crates/scion-server/tests/power.rs` (the directory-entry cut) | The cut cannot catch a lost fsync of a directory: LazyFS persists a rename at rename time, so the directory-entry durability the rename guard gives is invisible there. | bounded | The harness proves the reply path, not the directory-entry path; dm-log-writes proves that one. | A bug report says a directory entry was lost on such a filesystem. | A suite over a filesystem whose directory fsync does not force a journal commit. | the dm-log-writes runbook row (section 9) | the project owner |
 | `crates/scion-server/tests/power.rs` (the sync path) | The cut is sync-before-reply, and the sync path tested is the Linux one; macOS syncs differently (`F_FULLFSYNC`) and its CI job cannot run LazyFS, so there the crash suite is what runs. | bounded | One platform carries the power-cut evidence; macOS runs the crash suite. | A macOS bug report says a cut lost data the crash suite cannot catch. | A macOS power-cut tool that cuts below `F_FULLFSYNC`. | the crash suite (macOS lane) | the project owner |
-| `crates/scion-server/tests/common/mod.rs` (the metadata-named cross-check) | This ceiling is the empty walk; the Postgres rows are unread by this test, so the metadata-named cross-check has no Postgres run (the files on disk still verify, and the RPC-side checks hold). | bounded | The cross-check runs on SQLite; the Postgres rows are verified by the files' own checks. | The Postgres fault rows carry this check. | A Postgres run of the cross-check, with the rows read. | the conformance suite's cross-check | the project owner |
 | `crates/scion-server/tests/common/mod.rs` (the blob read-back) | The new blobs' bytes are not read back through the `Objects` API in this walk; the file-level check below is what proves them, and every changeset that `CreateChangeset` replied is checked on its own path. | bounded | The RPC-side read-back of new blobs is the walk's ceiling; the file-level check carries the proof. | The file-level check misses a class of blob the API serves. | A read-back of every new blob through `Objects`. | the conformance suite's blob tests | the project owner |
-| `crates/scn/tests/query.rs` (the git-import provenance) | This ceiling is the skip itself; Postgres import provenance (the git_import rows) is unread by these tests, so the git side of the comparison has no Postgres run. | bounded | The git side of the comparison runs on SQLite; Postgres import provenance is unread. | The Postgres fault rows carry the git comparison. | A Postgres run of the provenance comparison. | the scn suite's query tests | the project owner |
-| `crates/scn/tests/history.rs` (the git-import provenance) | The ceiling is the skip itself; Postgres import provenance (the git_import rows) is unread by these tests, so the git side of the comparison has no Postgres run. Upgrade path: a Postgres run of the same walk. | bounded | The git side of the comparison runs on SQLite. | The Postgres fault rows carry the git comparison. | A Postgres run of the provenance walk. | the scn suite's history tests | the project owner |
 | `scripts/common.sh` (the pidfile sweep) | Nothing sweeps a pidfile left by a script that died by SIGKILL — the trap cannot run then. The janitor sweep is the named upgrade path if stale servers show up. | bounded | A SIGKILLed script's server lives until its own end or the janitor's sweep. | Stale servers show up on a runner. | The janitor sweep, wired into the scripts. | the release smoke's cleanup steps | the project owner |
 | `scripts/common.sh` (the loop's process group) | No process group for function loops — bash only grants one to an exec'd program; the upgrade path is a dispatch subcommand the script re-invokes for the loop. | bounded | A loop job has no group of its own; the script's traps still stop it. | A CI timeout leaves a loop job running. | A dispatch subcommand the script re-invokes for the loop. | the owned-process tests (scripts/test-owned-run.sh) | the project owner |
 | `scripts/common.sh` (the staggered starts) | Stagger the starts because git daemon's backlog is 5 and cannot be set; the ceiling is a lazy-fetch burst during checkout. | bounded | Backlog 5; the stagger absorbs a lazy-fetch burst during checkout. | A checkout shows connection refusals in the rig. | A real git server (http-backend) in the rig. | the checkout benchmark's runs | the project owner |
 | `scripts/capacity.sh` (the copied readers) | The readers and the sampling are the soak's shape, copied here rather than lifted, because soak.sh and soak-fault.sh are two working scripts whose knobs this does not want to share. | bounded | Two copies of the same reader loop; #461 rewrites the harness and lifts the shared part. | The two copies drift. | Lift the shared loop into one place when #461 lands. | the capacity harness's self-checks (#461) | the project owner |
 | `scripts/version-matrix.sh` (the pins) | The pins stand in for release tags; the first release tag replaces them, because a release tag is an ancestor of HEAD and the pins sit on main. | bounded | Two pinned commits stand for tags; no tag exists yet. | The first release tag lands. | The tags replace the pins. | the version-matrix job's pairs | the project owner |
 | `scripts/soak-fault.sh` (the copied loaders) | The loaders are copied from soak.sh, not factored out, because the two scripts' knobs differ and the soak's 72-hour run pins its report format. | bounded | Two copies of the loader; the soak's report format must not change. | The copies drift. | Lift the loader once the soak's pinned run ends. | the fault soak's runs | the project owner |
-| `.github/workflows/coverage.yml` (the eight-minute walk) | One graph walk runs longer than eight minutes, so the coverage job grants it more than the step default. | bounded | The walk's own runtime; the job's timeout is the bound. | The walk outgrows the job's timeout. | Split the walk, or raise the timeout with a named ceiling. | the coverage job's own run | the project owner |
-| `.github/workflows/coverage.yml` (the mismatch ceiling) | 1,221 functions in the merged profiles map to no unit the gate rebuilds, so their data is dropped and the printed total excludes it; the constant moved to 1,226 when main's own units grew (runs 39956356938, 39959927635, 39965099329, then 39985447891). | bounded | The constant set, which tracks the workspace's own test units; the gate refuses any count above the named ceiling (today 1,300). | The count rises over the ceiling, or the set is named. | Name the set (which crates, why the hashes differ), then set the ceiling to what is left, ideally 0. | the coverage gate's own run | the project owner |
-| `.github/workflows/release.yml` (the dry-run's tag read) | The dry-run skips the tag-object read and the checks that need it: no CI run holds a signed release tag, so the verdicts are tested with canned objects instead. | bounded | The dry run proves the build, compare and attest; the tag verdicts are tested with canned tag objects. | The first real tag exercises the read path. | The release dry run on the tag itself, when one exists. | the release-verify-tag tests (scripts/test-release-verify-tag.sh) | the project owner |
+| `.github/workflows/release.yml` (the dry-run's tag read and publication flip) | The dry run skips the tag-object read and the signature check it carries — no CI run holds a signed release tag, so the verdicts are tested with canned objects instead — and skips the final `--draft=false` flip. | bounded | The dry run proves the build, compare, attest, and the publish path against a scratch-named draft it creates, uploads, counts and deletes; the signature verdicts are tested with canned tag objects. | The first real tag exercises the read path and the flip. | The release dry run on the tag itself, when one exists. | the release-verify-tag tests (scripts/test-release-verify-tag.sh); the dry run's release job | the project owner |
+| `.github/workflows/ci.yml` (the test job cap) | The 50-minute cap fits the whole-workspace Postgres suite, whose cost is now the slow tail of whole-model oracles: the graph, path-log and log-page tests walk a seeded model of thousands of changesets, and the crash suite kills a server and lands again (run 41366890167's logs); the log pages no longer read one changeset per entry (#758). | bounded | The measured times on main (22-37 min, Oct 2026; the runs that hold the batched reads measure 22-36); the job's timeout is the bound. | The slowest model oracles get a cheaper full walk (the ten 60-second tests: the graph and path-log oracles, the log-page full walks, the crash kill-and-land loops). | Bring the cap back toward 30. | the test job's own runs | the project owner |
+| `.github/workflows/ci.yml` (the Postgres cells cap) | The 45-minute cap fits the Postgres suite the majors' cells run, whose cost is now the same slow tail of whole-model oracles: the graph, path-log and log-page walks of seeded models, and the crash suite's kill-and-land loops (run 41366890167's logs); the log pages no longer read one changeset per entry (#758). | bounded | The measured times on main (17-30 min, Oct 2026; the runs that hold the batched reads measure the same, worst cell 29); the job's timeout is the bound. | The slowest model oracles get a cheaper full walk. | Bring the cap back toward 30. | the cells' own runs | the project owner |
+| `.github/workflows/ci.yml` (the land path-history proof job) | The nightly's land path-history proof runs alone, on its own Postgres service, with the full 2000 cases, in a 150-minute window. The measured wall is the 11-02 nightly's 82 minutes, shared by four proofs in one job before each proof got its ten concurrent workers - an upper bound for the proof alone; the first nightly after the split measures it alone. | bounded | The 11-02 shared wall (82 minutes) is the measured bound; the timeout is the bound. | The job passes 70% of its timeout (105 minutes). | Split the proof by cases, with a fixed seed per shard. | the job's own nightly runs | the project owner |
+| `.github/workflows/ci.yml` (the path-log proof job) | The nightly's path-log proof runs alone, on its own Postgres service, with the full 2000 cases, in a 120-minute window. The measured wall is the 11-02 nightly's 64 minutes, shared by four proofs in one job before the ten-worker change - an upper bound for the proof alone; the first nightly after the split measures it alone. | bounded | The 11-02 shared wall (64 minutes) is the measured bound; the timeout is the bound. | The job passes 70% of its timeout (84 minutes). | Split the proof by cases, with a fixed seed per shard. | the job's own nightly runs | the project owner |
+| `.github/workflows/ci.yml` (the graph-queries proof job) | The nightly's graph-queries proof runs alone, on its own Postgres service, with the full 2000 cases, in a 120-minute window. The measured wall is the 11-02 nightly's 33 minutes, shared by four proofs in one job - an upper bound for the proof alone; the 11-03 nightly's 102 minutes was the four proofs contending for one Postgres and one runner, not the proof's own cost. | bounded | The 11-02 shared wall (33 minutes) is the measured bound; the timeout is the bound. | The job passes 70% of its timeout (84 minutes). | Split the proof by cases, with a fixed seed per shard. | the job's own nightly runs | the project owner |
+| `.github/workflows/ci.yml` (the proptest remainder job) | The nightly's proptest budget proof runs as four jobs (three proofs alone, one remainder); the remainder runs the whole suite minus the three proofs, the view proof folded in, at the full 2000 cases, in a 120-minute window. Its step checks the three skipped names still exist and names the missing one, so a renamed proof fails loudly instead of running twice or never. | bounded | The 11-02 nightly's 118 minutes was the one shared job's wall, set by the land proof; the remainder's own proofs measure 33 minutes and less on that wall. | The job passes 70% of its timeout (84 minutes). | Move a proof back into the remainder only if its own job is gone; split a proof by cases otherwise. | the job's own nightly runs | the project owner |
+| `.github/workflows/ci.yml` (the umask 002 job's test parallelism) | The nightly umask 002 job runs the suite with the runner's default test parallelism, uncapped, on its own Postgres service (max_connections 100): no other run competes with it, so the default parallelism is expected to fit. | bounded | The suite's own pool sizes keep it under the service's 100 connections on main (the nightly's worst case, the two proof tests, is 12 readers plus the suite's pools, names at `test_support::PROOF_READERS`' comment in `crates/scion-server/src/lib.rs` (32 connections of 100)); the job's first nightly measures the run whole. | The nightly reports Postgres E53300 ("too many clients"). | Cap the job's `--test-threads` first; raise the service's `max_connections` only if a capped run still exhausts. | the job's own nightly runs | the project owner |
+| `.github/workflows/ci.yml` (the umask 002 job cap) | The 45-minute cap fits the suite the umask 002 job runs: the same whole-workspace Postgres suite the Postgres cells run, on one runner with one Postgres service. | bounded | The measured times of the Postgres cells on main (17-30 min, Oct 2026) are the floor; the job adds no step beyond the suite and the work-tree check. The job's first nightly measures it whole. | The nightly's measured run passes 35 minutes, or the slowest model oracles get a cheaper full walk (the trigger the main job's cap names). | Bring the cap back toward 30, with the main job's. | the job's own nightly runs | the project owner |
+| `crates/scion-proto/src/runtime/tls.rs` (the mTLS accept) | The accept of a client certificate checks what webpki checks — the chain to the client CA and the certificate's dates — and nothing more: no revocation, and no check that a certificate's name matches the peer that presents it. | bounded | A client certificate that the client CA signed and that is not expired works for as long as its dates say, until whoever made it replaces it. | A certificate is revoked, or a deployment must pin which certificate each peer presents. | Check revocation at the accept (CRL or OCSP), or pin the leaf certificate per peer. | the TLS suite's verifier tests | the project owner |
 
 ## 10. Testing
 
@@ -1720,8 +1687,7 @@ reopens the store from the backing directory, where it checks the same
 invariants as the crash suite. So the suite tests sync-before-reply: a
 reply that went out before the data was fsynced is lost by the cut, and
 the check fails. It caught a mutation without the fsync of a blob file
-before its row, and a mutation with SQLite's `synchronous = OFF`. What
-it does not prove:
+before its row. What it does not prove:
 
 - A drive's volatile cache, or a directory entry lost for lack of a
   directory fsync: the cut models what the process had not fsynced on
@@ -1794,12 +1760,16 @@ into fixed buckets. The values are read on export only.
 | `scion_requests_total{rpc,code}` | counter | Every counted RPC by path (`Scion/Blame`, `Objects/GetObjects`, ...) and gRPC status. |
 | `scion_request_seconds{rpc}` | histogram | A call's duration from the moment the layer sees the request until the reply ends or is dropped. Buckets at 1, 4, 16, 64, 256 ms and 1, 4, 16, 64 s, then `+Inf`. |
 | `scion_rpc_bytes_total{rpc,direction}` | counter | Reply bytes out; request bytes in, counted from the `content-length` header, which a gRPC client does not send. |
+| `scion_connections_refused_total` | counter | Connections the server closed because no place freed within the 5 s wait at the connection cap (`--max-connections`); a client that left while it waited counts here too. A rising rate says `--max-connections` is too small for the clients. |
+| `scion_calls_in_flight` | gauge | Calls whose reply body has not ended, as the count a drain still waits for. A call that never reaches a reply body is given back by the same guard that counted it. |
 | `scion_lands_total{outcome}` | counter | Lands by outcome: `landed`, `conflict`, `rejected`, `retry` (a pending land waits for its retry), then the class of a land that ended in an error: `aborted`, `deadline_exceeded`, `resource_exhausted`, `unavailable`, `not_found`, `invalid_argument`, `permission_denied`, `failed_precondition`, `cancelled` (the call went while its land was planned), `internal`. |
 | `scion_land_replans_total` | counter | Lands whose ref moved under them and were planned again: a rising rate means lands that contend with imports or other writers on one ref. |
 | `scion_view_trees_walked_total` | counter | Real trees a view derivation opened for a partial reader. A count that rises on every changeset of the same rule set says the per-tree memo is not serving and every read re-walks the tree. |
+| `scion_diff_rename_cache_bytes` | gauge | The bytes the paged diffs' rename cache costs, the entries' own memory included, to `RENAME_CACHE_MAX_BYTES`. A hold that stays while no diff runs is the cache's lazy sweep (section 9). |
 | `scion_cache_hits_total`, `scion_cache_misses_total` | counter | A tier's object reads served from its store or its snapshot, and read from upstream. A tier's scrape also shows its `Objects` calls in `scion_requests_total` and `scion_request_seconds`. |
 | `scion_blob_sync_seconds` | histogram | One fsync attempt on the blob write path, failed ones included: a temp file, a stored file, a blob directory, or the drive-cache flush that batches syncing at the same time share (a caller's duration includes the wait for the flush in progress). A sum that outruns the counts says a drive that cannot keep up with the imports. Same buckets as `scion_request_seconds`. |
 | `scion_data_free_bytes` | gauge | Free bytes for this process's user on the filesystem that holds the data directory, refreshed every 30 s. This is the alarm that fires before the server fails to write. |
+| `scion_memory_floor_bytes`, `scion_host_memory_bytes` | gauge | Set once at start: the floor the server's memory budgets and caps sum to (the shares table in floor.rs), and the host's limit as the start-up check read it (the cgroup limit, or the host's total). A host gauge under its floor gauge says the host has less room than the budgets assume; the start-up log then carries the error line that names both, with the shares. |
 | `scion_derive_walks_in_flight`, `scion_derive_walks_waiting` | gauge | Derive walks that hold a permit, and walks that wait for one. Walks waiting while the in-flight count sits at the cap mean a cold history read that waits behind the walkers. |
 | `scion_stalled_reply_bytes` | gauge | Bytes that stalled replies hold in HTTP/2, as one 4 MiB estimate per reply whose client stopped reading, given back when the reply's stream ends or the connection closes. A count that sits near a connection's `--max-stalled-bytes` says clients stop reading mid-reply. |
 | `scion_pg_collector_key_wait_seconds` | histogram | A Postgres write transaction's wait for the collector's advisory key, the one lock every writer of the schema orders on. Waits near the 60 s bound of the key mean the writer queue does not drain. Same buckets as `scion_request_seconds`. |

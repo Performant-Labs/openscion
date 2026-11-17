@@ -68,6 +68,10 @@ fn exercised() -> Metrics {
     m.blob_sync(1_500);
     m.collector_key_wait(2_500);
     m.data_free_bytes(4_242);
+    m.data_free_inodes(4_048);
+    m.data_free_sample_age(61);
+    m.set_blob_count(123);
+    m.set_blob_count_refresh_ms(612);
     // One walk holds its permit and one waiter queues at the render:
     // the gauges render only above 0, and a name that renders only
     // sometimes must be in the golden all the same. The ended paths

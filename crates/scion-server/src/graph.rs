@@ -302,24 +302,42 @@ pub(crate) fn on_first_parents(
     Ok(Some(at.id == base))
 }
 
-/// What a query read: nodes and parents, in steps.
+/// What a query read: nodes and parents, in steps and visits.
 #[derive(Clone, Copy, Debug, Default)]
 struct Cost {
     reads: usize,
     steps: usize,
+    visits: usize,
 }
 
 /// How long a walk holds one read connection: for moves of up to `reads`
-/// reads.
+/// reads, and for at most `visits` changesets visited over the whole
+/// query.
 #[derive(Clone, Copy, Debug)]
 struct Steps {
     reads: usize,
+    visits: usize,
 }
 
 /// The steps of the queries. A step ends after the move that reaches 1,000
 /// reads, and a move reads at most a few dozen rows: O(log n) nodes, or the
-/// parents of a merge.
-const STEPS: Steps = Steps { reads: 1000 };
+/// parents of a merge. A query visits at most
+/// [`GRAPH_QUERY_MAX_VISITS`] changesets.
+const STEPS: Steps = Steps {
+    reads: 1000,
+    visits: GRAPH_QUERY_MAX_VISITS,
+};
+
+/// How many changesets one graph query may visit before it fails with
+/// [`Error::ResourceExhausted`]. A visit is one move of the walk: the
+/// search taking a link or a history, the paint taking a merge. A
+/// move takes at least one changeset, so a query at this bound has
+/// visited at least a million changesets - at the runner's measured
+/// 6.8 microseconds a changeset on the woven history, about seven
+/// seconds of walk: far above what any honest query here spends, and
+/// far below the 600 s call deadline. A query past the bound stops
+/// instead of holding a read slot to its deadline.
+pub(crate) const GRAPH_QUERY_MAX_VISITS: usize = 1_000_000;
 
 /// Makes the moves of a walk with `next` until it gives the answer, in
 /// `steps`. Each step holds one read connection, and the walk gives it back
@@ -335,11 +353,18 @@ fn in_steps<T>(
 ) -> Result<(T, Cost)> {
     let mut cost = Cost::default();
     let mut seen = 0;
+    let bound = steps.visits;
     let result = loop {
         cost.steps += 1;
         let (step, step_seen) = store.read_counted(|c| {
             let mut index = Index::new(c, deadline, cache, parents);
             let answer = loop {
+                cost.visits += 1;
+                if cost.visits > bound {
+                    break Err(Error::ResourceExhausted(format!(
+                        "the graph walk passed its {bound}-visit bound"
+                    )));
+                }
                 match next(&mut index) {
                     Ok(None) if index.reads < steps.reads => {}
                     answer => break answer,
@@ -356,7 +381,11 @@ fn in_steps<T>(
     // As `Store::read`: the reply waits until each commit that a step could
     // see is durable, with one flush for all steps.
     store.wait_durable(seen)?;
-    let Cost { reads, steps } = cost;
+    let Cost {
+        reads,
+        steps,
+        visits,
+    } = cost;
     match &result {
         Err(Error::DeadlineExceeded(why)) => {
             tracing::info!(reads, steps, %why, "a graph query stopped at its deadline");
@@ -364,7 +393,10 @@ fn in_steps<T>(
         Err(Error::Cancelled(why)) => {
             tracing::info!(reads, steps, %why, "a graph query stopped: its call went");
         }
-        _ => tracing::debug!(reads, steps, "graph query"),
+        Err(Error::ResourceExhausted(why)) => {
+            tracing::info!(reads, steps, visits, %why, "a graph query stopped at its bound");
+        }
+        _ => tracing::debug!(reads, steps, visits, "graph query"),
     }
     result.map(|answer| (answer, cost))
 }
@@ -827,23 +859,24 @@ fn node(c: &mut dyn MetaTx, id: ChangesetId) -> Result<Node> {
 #[cfg(test)]
 mod tests {
     use crate::backend::Backend;
-    use crate::store::Store;
+    use proptest::prelude::{Strategy, any};
+    use proptest::sample::Index as Sample;
     use std::sync::mpsc;
     use std::time::{Duration, Instant};
 
-    use proptest::prelude::{Strategy, any};
-    use proptest::sample::Index as Sample;
     use scion_core::{BlobId, FileState, IdentityTime, RepoPath};
 
     use super::*;
-    use crate::db::testing;
     use crate::derived::steps;
+    use crate::meta::testing;
+    use crate::pg::damage;
 
     /// A cold commit graph and a past deadline: the query refuses instead of
     /// deriving the graph first. On main, where the derive ran without the
     /// deadline, this call returned a result.
     #[test]
     fn a_query_with_a_past_deadline_derives_nothing() {
+        let _slot = damage::slot();
         let parents = vec![vec![], vec![0], vec![0], vec![1, 2]];
         let (_dir, store, repo, ids) = store_graph(&parents);
         let past = Deadline::new(Instant::now());
@@ -857,7 +890,248 @@ mod tests {
     }
 
     /// Steps of a few reads, so that walks go on across steps.
-    const SMALL: Steps = Steps { reads: 4 };
+    const SMALL: Steps = Steps {
+        reads: 4,
+        visits: usize::MAX,
+    };
+
+    /// The bound holds: a walk under it answers, a walk past it fails
+    /// with an error that names the bound. The small bound rides the
+    /// test seam, so the pin does not build a million-node history.
+    #[test]
+    fn a_query_past_its_visit_bound_fails_naming_it() {
+        let _slot = damage::slot();
+        // Two branches that weave: each round grows both branches, then
+        // a criss-cross merge takes both tips. The paint that finds the
+        // bases takes one merge a visit, so a woven graph passes a
+        // small bound; a single-parent history answers in one.
+        let mut parents = vec![vec![]];
+        let mut a = vec![0_usize];
+        let mut b = vec![0_usize];
+        for _ in 0..3 {
+            for _ in 0..2 {
+                parents.push(vec![*a.last().unwrap()]);
+                a.push(parents.len() - 1);
+                parents.push(vec![*b.last().unwrap()]);
+                b.push(parents.len() - 1);
+            }
+            let (pa, pb) = (*a.last().unwrap(), *b.last().unwrap());
+            parents.push(vec![pa, pb]);
+            a.push(parents.len() - 1);
+            parents.push(vec![pb, pa]);
+            b.push(parents.len() - 1);
+        }
+        let (_dir, store, repo, ids) = store_graph(&parents);
+        // First, derive: the bound counts the query's walk, not the
+        // graph's derivation.
+        assert!(is_ancestor(&store, repo, ids[0], ids[*a.last().unwrap()], &later()).unwrap());
+        // One visit answers on a single-parent history: the walk
+        // descends the jump chain to the root in one move. The small
+        // bound rides this test's own Steps, so no other test's walk
+        // answers to it.
+        let bounded = Steps {
+            reads: 4,
+            visits: 2,
+        };
+        let (found, _) = in_steps(
+            &store,
+            &later(),
+            bounded,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            |index| {
+                let mut search =
+                    Search::new(At::get_unbounded(&store, repo, ids[1]).unwrap(), ids[0], 0);
+                search.next(index)
+            },
+        )
+        .unwrap();
+        assert!(found);
+        let got = in_steps(
+            &store,
+            &later(),
+            bounded,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            |index| {
+                let mut paint = Paint::new(
+                    At::get_unbounded(&store, repo, ids[*a.last().unwrap()]).unwrap(),
+                    At::get_unbounded(&store, repo, ids[*b.last().unwrap()]).unwrap(),
+                );
+                paint.next(index).map(|answer| answer.map(|_| ()))
+            },
+        );
+        assert!(
+            matches!(&got, Err(crate::error::Error::ResourceExhausted(text))
+                if text.contains("visit bound")),
+            "{got:?}"
+        );
+    }
+
+    /// The first-parent check's answer, which the land path trusts for
+    /// whether a base may be landed on: a base on the tip's first-parent
+    /// history is `Some(true)`, one off it `Some(false)`, and a tip
+    /// without a node is `None`. A body swapped for a constant, or the
+    /// final comparison flipped, makes a land proceed unverified or
+    /// refuse a legal base.
+    #[test]
+    fn a_base_on_the_first_parent_history_is_true_and_one_off_it_false() {
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
+        let _slot = damage::slot();
+        let (repo, ids, side) = deep_chain(&store, 16);
+        let tip = ids[15];
+        let gen_of = |id| store.read(|c| c.generation(repo, id)).unwrap();
+        let check = |base, base_gen| {
+            store
+                .read(|c| on_first_parents(c, tip, base, base_gen, &later()))
+                .unwrap()
+        };
+        // The root and a mid-chain changeset are on the history: the
+        // walk descends to their generation and lands on them.
+        assert_eq!(check(ids[0], gen_of(ids[0])), Some(true));
+        assert_eq!(check(ids[7], gen_of(ids[7])), Some(true));
+        // The side branch's tip is not on the first-parent history: the
+        // walk stops at the oldest changeset at or above its generation,
+        // which is its parent on the chain, not the side changeset.
+        assert_eq!(check(side, gen_of(side)), Some(false));
+        // A floor below the base's own generation lands above the root:
+        // the root is not there, so the answer is false for it.
+        assert_eq!(check(ids[0], gen_of(ids[7])), Some(false));
+    }
+
+    /// A merge above the first-parent meeting point breaks the fast
+    /// path's disjointness: the merge's other parent's history joins the
+    /// other side deeper down, so the bases are two siblings, not the
+    /// one changeset the first-parent meet lands on. `merge_bases` must
+    /// refuse the fast path (its `None`) and let the paint walk find
+    /// both.
+    #[test]
+    fn a_merge_above_the_meeting_point_gives_two_bases() {
+        let _slot = damage::slot();
+        // 0 the root; 1 and 2 its children; 3 the merge of 1 and 2 (a);
+        // 4 a child of 1; 5 the merge of 4 and 2 (b).
+        let parents = vec![vec![], vec![0], vec![0], vec![1, 2], vec![1], vec![4, 2]];
+        let (_dir, store, repo, ids) = store_graph(&parents);
+        let bases = merge_bases(&store, repo, ids[3], ids[5], &later()).unwrap();
+        assert!(bases.contains(&ids[1]), "{bases:?}");
+        assert!(bases.contains(&ids[2]), "{bases:?}");
+    }
+
+    /// The paint walk stops when a side dies, not when the queue drains:
+    /// `tally` keeps the live counts, and a side at zero ends the walk
+    /// before the remaining one-sided tail is walked. The mutant that
+    /// makes `tally` refuse every mark freezes the counts, and the walk
+    /// drains the whole graph - here past the visit bound, so the answer
+    /// becomes an error.
+    #[test]
+    fn a_paint_walk_ends_when_a_side_dies_not_when_the_queue_drains() {
+        // A first-parent history of 2,000 changesets; `side` branched
+        // from the 100th and was never merged, so the a-side dies right
+        // after it is taken, while the b-side's tail is still queued.
+        const N: usize = 2_000;
+        let _slot = damage::slot();
+        let mut parents: Vec<Vec<usize>> = vec![vec![]];
+        let mut history = vec![0];
+        for _ in 1..N {
+            let last = *history.last().unwrap();
+            parents.push(vec![last]);
+            history.push(parents.len() - 1);
+        }
+        parents.push(vec![history[100]]);
+        let (_dir, store, repo, ids) = store_graph_seeded(&parents);
+        let (a, b) = (
+            At::get_unbounded(&store, repo, *ids.last().unwrap()).unwrap(),
+            At::get_unbounded(&store, repo, ids[history[N - 1]]).unwrap(),
+        );
+        let mut paint = Paint::new(a, b);
+        let bounded = Steps {
+            reads: 100,
+            visits: 1000,
+        };
+        let (bases, cost) = in_steps(
+            &store,
+            &later(),
+            bounded,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            |index| paint.next(index),
+        )
+        .unwrap();
+        assert_eq!(bases, [ids[history[100]]]);
+        assert!(cost.visits < 1000, "{cost:?}");
+    }
+
+    /// The visit bound bites at the first visit past it, and lets an
+    /// answer that lands exactly on it through: the comparison is
+    /// strictly greater, so a walk whose last move is visit `bound`
+    /// still answers, and one that needs one more dies.
+    #[test]
+    fn the_visit_bound_lets_an_answer_on_it_through() {
+        let _slot = damage::slot();
+        // 0 the root; 1 and 2 its children; 3 the merge of 1 and 2 (a);
+        // 4 a child of 1; 5 the merge of 4 and 2 (b). The paint walk
+        // between 3 and 5 answers in a handful of visits.
+        let parents = vec![vec![], vec![0], vec![0], vec![1, 2], vec![1], vec![4, 2]];
+        let (_dir, store, repo, ids) = store_graph(&parents);
+        let (a, b) = (
+            At::get_unbounded(&store, repo, ids[3]).unwrap(),
+            At::get_unbounded(&store, repo, ids[5]).unwrap(),
+        );
+        let mut paint = Paint::new(a, b);
+        let unbounded = Steps {
+            reads: 100,
+            visits: 1_000_000,
+        };
+        let (_, cost) = in_steps(
+            &store,
+            &later(),
+            unbounded,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            |index| paint.next(index),
+        )
+        .unwrap();
+        let answer_visits = cost.visits;
+        assert!(answer_visits > 0, "{cost:?}");
+        // The same walk, one visit short of its answer: the bound fires.
+        let mut paint = Paint::new(a, b);
+        let short = Steps {
+            reads: 100,
+            visits: answer_visits - 1,
+        };
+        let got = in_steps(
+            &store,
+            &later(),
+            short,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            |index| paint.next(index),
+        );
+        assert!(
+            matches!(&got, Err(crate::error::Error::ResourceExhausted(text))
+                if text.contains("visit bound")),
+            "{got:?}"
+        );
+        // The answer exactly on the bound goes through: the comparison
+        // is strict, so visit `bound` itself is allowed.
+        let mut paint = Paint::new(a, b);
+        let exact = Steps {
+            reads: 100,
+            visits: answer_visits,
+        };
+        let (bases, cost) = in_steps(
+            &store,
+            &later(),
+            exact,
+            &mut HashMap::new(),
+            &mut HashMap::new(),
+            |index| paint.next(index),
+        )
+        .unwrap();
+        assert_eq!(bases, [ids[1], ids[2]]);
+        assert_eq!(cost.visits, answer_visits);
+    }
 
     /// A deadline that a test does not reach.
     fn later() -> Deadline {
@@ -869,15 +1143,15 @@ mod tests {
     fn store_graph(
         parents: &[Vec<usize>],
     ) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
+        // The same changesets `testing::insert_graph` builds, stored
+        // through the metadata trait, so the graph tests run on the test
+        // backend the environment names, Postgres included.
         let (repo, ids) = store
             .write(|c| {
                 let repo = c.create_repo("r")?;
-                Ok((
-                    repo,
-                    testing::insert_graph(c.sqlite().unwrap(), repo, parents)?,
-                ))
+                Ok((repo, testing::insert_graph(c, repo, parents)?))
             })
             .unwrap();
         (dir, store, repo, ids)
@@ -900,6 +1174,41 @@ mod tests {
                     )?;
                 }
                 Ok(())
+            })
+            .unwrap();
+        (dir, store, repo, ids)
+    }
+
+    /// A new store with the file-less graph `parents` in repo `r`, its
+    /// derived rows seeded through
+    /// [`seed_file_less_ladder`](crate::seed::seed_file_less_ladder):
+    /// the same graphs the other helpers build, without a round trip
+    /// per changeset, so a test that measures a walk measures the walk.
+    fn store_graph_seeded(
+        parents: &[Vec<usize>],
+    ) -> (tempfile::TempDir, Backend, RepoId, Vec<ChangesetId>) {
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
+        let css: Vec<scion_core::Changeset> = parents
+            .iter()
+            .scan(Vec::new(), |ids, of| {
+                let cs = scion_core::Changeset::new(
+                    of.iter().map(|&p| ids[p]).collect(),
+                    scion_core::IdentityTime::new(b"a".to_vec(), b"a@x".to_vec(), 0, 0)
+                        .expect("identity fits the format"),
+                    None,
+                    format!("f{}", ids.len()).into_bytes(),
+                    std::collections::BTreeMap::default(),
+                )
+                .expect("changeset fits the format");
+                ids.push(cs.encode_with_id().1);
+                Some(cs)
+            })
+            .collect();
+        let (repo, ids) = store
+            .write(|c| {
+                let repo = c.create_repo("r")?;
+                Ok((repo, crate::seed::seed_file_less_ladder(c, repo, &css)?))
             })
             .unwrap();
         (dir, store, repo, ids)
@@ -975,7 +1284,8 @@ mod tests {
             parents in proptest::prop_oneof![testing::graphs(20), sparse_graphs(20)],
             pairs in proptest::collection::vec(any::<(Sample, Sample)>(), PAIRS),
         ) {
-            let (_dir, store, repo, ids) = store_graph(&parents);
+            let _slot = damage::slot();
+            let (_dir, store, repo, ids) = store_graph_seeded(&parents);
             let histories = histories(&parents);
             let ancestors = ancestors(&parents);
             let nodes: Vec<Node> = ids
@@ -1130,8 +1440,9 @@ mod tests {
         // second. The test counts reads, so its pass does not depend on how
         // busy the machine is.
         const N: usize = 4_096;
-        let dir = tempfile::tempdir().unwrap();
-        let store = Backend::sqlite(Store::open(dir.path()).unwrap());
+        let dir = crate::test_support::private_tempdir();
+        let store = Backend::open_test(dir.path()).unwrap();
+        let _slot = damage::slot();
         let (repo, ids, side) = deep_chain(&store, N);
         let tip = ids[N - 1];
         // Myers bounds a walk down to a depth by about 3 log2 n moves.
@@ -1199,6 +1510,7 @@ mod tests {
 
     #[test]
     fn an_old_database_derives_the_graph_in_steps_on_first_query() {
+        let _slot = damage::slot();
         let parents: Vec<Vec<usize>> = vec![vec![], vec![0], vec![0], vec![1, 2], vec![3], vec![]];
         let (_dir, store, repo, ids) = store_graph(&parents);
         let commits = store.commits();
@@ -1241,6 +1553,7 @@ mod tests {
         // changeset that branched from the one before. `side` branched from
         // the 100th, and is not merged.
         const N: usize = 20_000;
+        let _slot = damage::slot();
         let mut parents: Vec<Vec<usize>> = vec![vec![]];
         let mut history = vec![0];
         for i in 1..N {
@@ -1253,7 +1566,7 @@ mod tests {
             history.push(parents.len() - 1);
         }
         parents.push(vec![history[100]]);
-        let (_dir, store, repo, ids) = store_graph_with_nodes(&parents);
+        let (_dir, store, repo, ids) = store_graph_seeded(&parents);
         let (side, tip) = (*ids.last().unwrap(), ids[history[N - 1]]);
         let (a, b) = (
             At::get_unbounded(&store, repo, side).unwrap(),
@@ -1335,8 +1648,9 @@ mod tests {
 
     #[test]
     fn a_walk_stops_at_its_deadline() {
+        let _slot = damage::slot();
         // The walks from the tip go through every merge down to `side`.
-        let (_dir, store, repo, ids) = store_graph(&ladder(100));
+        let (_dir, store, repo, ids) = store_graph_seeded(&ladder(100));
         let (side, tip) = (ids[1], *ids.last().unwrap());
         let passed = Deadline::new(Instant::now());
         let late = is_ancestor(&store, repo, side, tip, &passed);
@@ -1372,6 +1686,7 @@ mod tests {
 
     #[test]
     fn a_walk_blocks_no_write_and_no_read() {
+        let _slot = damage::slot();
         let (_dir, store, repo, ids) = store_graph_with_nodes(&ladder(20));
         let (side, tip) = (ids[1], *ids.last().unwrap());
         let mut paint = Paint::new(
@@ -1410,6 +1725,7 @@ mod tests {
 
     #[test]
     fn a_walk_waits_for_one_flush_for_all_its_steps() {
+        let _slot = damage::slot();
         let (_dir, store, repo, ids) = store_graph_with_nodes(&ladder(20));
         let (side, tip) = (ids[1], *ids.last().unwrap());
         let mut paint = Paint::new(
@@ -1438,8 +1754,14 @@ mod tests {
         assert_eq!(bases, [side]);
         assert!(cost.steps > 1, "{cost:?}");
         // None where the commit's own fsync flushes the drive cache.
+        //
+        // The count is 0: the commit's durability is Postgres's
+        // (synchronous_commit=on, checked at open), and a commit whose
+        // changeset names no new blob file full-flushes nothing. A
+        // commit that starts to full-flush blob groups fails here.
+        let expected = 0;
         let flushes = store.blobs().full_flushes() - before;
-        assert_eq!(flushes, u64::from(crate::store::FSYNC_LEAVES_DRIVE_CACHE));
+        assert_eq!(flushes, expected);
     }
 
     /// The parents batch changes no walk's read count: every changeset the
@@ -1450,6 +1772,7 @@ mod tests {
     /// statement: the merge's parents read became the merge's node read.
     #[test]
     fn the_parents_batch_counts_the_same_reads() {
+        let _slot = damage::slot();
         let (_dir, store, repo, ids) = store_graph(&ladder(100));
         let (side, tip) = (ids[1], *ids.last().unwrap());
         let floor = store.read(|c| c.generation(repo, side)).unwrap();

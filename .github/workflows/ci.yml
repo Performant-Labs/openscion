@@ -15,13 +15,19 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  # The schedule runs in its own group. A concurrency group keeps one
+  # run in progress and at most one pending run, and a newer queued run
+  # replaces the pending one whatever cancel-in-progress says (GitHub
+  # docs, "Control the concurrency of workflows and jobs"): one group
+  # over the nightly and the pushes to main let any push replace a
+  # nightly that is waiting for the runner, and a busy day could keep
+  # the nightly waiting forever. A nightly that never ran is not a
+  # green night.
+  group: ${{ github.workflow }}-${{ github.event_name == 'schedule' && 'nightly' || github.ref }}
   # A pull_request run may cancel the run before it (same branch,
   # superseded); a push to main may not: a run in progress finishes
   # and verifies the head it ran on, and while it runs only the
-  # newest push waits — an older pending run is replaced, not run.
-  # A 03:00 schedule and a push to main share one group, and neither
-  # cancels: the nightly waits its turn.
+  # newest push waits - an older pending run is replaced, not run.
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 # Every third-party action is pinned to the commit SHA its version tag
@@ -33,6 +39,11 @@ concurrency:
 
 env:
   CARGO_TERM_COLOR: always
+  # The test cells' builds keep only line tables in their debug info:
+  # backtraces keep file and line at a fraction of the size, so the
+  # work disk holds the workspace's whole build.
+  CARGO_PROFILE_DEV_DEBUG: line-tables-only
+  CARGO_PROFILE_TEST_DEBUG: line-tables-only
 
 jobs:
   # The tier gate. It reads the pull request's own file list from the
@@ -50,60 +61,30 @@ jobs:
     if: github.event_name == 'pull_request' && !github.event.pull_request.draft
     outputs:
       docs_only: ${{ steps.files.outputs.docs_only }}
-      pg: ${{ steps.files.outputs.pg }}
       macos: ${{ steps.files.outputs.macos }}
       workflows: ${{ steps.files.outputs.workflows }}
       deps: ${{ steps.files.outputs.deps }}
+      mount: ${{ steps.files.outputs.mount }}
+      power: ${{ steps.files.outputs.power }}
     steps:
       - id: files
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           # The path rules live here, once; the table is in the pull
-          # request body. Each line names the file's change status and
-          # path, so a file the pull request deletes is skipped before
-          # any read of its content.
-          files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/${{ github.event.pull_request.number }}/files" --jq '.[] | "\(.status) \(.filename)"')
+          # request body.
+          files=$(gh api --paginate "repos/$GITHUB_REPOSITORY/pulls/${{ github.event.pull_request.number }}/files" --jq '.[].filename')
           docs_only=true
-          pg=false
           macos=false
           workflows=false
           deps=false
-          while IFS= read -r line; do
-            [ -z "$line" ] && continue
-            status=${line%% *}
-            file=${line#* }
+          mount=false
+          power=false
+          while IFS= read -r file; do
+            [ -z "$file" ] && continue
             case "$file" in
               docs/*|*.md|changes/*) ;;
               *) docs_only=false ;;
-            esac
-            # Server code, and tests that opt into the Postgres
-            # backend: the server's correctness depends on the
-            # Postgres transaction order, so any change under the
-            # server's src runs the Postgres tests; a test opts in
-            # when its text names the shared backend or the env var,
-            # and the globs catch the ones named pg or postgres, new
-            # ones included.
-            case "$file" in
-              crates/scion-server/src/*|\
-              crates/scion-server/migrations/*|\
-              crates/scion-server/tests/*pg*.rs|\
-              crates/scion-server/tests/*postgres*.rs) pg=true ;;
-              crates/scion-server/tests/*.rs)
-                # A file the pull request deletes has no content, so
-                # it is skipped before the read; the path rules above
-                # already applied to it. A file that cannot be read
-                # runs Postgres rather than skipping it.
-                if [ "$status" = removed ]; then
-                  :
-                elif ! content=$(gh api "repos/$GITHUB_REPOSITORY/contents/$file?ref=${{ github.event.pull_request.head.sha }}" --jq '.content' 2>/dev/null); then
-                  pg=true
-                  echo "::notice::cannot read $file, running Postgres to be safe"
-                elif printf '%s' "$content" | base64 -d 2>/dev/null \
-                  | grep -q 'open_test\|SCION_TEST_BACKEND\|SCION_TEST_POSTGRES_URL'; then
-                  pg=true
-                fi
-                ;;
             esac
             # macOS or filesystem code: the tier store, the scn vfs
             # and mount path, the permission checks — the ACL and
@@ -119,9 +100,15 @@ jobs:
             esac
             # Workflow or release files. The lint job's actionlint
             # step already runs for every pull request; the release
-            # smoke is the addition.
+            # smoke is the addition. A workflow change also runs the
+            # Postgres and macOS jobs: the workflows are how those
+            # jobs prove themselves, so a change to one runs the jobs
+            # it can break.
             case "$file" in
-              .github/workflows/*|scripts/release*) workflows=true ;;
+              .github/workflows/*|scripts/release*)
+                workflows=true
+                macos=true
+                ;;
             esac
             # A dependency surface: any manifest, any lockfile (the
             # root's or a fuzz workspace's), the deny configuration a
@@ -135,13 +122,34 @@ jobs:
               deny.toml|*/deny.toml|\
               scripts/check-deny-coverage.sh) deps=true ;;
             esac
+            # The power-cut suite: its harness lives in tests/common
+            # and the suite itself in tests/power.rs, so a pull request
+            # that touches either can break the power-loss job - which
+            # never ran on a pull request before. The power output
+            # makes the pull request run it.
+            case "$file" in
+              crates/scion-server/tests/common/*|\
+              crates/scion-server/tests/power.rs) power=true ;;
+            esac
+            # The writable mount: its code lives in the VFS, the
+            # mount command and the commit's mount path. A pull request
+            # that touches one runs the feature's tests, so a PR cannot
+            # break the writable build for main to find out after the
+            # merge.
+            case "$file" in
+              crates/scn/src/vfs.rs|\
+              crates/scn/src/cmd/mount.rs|\
+              crates/scn/src/cmd/commit.rs|\
+              crates/scn/tests/from_mount.rs) mount=true ;;
+            esac
           done <<< "$files"
           {
             echo "docs_only=$docs_only"
-            echo "pg=$pg"
             echo "macos=$macos"
             echo "workflows=$workflows"
             echo "deps=$deps"
+            echo "mount=$mount"
+            echo "power=$power"
           } >> "$GITHUB_OUTPUT"
 
   lint:
@@ -153,7 +161,9 @@ jobs:
     if: >-
       ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 5
+    # A hang guard, not a speed budget: a branch that changes a dependency's
+    # features rebuilds the workspace cold, and clippy runs past 5 minutes.
+    timeout-minutes: 15
     steps:
       # Depth 2: the changelog check names the pull request's own changes
       # as HEAD^1..HEAD, the base side of the merge commit.
@@ -173,6 +183,8 @@ jobs:
       - name: a golden change moves its format doc's version
         if: github.event_name == 'pull_request'
         run: scripts/check-golden-pairing.sh
+      - name: golden pairing rules
+        run: scripts/test-golden-pairing.sh
       - name: the changelog merge script does what it says
         run: scripts/test-merge-changelog.sh
       - name: the release tag verdicts hold (release-verify-tag)
@@ -182,6 +194,8 @@ jobs:
       # actionlint release is pinned by version and sha256.
       - name: the workflows parse (actionlint)
         run: scripts/lint-workflows.sh
+      - name: the actionlint download fails as a download (#897)
+        run: scripts/test-lint-workflows.sh
       - name: the capacity reader counters count the log's own shapes
         run: scripts/test-capacity-counters.sh
       - name: a script that dies leaves no owned process
@@ -189,10 +203,10 @@ jobs:
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
         with:
           components: rustfmt, clippy
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           # Save from main only. A pull request restores main's cache;
           # per-branch caches (66) blew past the 10 GB ceiling and evicted
@@ -200,6 +214,10 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The writable mount is a build feature, off by default: a
+      # PR that breaks the feature build must fail on the PR, not on
+      # main after the merge.
+      - run: cargo clippy -p open-scion --features unstable-writable-mount -- -D warnings
       # A release build has no dev-dependencies, so the test-hooks feature
       # stays off and every test-only item that a cfg misses shows up as
       # dead code. --all-targets unifies the dev-dependency that turns
@@ -209,8 +227,10 @@ jobs:
   docs:
     name: rustdoc
     needs: tier
-    # The docs tests run on every event and for every ready pull
-    # request; for a docs-only PR they are the only tier that runs.
+    # rustdoc runs on every event and for every ready pull request; for
+    # a docs-only PR it and the docs-tests job below are the only jobs
+    # that run. The docs tests are integration tests, not rustdoc, so
+    # they live in the separate docs-tests job below.
     if: >-
       ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft }}
     runs-on: ubuntu-24.04
@@ -218,13 +238,100 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: RUSTDOCFLAGS="-D warnings" cargo doc --workspace --no-deps
+
+  docs-tests:
+    name: docs tests
+    needs: tier
+    # The docs tests (links, the changes fragments, flags, operations,
+    # alerts, capacity, the CLI help) are integration tests of the docs
+    # pages. The test job skips a docs-only pull request, so without
+    # this job a broken link or a stale doc would land and fail main's
+    # first run instead. The same if as the docs job: for a docs-only
+    # PR the two of them are the only jobs that run. The test targets
+    # come from the docs_*.rs files themselves, so a new docs test
+    # file runs without a hand list to forget; the counts refuse a
+    # glob that matched nothing, so a moved directory cannot turn the
+    # job into a no-op.
+    if: >-
+      ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    services:
+      # The suite's Postgres tests read this database: the backend they
+      # choose is Postgres, and the URL names the database this service
+      # runs.
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        # The database's parallel plans and its cumulative statistics
+        # share /dev/shm, which Docker caps at 64 MB; the suite's schema
+        # pile-up filled it and the database crashed (#849). 256 MB is
+        # the headroom the plans need.
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --shm-size 256mb
+    steps:
+      # Full history: the capacity footer names a commit of main, and
+      # docs_capacity.rs checks it is an ancestor of origin/main - a
+      # shallow clone would skip that check.
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # A stray merge marker once sat in docs/faults.md through a whole
+      # green train: no job looked for one. This fails when the tracked
+      # tree holds a conflict marker (the open and close lines; the
+      # ======= middle line is left out because documents may hold one
+      # on purpose), and prints the lines it found. It runs in this job
+      # because this job runs on every event and for every ready pull
+      # request, docs-only ones included.
+      - name: no stray merge markers
+        run: |
+          if git grep -nE '^(<<<<<<<|>>>>>>>)( |$)'; then
+            echo '::error::a stray merge marker is in the tracked tree'
+            exit 1
+          fi
+      - name: the docs tests
+        run: |
+          shopt -s nullglob
+          server_files=(crates/scion-server/tests/docs_*.rs)
+          cli_files=(crates/scn/tests/docs_*.rs)
+          if [ "${#server_files[@]}" -eq 0 ] || [ "${#cli_files[@]}" -eq 0 ]; then
+            echo "no docs_*.rs files found: the docs tests would run nothing"
+            exit 1
+          fi
+          server_args=()
+          for f in "${server_files[@]}"; do server_args+=(--test "$(basename "$f" .rs)"); done
+          cli_args=()
+          for f in "${cli_files[@]}"; do cli_args+=(--test "$(basename "$f" .rs)"); done
+          df -h /
+          cargo test -p open-scion-server "${server_args[@]}"
+          df -h /
+          df -h /
+          cargo test -p open-scion "${cli_args[@]}"
+          df -h /
+        env:
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
 
   supply-chain:
     name: cargo-deny
@@ -240,7 +347,7 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-deny@0.20.2
       - run: cargo deny check
@@ -251,6 +358,16 @@ jobs:
       # root holds hold here too.
       - name: cargo deny check, in every fuzz sub-workspace
         run: |
+          # The lock check runs BEFORE cargo deny: cargo deny resolves a
+          # stale lock in place (its own resolution may write the
+          # lockfile), so a check after it would see the lock cargo deny
+          # already fixed, not the stale one the commit carried - the
+          # exact silent re-resolve this check exists to catch.
+          for toml in crates/*/fuzz/Cargo.toml; do
+            echo "== the lock matches the manifest in $(dirname "$toml")"
+            cargo metadata --locked --format-version 1 \
+              --manifest-path "$toml" > /dev/null
+          done
           for lock in crates/*/fuzz/Cargo.lock; do
             dir="$(dirname "$lock")"
             # Fail closed: cargo-deny only warns when its config is
@@ -275,22 +392,117 @@ jobs:
     if: >-
       ${{ !cancelled() && (needs.tier.result == 'success' || needs.tier.result == 'skipped') && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # Every suite runs on Postgres, and a cold cache adds the build: a
+    # cap covers both, the way the fuzz smoke's does.
+    # SHORTCUT: 50 min fits the whole-workspace Postgres suite (22-37
+    # min on main, Oct 2026) with margin; its cost is now the slow tail
+    # of whole-model oracles: the graph, path-log and log-page tests
+    # walk a seeded model of thousands of changesets, and the crash
+    # suite kills a server and lands again. Bring it back toward 30
+    # when the slowest model oracles get a cheaper full walk.
+    # #1197: the cap must also cover the ci profile's own kill - a hung
+    # test is killed and NAMED at 60 s x 20 (nextest.toml) inside this
+    # job, and the job must outlive the kill for the log to say so.
+    # Measured over the last 10 green main runs: the nextest step max
+    # 22.9 min, the other steps max 6.3, + the 20-min kill + 3 spare
+    # = 52.1 -> 53.
+    timeout-minutes: 53
+    services:
+      # The scripts' servers keep their metadata in Postgres: the smoke
+      # below (start-scion-smoke) opens the database this service names.
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        # headroom, see the first postgres service (#849)
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --shm-size 256mb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: free the runner's unused SDKs
+        run: |
+          # A hosted runner carries preinstalled SDKs this repo never
+          # builds with (tens of GB), and pool runners vary in how much
+          # free disk they start with: one died of "No space left on
+          # device" partway through the suite, too late for its log to
+          # upload. When the disk starts low, reclaim the SDKs by exact
+          # path before the build needs the room.
+          free_gb=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+          echo "free on / at start: ${free_gb} GB"
+          if [ "$free_gb" -lt 30 ]; then
+            for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; do
+              if [ -d "$dir" ]; then
+                sudo rm -rf "$dir"
+              fi
+            done
+            df -h /
+          fi
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
+          tool: cargo-nextest
+      # The test job and the pg cells build the same target (Linux
+      # x64, the same features), so one shared entry serves both, which
+      # keeps the repo under its 10 GB cache limit.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: test-postgres
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-workspace-crates: true
-      - run: cargo test --workspace
+      - name: the disk has room for the suite
+        run: |
+          # A green cell uses about 10 GB. Failing here, while the log
+          # still uploads, beats dying of "No space left on device" at
+          # the end: the error names the deficit instead of losing the
+          # run's output.
+          free_gb=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+          if [ "$free_gb" -lt 15 ]; then
+            echo "::error::only ${free_gb} GB free on /, the job needs 15 GB"
+            exit 1
+          fi
+          echo "free on / before the tests: ${free_gb} GB"
+      # The checked open's real-ACL case must run in CI, not skip: the
+      # script installs the acl package when the image lacks it, and
+      # SCION_TEST_REQUIRE_SETFACL=1 below makes a missing setfacl fail
+      # the test instead of skipping it.
+      - name: the real-ACL case has setfacl
+        run: scripts/ci-ensure-setfacl.sh
+      - run: |
+          cargo nextest run --workspace --profile ci
+          cargo test --doc --workspace
+          df -h /
         env:
-          # The fast tier: a pull request runs 500 cases, main, the
-          # nightly and a dispatch the full 2000.
-          PROPTEST_CASES: ${{ github.event_name == 'pull_request' && '500' || '2000' }}
+          # The fast tier: a pull request runs 64 cases, main, the
+          # nightly and a dispatch 128; the nightly's own job below
+          # still proves the full 2000 on Postgres.
+          PROPTEST_CASES: ${{ github.event_name == 'pull_request' && '64' || '128' }}
+          SCION_TEST_REQUIRE_SETFACL: "1"
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+          # The backup test dumps the live metadata with the job's own
+          # Postgres, so its tools match the server: the container name
+          # points at the service container above, and the test never
+          # stops it.
+          SCION_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
+      # The daemon startup rules (#592's data-dir gate) are exercised by
+      # no per-PR job otherwise: the dispatch scripts (soak, bench,
+      # capacity, version-matrix) start the daemon, the suite does not.
+      # A few seconds: start the stack through common.sh, one call
+      # through the daemon, stop. The stack's server keeps its metadata
+      # in Postgres, in the schema pg_url_for names for its data dir.
+      - name: the shell stack starts (server, cache, daemon)
+        env:
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+        run: scripts/start-scion-smoke.sh
       - name: the work tree is still clean after the tests
         run: |
           # A test that writes outside its sandbox (the #332 class) shows up
@@ -305,9 +517,11 @@ jobs:
             exit 1
           fi
       - name: a real disk full (tmpfs)
-        run: cargo test -p open-scion-server --test disk_full
+        run: |
+          cargo test -p open-scion-server --test disk_full
         env:
           SCION_DISK_REQUIRE: "1"
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
       - name: block-level power cuts (dm-log-writes)
         run: |
           # replay-log, pinned at 7b70d8a6863c5de30933d42a7672d35d01d2dc6c so the tool cannot move under the test.
@@ -318,6 +532,89 @@ jobs:
         env:
           SCION_DMW_REQUIRE: "1"
           SCION_DMW_REPLAY: ${{ runner.temp }}/replay-log
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+
+  test-restore-ceiling:
+    name: test (restore rss ceiling)
+    needs: tier
+    # The nightly, main and a dispatch only: the fixture is too much
+    # store for a shared machine's shared disk, the guard is release-shaped (a
+    # debug build's own baseline would eat the ceiling), and the
+    # measured peak lands in this job's log. The second step flips the
+    # replay's whole-file mutation lever and refuses a run where the
+    # mutated restore also passes, so the ceiling is never a guard a
+    # whole-history read slips under.
+    # The tier job is pull_request-shaped, so on a dispatch it is
+    # skipped: the ceiling runs anyway, the way lint does.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' && (needs.tier.result == 'success' || needs.tier.result == 'skipped')) }}
+    runs-on: ubuntu-24.04
+    # The whole workspace on one Postgres: the fast tier already
+    # proved the suites, this proves the majors. A cold cache adds the
+    # build, the way the fast tier's cap does.
+    timeout-minutes: 40
+    services:
+      # The suite's Postgres tests read this database: the backend they
+      # choose is Postgres, and the URL names the database this service
+      # runs.
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        # headroom, see the first postgres service (#849)
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --shm-size 256mb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-workspace-crates: true
+      - name: the streamed restore stays under its ceiling
+        run: |
+          df -h /
+          cargo test --release -p open-scion-server --test archive_restore_stream a_big_restore -- --nocapture
+          df -h /
+        env:
+          SCION_TEST_RESTORE_BIG: "1"
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+      - name: the whole-file read would not (the guard is not vacuous)
+        # The mutated run must fail for THE CEILING's reason, not any
+        # reason: a compile error or a missing /proc would "fail" the
+        # same way and prove nothing. The output must carry the
+        # ceiling assert's own text - the mutated run measured a peak,
+        # and the peak passed the bound. Any other failure shows the
+        # output and fails the step.
+        run: |
+          df -h /
+          if out=$(cargo test --release -p open-scion-server --test archive_restore_stream a_big_restore -- --nocapture 2>&1); then
+            echo "$out"
+            echo "::error::the whole-file mutation passed the ceiling: the guard is vacuous"
+            exit 1
+          fi
+          if ! printf '%s' "$out" | grep -q "passed the ceiling"; then
+            echo "$out"
+            echo "::error::the mutated run failed for a reason the ceiling did not name; the guard proves nothing"
+            exit 1
+          fi
+          printf '%s\n' "$out" | grep -oE "peak RSS \([0-9]+ kB\) passed the ceiling" | head -1
+          echo "the whole-file mutation blew the ceiling, as it must"
+          df -h /
+        env:
+          SCION_TEST_RESTORE_BIG: "1"
+          SCION_TEST_RESTORE_MUTATION: "whole_file"
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
 
   # The Postgres majors the support matrix claims (docs/support.md):
   # one native service per major, one matrix row each. The majors are
@@ -327,50 +624,120 @@ jobs:
   test-postgres:
     name: test (postgres ${{ matrix.version }})
     needs: tier
-    # Risk tier: a pull request that touches Postgres or metadata code
-    # also runs this job, on one Postgres version as today. Main, the
-    # nightly and a dispatch always run it.
+    # Fast tier: every event, but on a pull request only a ready,
+    # non-docs-only one - every suite is Postgres now, so the push that
+    # runs the suite runs the Postgres majors too.
     if: >-
-      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' && needs.tier.outputs.pg == 'true')) }}
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true')) }}
     runs-on: ubuntu-24.04
-    timeout-minutes: 30
+    # SHORTCUT: 45 min fits the Postgres suite (17-30 min on main, Oct
+    # 2026) with margin; its cost is now the same slow tail of
+    # whole-model oracles: the graph, path-log and log-page walks of
+    # seeded models, and the crash suite's kill-and-land loops. Bring
+    # it back toward 30 when the slowest model oracles get a cheaper
+    # full walk.
+    # #1197: the cap must cover the ci profile's own kill - a hung test
+    # is killed and NAMED at 60 s x 20 (nextest.toml) inside this job.
+    # One cap serves the whole matrix, sized to the hungriest cell:
+    # Postgres 16 measured (last 10 green main runs) step max 20.7,
+    # other steps max 3.6, + the 20-min kill + 3 spare = 47.3 -> 48.
+    timeout-minutes: 48
     strategy:
       fail-fast: false
       matrix:
-        # Every Postgres cell is experimental in v0.1.0. Postgres 17 is
-        # the one major that runs per push (on data-path changes, through
-        # the tier rule above); the 16 and 18 cells are best effort and
-        # run nightly and on a release candidate's dispatch.
+        # Postgres is the supported backend (docs/support.md). Postgres
+        # 17 is the one major that runs per push; the 16 and 18 cells
+        # are best effort and run nightly and on a release candidate's
+        # dispatch.
         version: ${{ (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') && fromJSON('["16.15", "17.11", "18.6"]') || fromJSON('["17.11"]') }}
+        # The digest pins. A tag can move to new bytes; a digest cannot
+        # (production-audit.md section 9). Each include entry pins the
+        # multi-arch image index of its tag, fetched live from the
+        # registry (the runners are x64 and arm64; both are in the
+        # index). Bump a version together with its digest line.
+        include:
+          - version: 16.15
+            digest: 9e2cf6287f25c3151f4c9421ccce2b17f3e60061c111a29165e0d2cdd9ff0a97
+          - version: 17.11
+            digest: b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+          - version: 18.6
+            digest: edb0c08dc33befd0262ab3b5cf1c4f3f8cfd8b09e88c05b45adee29d6761ddb6
     services:
       postgres:
-        image: postgres:${{ matrix.version }}
+        image: postgres:${{ matrix.version }}@sha256:${{ matrix.digest }}
         env:
           POSTGRES_PASSWORD: scion
           POSTGRES_DB: scion
         ports:
           - 5432:5432
+        # headroom, see the first postgres service (#849)
         options: >-
-          --health-cmd "pg_isready -U postgres"
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+          --shm-size 256mb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: free the runner's unused SDKs
+        run: |
+          # A hosted runner carries preinstalled SDKs this repo never
+          # builds with (tens of GB), and pool runners vary in how much
+          # free disk they start with: one died of "No space left on
+          # device" partway through the suite, too late for its log to
+          # upload. When the disk starts low, reclaim the SDKs by exact
+          # path before the build needs the room.
+          free_gb=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+          echo "free on / at start: ${free_gb} GB"
+          if [ "$free_gb" -lt 30 ]; then
+            for dir in /usr/share/dotnet /usr/local/lib/android /opt/ghc /opt/hostedtoolcache/CodeQL; do
+              if [ -d "$dir" ]; then
+                sudo rm -rf "$dir"
+              fi
+            done
+            df -h /
+          fi
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
+          tool: cargo-nextest
+      # The matrix cells share the test job's entry: same target (Linux
+      # x64), so one entry serves all four.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: test-postgres
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-workspace-crates: true
-      - run: cargo test -p open-scion-server
+      - name: the disk has room for the suite
+        run: |
+          # A green cell uses about 10 GB. Failing here, while the log
+          # still uploads, beats dying of "No space left on device" at
+          # the end: the error names the deficit instead of losing the
+          # run's output.
+          free_gb=$(df --output=avail -BG / | tail -1 | tr -dc 0-9)
+          if [ "$free_gb" -lt 15 ]; then
+            echo "::error::only ${free_gb} GB free on /, the job needs 15 GB"
+            exit 1
+          fi
+          echo "free on / before the tests: ${free_gb} GB"
+      # The checked open's real-ACL case must run in CI, not skip: the
+      # script installs the acl package when the image lacks it, and
+      # SCION_TEST_REQUIRE_SETFACL=1 below makes a missing setfacl fail
+      # the test instead of skipping it.
+      - name: the real-ACL case has setfacl
+        run: scripts/ci-ensure-setfacl.sh
+      - run: |
+          cargo nextest run --workspace --profile ci
+          cargo test --doc --workspace
+          df -h /
         env:
-          # The Postgres job proves backend parity, not more cases; the
-          # SQLite jobs already run 2000.
+          # The Postgres majors prove version parity, not more cases;
+          # the main job on 17 already runs 2000.
           PROPTEST_CASES: "64"
-          SCION_TEST_BACKEND: postgres
+          SCION_TEST_REQUIRE_SETFACL: "1"
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
           # The backup test dumps the live metadata with the job's own
           # Postgres, so its tools match the server: the container name
@@ -383,14 +750,14 @@ jobs:
       # data directory cannot cut the metadata. The SQLSTATE 53100 arm of
       # the disk-full mapping is a unit test of the run above.
       - name: a real disk full (tmpfs), on Postgres
-        run: cargo test -p open-scion-server --test disk_full
+        run: |
+          cargo test -p open-scion-server --test disk_full
         env:
           SCION_DISK_REQUIRE: "1"
-          SCION_TEST_BACKEND: postgres
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
       - name: block-level power cuts (dm-log-writes), on Postgres
         run: |
-          # replay-log, pinned as in the SQLite job above.
+          # replay-log, pinned as in the main job above.
           git clone https://github.com/josefbacik/log-writes "$RUNNER_TEMP/dlw"
           git -C "$RUNNER_TEMP/dlw" checkout 7b70d8a6863c5de30933d42a7672d35d01d2dc6c
           gcc -O2 -o "$RUNNER_TEMP/replay-log" "$RUNNER_TEMP/dlw/replay-log.c" "$RUNNER_TEMP/dlw/log-writes.c"
@@ -398,7 +765,6 @@ jobs:
         env:
           SCION_DMW_REQUIRE: "1"
           SCION_DMW_REPLAY: ${{ runner.temp }}/replay-log
-          SCION_TEST_BACKEND: postgres
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
       - name: the work tree is still clean after the tests
         run: |
@@ -418,12 +784,159 @@ jobs:
       # takes the database down while it runs.
       - name: the database may go down, and the store recovers
         run: |
-          container=$(docker ps --filter ancestor=postgres:${{ matrix.version }} --format '{{.Names}}' | head -1)
-          test -n "$container"
+          # The service container is found by its published port, never
+          # by the image reference: the image is pinned by digest, and
+          # a tag-shaped filter (ancestor=postgres:17.11) matches a
+          # digest-pinned container not at all. Exactly one container
+          # may publish 5432 on this runner; zero or two are a setup
+          # error the step names before any test runs.
+          names=$(docker ps --filter publish=5432 --format '{{.Names}}')
+          count=$(printf '%s\n' "$names" | grep -c . || true)
+          if [ "$count" -eq 0 ]; then
+            echo "::error::no container publishes 5432: the postgres service container is missing or did not start"
+            exit 1
+          fi
+          if [ "$count" -gt 1 ]; then
+            echo "::error::$count containers publish 5432: the takeover test cannot know which is the job's database ($names)"
+            exit 1
+          fi
+          container=$names
           SCION_TEST_PG_CONTAINER="$container" \
-          SCION_TEST_BACKEND=postgres \
           SCION_TEST_POSTGRES_URL=postgres://postgres:scion@localhost:5432/scion \
           cargo test -p open-scion-server --test backend_refusals -- --ignored
+
+  # The suite under umask 002 (issue #699): a run whose files land
+  # group-writable must still pass, because an operator's umask is not
+  # the suite's to choose. The temp-directory helpers set 0700
+  # explicitly, and the product's parent-directory refusals stay
+  # refusals; this job proves both on the schedule. It owns its
+  # Postgres service (one runner, one database), so no other run's
+  # connections compete with it.
+  # Runs on manual dispatch too, so a merge train runs it before it
+  # lands (#1210: four nightly-only breaks in a row).
+  # SHORTCUT: the job runs the suite with the runner's default test
+  # parallelism. If a nightly shows Postgres E53300 ("too many
+  # clients"), cap this job's --test-threads first, and raise the
+  # service's max_connections only if a capped run still exhausts.
+  test-umask-002:
+    name: test (umask 002)
+    needs: tier
+    if: ${{ !cancelled() && (github.event_name == 'schedule' || github.event_name == 'workflow_dispatch') }}
+    runs-on: ubuntu-24.04
+    # SHORTCUT: 45 min fits the Postgres suite (17-30 min on main, Oct
+    # 2026) with margin; its cost is the same slow tail of
+    # whole-model oracles the main job's 50 min budget names. Bring it
+    # back toward 30 when that tail shrinks.
+    # #1197: the cap must cover the ci profile's own kill - a hung test
+    # is killed and NAMED at 60 s x 20 (nextest.toml) inside this job.
+    # Measured over the green main schedule runs: the nextest step max
+    # 23.9 min, the other steps max 0.9, + the 20-min kill + 3 spare
+    # = 47.9 -> 48.
+    timeout-minutes: 48
+    services:
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --shm-size 256mb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: protoc
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-nextest
+      # Same target (Linux x64, the same features) as the test job, so
+      # one shared entry serves both.
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          shared-key: test-postgres
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-workspace-crates: true
+      # The checked open's real-ACL case must run in CI, not skip: the
+      # script installs the acl package when the image lacks it, and
+      # SCION_TEST_REQUIRE_SETFACL=1 below makes a missing setfacl fail
+      # the test instead of skipping it.
+      - name: the real-ACL case has setfacl
+        run: scripts/ci-ensure-setfacl.sh
+      - name: the whole suite under umask 002
+        run: |
+          umask 002
+          umask  # one line of proof in the log: the run's mask is 0002
+          cargo nextest run --workspace --profile ci
+          cargo test --doc --workspace
+        env:
+          PROPTEST_CASES: "128"
+          SCION_TEST_REQUIRE_SETFACL: "1"
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+          # The backup test dumps the live metadata with this job's own
+          # Postgres, so its tools match the server.
+          SCION_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
+      - name: the work tree is still clean after the tests
+        run: |
+          dirty=$(git status --porcelain --untracked-files=all)
+          if [ -n "$dirty" ]; then
+            git diff --exit-code || true
+            echo "::error::the test suite left the work tree dirty: $dirty"
+            exit 1
+          fi
+
+  test-writable:
+    name: test (the writable mount feature)
+    needs: tier
+    # Risk tier: a pull request that touches the mount's write path
+    # (the VFS, the mount command or the commit's mount path) also runs
+    # the feature's tests, so a PR cannot break the build that carries
+    # the write path. Main, the nightly and a dispatch always run it.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' && needs.tier.outputs.mount == 'true')) }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 15
+    services:
+      # The suite's Postgres tests read this database: the backend they
+      # choose is Postgres, and the URL names the database this service
+      # runs.
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        # headroom, see the first postgres service (#849)
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --shm-size 256mb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The feature build's tests: the write-side unit tests of the VFS
+      # and the from-mount suite, which the default build compiles out.
+      - run: |
+          df -h /
+          cargo test -p open-scion --features unstable-writable-mount
+          df -h /
+        env:
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
 
   test-macos:
     name: test (macOS)
@@ -434,27 +947,63 @@ jobs:
     if: >-
       ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.docs_only != 'true' && needs.tier.outputs.macos == 'true')) }}
     runs-on: macos-15
-    timeout-minutes: 40
+    # #1197: the cap must cover the ci profile's own kill - a hung test
+    # is killed and NAMED at 60 s x 20 (nextest.toml) inside this job,
+    # and the job must outlive the kill for the log to say so. Measured
+    # over the last 10 green main runs: the nextest step max 25.7 min,
+    # the other steps max 3.2, + the 20-min kill + 3 spare = 51.9 -> 52;
+    # the cap carries 55 because this job's wall spread is the widest
+    # (p90 26.9, max 28.9) and GitHub warns of macOS arm64 capacity
+    # limits, which stretch the setup steps unpredictably.
+    timeout-minutes: 55
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
           cache-workspace-crates: true
+      # macOS runs no service containers, so the suite's Postgres tests
+      # get a Homebrew postgresql@17: its data directory lives in the
+      # runner's temp, and the URL the suite reads names the database the
+      # step created. Full paths: postgresql@17 is keg-only, so a bare
+      # initdb may be another Postgres the image carries, and GITHUB_PATH
+      # only reaches later steps. The version line proves 17 in the log.
+      - name: postgres on macOS
+        if: runner.os == 'macOS'
+        run: |
+          brew install postgresql@17
+          PG=$(brew --prefix postgresql@17)/bin
+          "$PG/postgres" --version
+          "$PG/initdb" --username=postgres --auth=trust "$RUNNER_TEMP/pgdata"
+          "$PG/pg_ctl" -D "$RUNNER_TEMP/pgdata" -l "$RUNNER_TEMP/pg.log" start
+          "$PG/createdb" -U postgres -h 127.0.0.1 scion
+          # The backup test's no-container arm runs pg_dump and psql
+          # from the path: keg-only, so the tools go on the path for the
+          # later steps, with the version check the test itself runs.
+          echo "$PG" >> "$GITHUB_PATH"
       # The Linux lint job never compiles macOS-only code (the ACL FFI
       # module among it), so clippy runs here, before the tests: same
       # warm cache, a couple of minutes on a job that already builds
       # everything, and no second macOS runner to book. --all-targets
       # covers the lib, the bins and the test code in one pass.
       - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: |
+          df -h /
+          cargo nextest run --workspace --profile ci
+          cargo test --doc --workspace
+          df -h /
         env:
-          # A pull request runs 500 cases, main and the nightly 2000.
-          PROPTEST_CASES: ${{ github.event_name == 'pull_request' && '500' || '2000' }}
+          # A pull request runs 64 cases, main and the nightly 128;
+          # the nightly's own job proves the full 2000.
+          PROPTEST_CASES: ${{ github.event_name == 'pull_request' && '64' || '128' }}
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
       - name: the work tree is still clean after the tests
         run: |
           # New untracked files count too (a stray bench-output.txt);
@@ -490,32 +1039,403 @@ jobs:
 
 
   # The arm64 cells of the support matrix (docs/support.md) are proven
-  # here, natively: a hosted arm64 runner builds and runs the whole
-  # workspace on its own architecture. Cross-compiling is not evidence.
-  # The block-level power-cut suites (dm-log-writes) and the LazyFS
-  # power-loss job stay on x64: their loop-device and FUSE harnesses
-  # are proven there, and one platform carries that evidence.
-  test-arm64:
-    name: test (linux arm64)
+  # here, natively: hosted arm64 runners build and run the workspace on
+  # its own architecture, split into two jobs (the server crate's
+  # suite, and the rest of the workspace) so neither sits under load
+  # for the 45+ minutes in which the runner has been losing
+  # communication. Cross-compiling is not evidence. The block-level
+  # power-cut suites (dm-log-writes) and the LazyFS power-loss job
+  # stay on x64: their loop-device and FUSE harnesses are proven
+  # there, and one platform carries that evidence.
+  test-arm64-server:
+    name: test (linux arm64 server)
     # The arm64 cells are best effort until v0.8: the nightly and a
     # release candidate's dispatch prove them, a push does not.
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04-arm
-    timeout-minutes: 40
+    # The suite on Postgres stays well under 30 minutes; the cap only
+    # bounds a pathological cache.
+    # #1197: the cap covers the ci-full profile's own kill - a hung
+    # test is killed and NAMED at 60 s x 56 (nextest.toml) inside this
+    # job. Measured over the green main schedule runs: the nextest step
+    # max 39.8 min, the other steps max 0.9, + the 56-min kill + 3
+    # spare = 99.7 -> 100.
+    timeout-minutes: 100
+    services:
+      # The suite's Postgres tests read this database: the backend they
+      # choose is Postgres, and the URL names the database this service
+      # runs.
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        # headroom, see the first postgres service (#849)
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --shm-size 256mb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
-      - run: cargo test --workspace
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: |
+          df -h /
+          cargo nextest run -p open-scion-server --profile ci-full
+          cargo test --doc -p open-scion-server
+          df -h /
         env:
-          PROPTEST_CASES: "2000"
+          PROPTEST_CASES: "256"
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+          # The backup test dumps the live metadata with the job's own
+          # Postgres, so its tools match the server.
+          SCION_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
       - name: a real disk full (tmpfs)
-        run: cargo test -p open-scion-server --test disk_full
+        run: |
+          df -h /
+          cargo test -p open-scion-server --test disk_full
+          df -h /
         env:
           SCION_DISK_REQUIRE: "1"
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+
+  # The arm64 suite's second half: every workspace crate except the
+  # server. One job per suite keeps each arm64 run short - the runner
+  # deaths all landed in a single job that carried the whole workspace
+  # at once.
+  test-arm64-rest:
+    name: test (linux arm64 rest)
+    if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    services:
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        # headroom, see the first postgres service (#849)
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --shm-size 256mb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: protoc
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - run: |
+          df -h /
+          cargo nextest run --workspace --exclude open-scion-server --profile ci
+          cargo test --doc --workspace --exclude open-scion-server
+          df -h /
+        env:
+          PROPTEST_CASES: "256"
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+          SCION_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
+
+  # The nightly's proof that the whole proptest budget (2000 cases)
+  # passes on Postgres: the per-job counts above keep the per-push jobs
+  # under their caps, and the nightly carries the full run once a night
+  # in four jobs, each with its own Postgres service. One job proved
+  # too slow: the four slowest proofs share one runner and one
+  # database, and together they roughly double every wall (the 11-03
+  # nightly cancelled at its 2 h limit; alone, the same proofs measure
+  # half that). Each job id does not start with `test`: the
+  # support-matrix test holds every `test*` job to a matrix row, and
+  # these are budget proofs, not support cells.
+  #
+  # The measured walls are the 11-02 nightly's shared walls, from the
+  # one job that ran all four proofs together, before each proof got
+  # its ten concurrent workers - upper bounds for each proof alone,
+  # and the timeouts below are set from them: the land path-history
+  # proof 82 min, the path-log proof 64 min, the graph-queries proof
+  # 33 min, the view proof 10 min. The first nightly after the split
+  # measures each proof alone. Per case the
+  # proofs cost a constant (measured at 32 and 64 cases, one proof per
+  # run on a ten-reader pool: the land proof 1.26 s/case, the path-log
+  # proof 0.75, the graph queries 1.35, the view 0.22), so the walls
+  # scale with the case count alone, and the 11-03 nightly's doubling
+  # was the four proofs contending for one Postgres and one runner.
+  # Each job below names its own minutes and the trigger that splits
+  # it further.
+  proof-land-path-history:
+    name: proof (land path history)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    # SHORTCUT: 150 min fits the proof. The 11-02 nightly measured the
+    # four proofs' shared wall at 82 min for the land proof, an upper
+    # bound for the proof alone and 71% of a 120-minute window; 150
+    # brings that worst case back under 60%. The first nightly after
+    # the split measures the proof alone. Split the proof by cases
+    # when the job passes 70% of this timeout.
+    timeout-minutes: 150
+    services:
+      # The suite's Postgres tests read this database: the backend they
+      # choose is Postgres, and the URL names the database this service
+      # runs.
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        # headroom, see the first postgres service (#849)
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --shm-size 256mb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-workspace-crates: true
+      # The checked open's real-ACL case must run in CI, not skip: the
+      # script installs the acl package when the image lacks it, and
+      # SCION_TEST_REQUIRE_SETFACL=1 below makes a missing setfacl fail
+      # the test instead of skipping it.
+      - name: the real-ACL case has setfacl
+        run: scripts/ci-ensure-setfacl.sh
+      - run: |
+          df -h /
+          cargo test -p open-scion-server --lib -- --exact \
+            land::tests::a_check_in_the_path_history_matches_the_index_and_a_walk
+          df -h /
+        env:
+          PROPTEST_CASES: "2000"
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+      - name: the work tree is still clean after the tests
+        run: |
+          dirty=$(git status --porcelain --untracked-files=all)
+          if [ -n "$dirty" ]; then
+            git diff --exit-code || true
+            echo "::error::the test suite left the work tree dirty: $dirty"
+            exit 1
+          fi
+  proof-path-log:
+    name: proof (path log)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    # SHORTCUT: 120 min fits the proof. The 11-02 nightly measured the
+    # four proofs' shared wall at 64 min for the path-log proof, an
+    # upper bound for the proof alone; the first nightly after the
+    # split measures it alone. Split the proof by cases when the job
+    # passes 70% of this timeout.
+    timeout-minutes: 120
+    services:
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        # headroom, see the first postgres service (#849)
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --shm-size 256mb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-workspace-crates: true
+      - run: |
+          df -h /
+          cargo test -p open-scion-server --lib -- --exact \
+            history::tests::a_path_log_matches_a_walk_of_first_parents
+          df -h /
+        env:
+          PROPTEST_CASES: "2000"
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+      - name: the work tree is still clean after the tests
+        run: |
+          dirty=$(git status --porcelain --untracked-files=all)
+          if [ -n "$dirty" ]; then
+            git diff --exit-code || true
+            echo "::error::the test suite left the work tree dirty: $dirty"
+            exit 1
+          fi
+  proof-graph-queries:
+    name: proof (graph queries)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    # SHORTCUT: 120 min fits the proof. The 11-02 nightly measured the
+    # four proofs' shared wall at 33 min for the graph-queries proof,
+    # an upper bound for the proof alone; the 11-03 nightly's 102
+    # minutes was the four proofs contending for one Postgres and one
+    # runner, not the proof's own cost. The first nightly after the
+    # split measures it alone. Split the proof by cases when the job
+    # passes 70% of this timeout.
+    timeout-minutes: 120
+    services:
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        # headroom, see the first postgres service (#849)
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --shm-size 256mb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: protoc
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-workspace-crates: true
+      - run: |
+          df -h /
+          cargo test -p open-scion-server --lib -- --exact \
+            graph::tests::queries_match_the_graph
+          df -h /
+        env:
+          PROPTEST_CASES: "2000"
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+      - name: the work tree is still clean after the tests
+        run: |
+          dirty=$(git status --porcelain --untracked-files=all)
+          if [ -n "$dirty" ]; then
+            git diff --exit-code || true
+            echo "::error::the test suite left the work tree dirty: $dirty"
+            exit 1
+          fi
+  proptest-full:
+    name: test (proptest full)
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-24.04
+    # The remainder of the budget proof: the whole suite at the full
+    # 2000 cases, with the three proofs above skipped (the view proof
+    # stays here; alone it is the cheapest of the four). The skip names
+    # are checked first, so a renamed proof fails this job instead of
+    # slipping back into the remainder and running twice - or never.
+    # SHORTCUT: 120 min fits the suite minus the three proofs. The
+    # 11-02 nightly's 118 minutes was the one shared job's wall, set by
+    # the land proof; the remainder's own proofs measure 33 min and
+    # less on that wall. Split a proof by cases when its job passes
+    # 70% of its timeout.
+    # #1197: the cap covers the ci-full profile's own kill - a hung
+    # test is killed and NAMED at 60 s x 56 (nextest.toml) inside this
+    # job. Measured over the green main schedule runs: the test step
+    # max 117.9 min (the 2000-case proptest run), the other steps max
+    # 2.0, + the 56-min kill + 3 spare = 178.9 -> 179.
+    timeout-minutes: 179
+    services:
+      # The suite's Postgres tests read this database: the backend they
+      # choose is Postgres, and the URL names the database this service
+      # runs.
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        # headroom, see the first postgres service (#849)
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --shm-size 256mb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: protoc
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-nextest
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+          cache-workspace-crates: true
+      - name: the three skipped proof names still exist
+        run: |
+          list=$(cargo test -p open-scion-server --lib -- --list)
+          for name in \
+            land::tests::a_check_in_the_path_history_matches_the_index_and_a_walk \
+            history::tests::a_path_log_matches_a_walk_of_first_parents \
+            graph::tests::queries_match_the_graph; do
+            echo "$list" | grep -qx "$name: test" || {
+              echo "::error::the proof $name is gone or renamed; update the proof jobs and this list"
+              exit 1
+            }
+          done
+      - run: |
+          df -h /
+          # The same three skips as the proof jobs above, as a nextest
+          # filter: both selectors run the same set (verified against
+          # the libtest list; the ignored tests neither runs, and the
+          # doc tests the next line covers), and nextest names any test
+          # that hangs instead of holding the nightly to its limit.
+          cargo nextest run --workspace --profile ci-full \
+            -E 'not (test(=land::tests::a_check_in_the_path_history_matches_the_index_and_a_walk) or test(=history::tests::a_path_log_matches_a_walk_of_first_parents) or test(=graph::tests::queries_match_the_graph))'
+          cargo test --doc --workspace
+          df -h /
+        env:
+          PROPTEST_CASES: "2000"
+          SCION_TEST_REQUIRE_SETFACL: "1"
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+          # The backup test dumps the live metadata with the job's own
+          # Postgres, so its tools match the server.
+          SCION_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
+      - name: the work tree is still clean after the tests
+        run: |
+          dirty=$(git status --porcelain --untracked-files=all)
+          if [ -n "$dirty" ]; then
+            git diff --exit-code || true
+            echo "::error::the test suite left the work tree dirty: $dirty"
+            exit 1
+          fi
 
   # The xfs cell of the support matrix (docs/support.md): every store
   # the server suite opens lands on a real xfs loop device, through
@@ -530,13 +1450,33 @@ jobs:
     if: github.event_name == 'schedule' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
     timeout-minutes: 30
+    services:
+      # The suite's Postgres tests read this database: the backend they
+      # choose is Postgres, and the URL names the database this service
+      # runs.
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        # headroom, see the first postgres service (#849)
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --shm-size 256mb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: an xfs loop device for the stores
         run: |
           sudo apt-get update -qq
@@ -551,8 +1491,12 @@ jobs:
       - run: TMPDIR=/mnt/xfs cargo test -p open-scion-server
         env:
           # The xfs job proves filesystem parity, not more cases; the
-          # SQLite job on the runner disk already runs 2000.
+          # main job on the runner disk already runs 2000.
           PROPTEST_CASES: "64"
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
+          # The backup test dumps the live metadata with the job's own
+          # Postgres, so its tools match the server.
+          SCION_TEST_PG_CONTAINER: ${{ job.services.postgres.id }}
       - name: the loop device goes away
         if: always()
         run: |
@@ -562,8 +1506,13 @@ jobs:
 
   power-loss:
     name: power-loss
-    # The slow tier: main, the nightly and a dispatch only.
-    if: github.event_name != 'pull_request'
+    needs: tier
+    # The slow tier: main, the nightly and a dispatch only - plus a
+    # pull request whose change can break it (the suite's harness in
+    # tests/common, or the suite itself), the way pg runs the Postgres
+    # tests for the pull request that touches them.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.power == 'true')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 45
     services:
@@ -571,30 +1520,32 @@ jobs:
       # the blob files take the cuts, the metadata sits in the database's
       # own WAL, and the run proves the store reads what the cut left.
       postgres:
-        image: postgres:17.11
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
         env:
           POSTGRES_PASSWORD: scion
           POSTGRES_DB: scion
         ports:
           - 5432:5432
+        # headroom, see the first postgres service (#849)
         options: >-
-          --health-cmd "pg_isready -U postgres"
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+          --shm-size 256mb
     env:
       SCION_POWER_REQUIRE: "1"
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: cache the LazyFS build
-        uses: actions/cache@0057852bfaa89a56745cba8c7296529d2fc39830 # v4.3.0
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
         with:
           path: |
             ${{ runner.temp }}/lazyfs/lazyfs/build
@@ -627,23 +1578,20 @@ jobs:
         env:
           SCION_LAZYFS: ${{ runner.temp }}/lazyfs
           SCION_LAZYFS_TRACE_DIR: ${{ runner.temp }}/lazyfs-trace
-        run: cargo test -p open-scion-server --test power
-      - name: run (postgres)
-        env:
-          SCION_LAZYFS: ${{ runner.temp }}/lazyfs
-          SCION_LAZYFS_TRACE_DIR: ${{ runner.temp }}/lazyfs-trace
-          SCION_TEST_BACKEND: postgres
           SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
         # One server of the database at a time: the binary's Postgres open
         # takes the database's one-server lock, so the suite runs serially
-        # here. The SQLite run above stays parallel.
-        run: cargo test -p open-scion-server --test power -- --test-threads=1
+        # here.
+        run: |
+          df -h /
+          cargo test -p open-scion-server --test power -- --test-threads=1
+          df -h /
       # The suite writes the LazyFS ops trace to
       # $SCION_LAZYFS_TRACE_DIR/lazyfs-r<N>.log; on a failure the trace
       # says what the cut actually persisted.
       - name: upload the LazyFS trace
         if: failure()
-        uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4.6.2
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: lazyfs-trace
           path: |
@@ -653,8 +1601,13 @@ jobs:
 
   nfs-mount:
     name: mount (NFS)
-    # The slow tier: main, the nightly and a dispatch only.
-    if: github.event_name != 'pull_request'
+    needs: tier
+    # The slow tier: main, the nightly, a dispatch, and a pull request
+    # whose files the mount's code touches (the tier output `mount`):
+    # a PR that changes the mount must face the NFS mount, not leave
+    # it for main to find out after the merge.
+    if: >-
+      ${{ !cancelled() && (github.event_name != 'pull_request' || (needs.tier.result == 'success' && !github.event.pull_request.draft && needs.tier.outputs.mount == 'true')) }}
     runs-on: ubuntu-24.04
     timeout-minutes: 30
     services:
@@ -662,24 +1615,26 @@ jobs:
       # the marker and the blob files sit on the NFS mount, the metadata
       # sits in the database, and the run proves the mount of that half.
       postgres:
-        image: postgres:17.11
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
         env:
           POSTGRES_PASSWORD: scion
           POSTGRES_DB: scion
         ports:
           - 5432:5432
+        # headroom, see the first postgres service (#849)
         options: >-
-          --health-cmd "pg_isready -U postgres"
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
           --health-interval 5s
           --health-timeout 5s
           --health-retries 10
+          --shm-size 256mb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: the kernel NFS client
@@ -688,14 +1643,13 @@ jobs:
           sudo apt-get install -y -qq nfs-common
       # The script wraps every external command in `timeout`, and its trap
       # force-unmounts and kills the server and the mount on any exit, so
-      # a failed step cannot hang the runner until this cap.
+      # a failed step cannot hang the runner until this cap. The server's
+      # metadata lives in Postgres, in the schema pg_url_for names for its
+      # data dir; the run proves the mount of that half.
       - name: run the mount script
+        env:
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
         run: timeout 600 scripts/mount-nfs.sh
-      - name: run the mount script (postgres)
-        run: |
-          SCION_TEST_BACKEND=postgres \
-          SCION_TEST_POSTGRES_URL=postgres://postgres:scion@localhost:5432/scion \
-          timeout 600 scripts/mount-nfs.sh
 
   publish-check:
     name: publish check
@@ -706,7 +1660,7 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: protoc
       # One invocation, in dependency order: cargo resolves a packaged
@@ -724,14 +1678,14 @@ jobs:
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-      - uses: dtolnay/rust-toolchain@360a4e93673de6630fac2478bc9e35244b01a759 # 1.88, the MSRV: do not move
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: dtolnay/rust-toolchain@599c45df1a24c1c63ae1129a7e59f46654b8fb66 # 1.89, the MSRV: do not move
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
-      - run: cargo +1.88 check --locked --workspace --all-targets --all-features
+      - run: cargo +1.89 check --locked --workspace --all-targets --all-features
 
   grpc-conformance:
     name: conformance (grpcurl)
@@ -739,13 +1693,31 @@ jobs:
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
     timeout-minutes: 10
+    services:
+      # The suite's Postgres tests read this database: the backend they
+      # choose is Postgres, and the URL names the database this service
+      # runs.
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        # headroom, see the first postgres service (#849)
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --shm-size 256mb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - run: cargo build --release -p open-scion-server
@@ -754,6 +1726,8 @@ jobs:
       # object hashes to its ID with b3sum. The script fetches the pinned
       # grpcurl release and checks its sha256 before it runs.
       - run: scripts/grpc-conformance.sh
+        env:
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
 
   docker:
     name: docker demo
@@ -766,43 +1740,64 @@ jobs:
       # The layer cache holds the release build: the first run takes about
       # five minutes, a run after an ordinary push about one. The cache
       # export needs the container driver, not the default docker one.
-      - uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3.12.0
-      - uses: docker/build-push-action@10e90e3645eae34f1e60eeb005ba3a3d33f178e8 # v6.19.2
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - uses: docker/build-push-action@c3c9e263c25d99ce0380d002d59b67737d91b0dc # v7.4.0
         with:
           context: .
           load: true
           tags: open-scion-demo
           cache-from: type=gha
           cache-to: type=gha,mode=max
-      - name: run the demo (SQLite)
+      - name: run the demo
         run: sh docker/demo.sh
-      - name: run the demo (Postgres)
-        run: sh docker/demo.sh postgres
 
   fuzz:
     name: fuzz smoke (60 s)
     # The slow tier: main, the nightly and a dispatch only.
     if: github.event_name != 'pull_request'
     runs-on: ubuntu-24.04
-    timeout-minutes: 15
+    # A cap covers a cold build: after every Cargo.lock change the
+    # rust-cache misses and every fuzz target builds again (a warm run
+    # is 3.5 min, main's cold run went past the old 15).
+    timeout-minutes: 25
+    services:
+      # The suite's Postgres tests read this database: the backend they
+      # choose is Postgres, and the URL names the database this service
+      # runs.
+      postgres:
+        image: postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+        env:
+          POSTGRES_PASSWORD: scion
+          POSTGRES_DB: scion
+        ports:
+          - 5432:5432
+        # headroom, see the first postgres service (#849)
+        options: >-
+          --health-cmd "pg_isready -h 127.0.0.1 -U postgres"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+          --shm-size 256mb
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@2c76c034f9e32a5d6e2c104dc4df23a22476db04 # nightly
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
           workspaces: |
             crates/scion-core/fuzz
             crates/scion-proto/fuzz
             crates/scion-server/fuzz
             crates/scion-tier/fuzz
-          save-if: ${{ github.ref == 'refs/heads/main' }}
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: cargo-fuzz
       - name: fuzz the parsers
+        env:
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
         run: |
           # The prebuilt cargo-fuzz defaults to a musl target, where the
           # address sanitizer cannot run. The targets run four at a time:
@@ -844,16 +1839,48 @@ jobs:
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@b725eda525362e7cf34af9a7243cac1e3f01a7ec # stable
-      - uses: taiki-e/install-action@8cca0918f8471c33515202b73f56ab27f2bed283 # v2.87.29
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
         with:
           tool: protoc
-      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2.9.2
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
         with:
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The smoke's server keeps its metadata in Postgres, in the schema
+      # pg_url_for names for its data dir. Linux starts the database in a
+      # container (service containers do not run on the macOS image);
+      # macOS starts its own below.
+      - name: postgres on Linux
+        if: runner.os == 'Linux'
+        run: |
+          docker run -d --name postgres \
+            -e POSTGRES_PASSWORD=scion -e POSTGRES_DB=scion \
+            -p 5432:5432 \
+            postgres:17.11@sha256:b8faeff7712663c2773a190181e1246e37e364b887611c04658c28b44e2408fe
+          for _ in $(seq 1 30); do
+            docker exec postgres pg_isready -h 127.0.0.1 -U postgres >/dev/null 2>&1 && break
+            sleep 1
+          done
+          docker exec postgres pg_isready -h 127.0.0.1 -U postgres || { docker logs postgres; exit 1; }
+      # The macOS image runs no service containers: a Homebrew Postgres,
+      # started before the smoke and left to the runner.
+      - name: postgres on macOS
+        if: runner.os == 'macOS'
+        run: |
+          brew install postgresql@17
+          # Full paths: postgresql@17 is keg-only, so a bare initdb may be
+          # another Postgres the image carries, and GITHUB_PATH only
+          # reaches later steps. The version line proves 17 in the log.
+          PG=$(brew --prefix postgresql@17)/bin
+          "$PG/postgres" --version
+          "$PG/initdb" --username=postgres --auth=trust "$RUNNER_TEMP/pgdata"
+          "$PG/pg_ctl" -D "$RUNNER_TEMP/pgdata" -l "$RUNNER_TEMP/pg.log" start
+          "$PG/createdb" -U postgres -h 127.0.0.1 scion
       # The README quick start on the release binaries, twice (umask 022
       # and 002): import, ticket-key, serve, scn reads and writes, fsck,
       # and a one-signal shutdown that must exit 0, on Linux and macOS.
       - run: scripts/release-smoke.sh
+        env:
+          SCION_TEST_POSTGRES_URL: postgres://postgres:scion@localhost:5432/scion
 
   nightly-streak:
     name: nightly streak

@@ -17,7 +17,7 @@
 //! - Reads and writes run at READ COMMITTED. Rows that content addresses
 //!   never change once written, and refs and lands move only through
 //!   compare-and-swap predicates (`version = $n`, `state = 'pending'`), so
-//!   a lost swap is visible to the caller, as on SQLite.
+//!   a lost swap is visible to the caller.
 //! - Land IDs come from an identity sequence, so no ID is handed out
 //!   twice, and the newest land holds the largest one.
 
@@ -45,18 +45,28 @@ use crate::error::{Error, Result, Storage};
 use crate::history::NodeId;
 use crate::import::SHA1;
 use crate::land::{
-    EXPIRE_PER_LAND, LAND_RETENTION_SECS, LandOutcome, LandRequest, LandState, decode_paths,
-    encode_paths,
+    EXPIRE_PER_LAND, LAND_RETENTION_SECS, LandOutcome, LandRejectReason, LandRequest, LandState,
+    decode_paths, encode_paths,
 };
-use crate::meta::{FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId, StaleLand};
+use crate::meta::{
+    FsckDerivedRow, Meta, MetaTx, RefState, RepoChangeset, RepoId, StaleLand, StartRead,
+};
 use crate::store::Blobs;
+use crate::tree::{PreRead, RootTree};
 
 #[cfg(any(test, feature = "test-hooks"))]
 #[path = "test_support/pg.rs"]
 pub(crate) mod test_hooks;
 
+/// The damage tests make: one function per kind, each doing its kind's
+/// damage. A child module of `pg` (same as `test_hooks`) so the tests
+/// can reach this file's error mapping.
+#[cfg(test)]
+#[path = "test_support/damage.rs"]
+pub(crate) mod damage;
+
 /// The schema version this build makes and reads.
-pub(crate) const PG_SCHEMA_VERSION: u32 = 5;
+pub(crate) const PG_SCHEMA_VERSION: u32 = 6;
 
 /// How long a call may wait for a Postgres reader before the server
 /// answers [`Error::Unavailable`]. Well below the 600 s call deadline:
@@ -67,7 +77,7 @@ pub(crate) const READER_WAIT: Duration = Duration::from_secs(30);
 /// The bound on one statement of a read transaction, below the 600 s
 /// call deadline (`scn`'s), so one stuck query cannot hold a reader to
 /// the end of a stream.
-const READ_STATEMENT_TIMEOUT: Duration = Duration::from_secs(300);
+pub(crate) const READ_STATEMENT_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// How long a read transaction may sit idle between statements, so an
 /// abandoned walk (its call gone, its reply unread) gives the reader
@@ -76,8 +86,23 @@ const READ_IDLE_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// The advisory lock of the one server process of a database.
 const SERVER_LOCK: i64 = 0x5343_494F_4E53_5256;
-/// The advisory lock of one migration run of a database.
-const SCHEMA_LOCK: i64 = 0x5343_494F_4E53_4348;
+
+/// The readers this process has taken since the last reset, for a test
+/// that counts one walk's transactions by the readers it held.
+#[cfg(any(test, feature = "test-hooks"))]
+static TEST_READER_TAKES: AtomicU64 = AtomicU64::new(0);
+
+// The tests bound a walk's changeset-read cost by this counter, and the
+// full-stop gate keeps another test's statements out of its delta.
+#[cfg(any(test, feature = "test-hooks"))]
+thread_local! {
+    pub(crate) static CHANGESET_READS: std::cell::Cell<usize> =
+        const { std::cell::Cell::new(0) };
+}
+/// The advisory lock of one migration run of a database. An older
+/// build takes it alone, exclusive; this build takes it shared beside
+/// its own schema's key.
+pub(crate) const SCHEMA_LOCK: i64 = 0x5343_494F_4E53_4348;
 
 /// Schema migrations in order. Migration `n`, from 1, moves the database
 /// from version `n - 1` to version `n`. A released migration never changes.
@@ -87,6 +112,19 @@ const PG_MIGRATIONS: [&str; PG_SCHEMA_VERSION as usize] = [
     include_str!("../migrations/postgres/0003_view_trees.sql"),
     include_str!("../migrations/postgres/0004_store_uuid.sql"),
     include_str!("../migrations/postgres/0005_parent_numbering.sql"),
+    include_str!("../migrations/postgres/0006_land_reason.sql"),
+];
+
+/// The name of every migration, in the order [`PG_MIGRATIONS`] runs
+/// them: what `migrate --check` prints as the pending steps. One test
+/// keeps the two tables the same length.
+pub(crate) const PG_MIGRATION_NAMES: [&str; PG_SCHEMA_VERSION as usize] = [
+    "0001_init",
+    "0002_view_roots",
+    "0003_view_trees",
+    "0004_store_uuid",
+    "0005_parent_numbering",
+    "0006_land_reason",
 ];
 
 /// The fence of a process that lost the one-server lock. The worker of
@@ -130,9 +168,86 @@ pub(crate) struct Pg {
     inner: Arc<PgInner>,
 }
 
+/// How many slot holders may take the write client ahead of other
+/// waiting writers before the lane must let one through: a stream of
+/// settles must not starve the record commits that feed it.
+const WRITER_LANE_AHEAD: usize = 4;
+
+/// The write lane's state: who holds the write client, who waits, and
+/// how the lane orders them. A land that holds its ref's lock (the
+/// settle's commit and the sweep's reject; the finish's reads ride the
+/// read pool now) enters ahead of other waiting writers, because its
+/// wait costs the whole queue of its ref; the bound keeps the other
+/// writers moving. Without a slot holder waiting, the lane is today's
+/// plain queue.
+#[derive(Default)]
+struct WriterGate {
+    /// The write client is out with a transaction.
+    taken: bool,
+    /// Takers not yet released: waiting or granted. The derivation
+    /// step's wait watches this one.
+    waiting: usize,
+    /// Slot holders that wait, not granted yet.
+    holders_waiting: usize,
+    /// Other writers that wait, not granted yet.
+    plain_waiting: usize,
+    /// Slot holders granted since the last other writer was.
+    holders_ahead: usize,
+}
+
+/// Whether a taker of this class may take the client now: a slot
+/// holder goes while the other writers have not earned the bound's
+/// mercy, and an other writer goes when no slot holder waits or after
+/// the bound's run of slot holders.
+fn lane_admits(gate: &WriterGate, slot_holder: bool) -> bool {
+    if slot_holder {
+        gate.plain_waiting == 0 || gate.holders_ahead < WRITER_LANE_AHEAD
+    } else {
+        gate.holders_waiting == 0 || gate.holders_ahead >= WRITER_LANE_AHEAD
+    }
+}
+
 struct PgInner {
-    /// The write client, for every commit and [`Pg::read_unflushed`].
+    /// The write client, for every commit and [`Pg::read_unflushed`]. The
+    /// gate below decides who holds it when; the invariants this one
+    /// client keeps are listed on [`WriterGate`], where the queue lives.
     writer: Mutex<PgClient>,
+    /// The write lane's gate: who may take the write client next, and
+    /// when it is out. The one write client keeps these invariants, in
+    /// words, so the next change to this lock reads them here:
+    ///
+    /// - Write transactions are serial. One client means two write
+    ///   transactions of this process never run their statements side by
+    ///   side, so they cannot deadlock on row locks and cannot read each
+    ///   other's uncommitted state. The gate grants one taker at a time.
+    /// - Every write transaction takes the collector's advisory key
+    ///   (`pg_advisory_xact_lock(hashtext(current_schema() || ':gc'))`)
+    ///   and holds it to the transaction's end, with the lock-timeout
+    ///   layering that rides it: the 60 s guard set before the key's
+    ///   statement, the 5 s writer clock set with it for the rest of the
+    ///   transaction. The collector's re-read pins the blobs a writer
+    ///   just put.
+    /// - A changeset's generation is computed inside the transaction
+    ///   that inserts it (the parents' generations read there, the
+    ///   child's written as their max + 1), so no other write can slip
+    ///   a sibling in between.
+    /// - The land's settle runs its row writes and the ref's CAS in one
+    ///   transaction, and the verdict path re-reads the ref in the same
+    ///   transaction as the land row's update: a ref that moved aborts
+    ///   the verdict and the land replans.
+    /// - The land row's update is guarded by `state = 'pending'`: a twin
+    ///   call that settles first is stopped there.
+    /// - The fence lives in this client's session: the process knows it
+    ///   still owns the store because this session holds the one-server
+    ///   lock, and every commit checks the fence before it runs.
+    /// - A transaction that held changeset or derived rows without the
+    ///   flush rolls back and refuses; the write order is changesets,
+    ///   parents, membership, derived, history, git imports.
+    /// - The waiting count lets a derivation step wait while writers
+    ///   wait, so a steady stream of writers delays a cold read up to
+    ///   its deadline, never a land.
+    writer_gate: Mutex<WriterGate>,
+    writer_woken: Condvar,
     /// Set when this process lost the one-server lock: every read and
     /// write of this backend fails from then on, and the server that
     /// holds the backend exits (the [`Fence`]).
@@ -144,21 +259,36 @@ struct PgInner {
     /// first open creates the schema, and reports none.
     migrated: Option<(u32, u32)>,
     /// Clients for [`Pg::read`], at most [`READERS`](crate::store::READERS)
-    /// at once, like the readers of a SQLite store.
+    /// at once.
     readers: Readers,
     /// The blob folder: blob files stay on local disk in every backend.
     blobs: Blobs,
-    /// Writers that wait for the write client: the derivation walk waits
-    /// while they wait, so a steady stream of writers delays a cold read
-    /// up to its deadline, never a land ([#142]).
-    writers: Mutex<usize>,
-    write_woken: Condvar,
     /// The walks in flight of this backend's derivations.
     derive: crate::derived::DeriveFlights,
-    /// The import's test hooks and busy-retry count, as the SQLite store
-    /// keeps its own.
+    /// The RAM the view derivations of this backend reserve their memos
+    /// from: [`crate::views::VIEW_DERIVES_MAX`] reservations of
+    /// [`crate::views::VIEW_MEMO_BYTES`], so at most that many derivations
+    /// hold a memo at once and FLOOR counts the share.
+    view_memo: crate::memory::Bytes,
+    /// The import's test hooks and busy-retry count.
     #[cfg(any(test, feature = "test-hooks"))]
     hooks: crate::store::test_hooks::ImportHooks,
+    /// The commit seams the tests watch: the commits made, the write
+    /// transactions run, and how many of the next commits fail as a busy
+    /// database.
+    #[cfg(any(test, feature = "test-hooks"))]
+    committed: std::sync::atomic::AtomicU64,
+    /// How many deadline-less waits for writers ended - by the yield's
+    /// bound, or because the writers were done. The tests of the bound
+    /// read it: a retry of a refused write cannot bump it, so the turn
+    /// the bound grants is told apart from any writer's churn.
+    yield_turns: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "test-hooks"))]
+    txes: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_commits: std::sync::atomic::AtomicU64,
+    #[cfg(any(test, feature = "test-hooks"))]
+    fail_commits_disk_full: std::sync::atomic::AtomicU64,
     /// The operator metrics, set once by the server before it serves: a
     /// commit's wait for the collector's advisory key records how long
     /// it waited. Empty in import, fsck and gc, which export none.
@@ -199,7 +329,10 @@ impl Readers {
         let idle = (0..size)
             .map(|_| {
                 let client = connect_with(url, ca, options, schema)?;
-                let on: String = client.query("SHOW synchronous_commit", &[])?[0].get(0);
+                let on: String = client.query("SHOW synchronous_commit", &[]).map_err(|e| {
+                    named_step("a reader's durability check", "SHOW synchronous_commit", e)
+                })?[0]
+                    .get(0);
                 if on != "on" {
                     return Err(Error::FailedPrecondition(format!(
                         "the database runs synchronous_commit={on}; this \
@@ -253,6 +386,8 @@ impl Readers {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .push(started_at);
+        #[cfg(any(test, feature = "test-hooks"))]
+        TEST_READER_TAKES.fetch_add(1, Ordering::Relaxed);
         self.report_busy();
         if let Some(metrics) = self.metrics() {
             metrics.pg_pool_wait(started.elapsed());
@@ -471,6 +606,25 @@ struct Job {
 
 type RawFn = Box<dyn FnOnce(&mut Client) -> Result<()> + Send>;
 
+/// The record's key lookup answers all of it at once: the repo, the
+/// land the key already recorded (its columns when present), the input's
+/// generation, the target ref's existence, the caller's pending count.
+type RecordLookup = (RepoId, Option<i64>, Option<LandOutcome>, bool, i64);
+
+/// A land column the join must have set, or the row is corrupt.
+///
+/// # Errors
+///
+/// [`Error::Corrupt`] when the column is missing.
+fn need<T>(v: Option<T>, land_id: i64, repo: RepoId) -> Result<T> {
+    v.ok_or_else(|| {
+        Error::Corrupt(format!(
+            "land {land_id} of repo {} lost its columns",
+            repo.0
+        ))
+    })
+}
+
 /// A client of the database, driven by one worker thread. The sync
 /// `postgres` client runs its own tokio runtime, which must not start
 /// inside the server's, so a statement is sent to the worker and the
@@ -479,7 +633,177 @@ struct PgClient {
     jobs: std::sync::mpsc::Sender<Job>,
 }
 
+/// The worker loop's next step: run another job, or stop the thread.
+enum Flow {
+    Go,
+    Stop,
+}
+
+/// The panic's message, for the log: a panic payload is `&str`, `String`,
+/// or anything else.
+fn panic_text(payload: &(dyn std::any::Any + Send)) -> String {
+    if let Some(text) = payload.downcast_ref::<&str>() {
+        (*text).to_owned()
+    } else if let Some(text) = payload.downcast_ref::<String>() {
+        text.clone()
+    } else {
+        "a panic with no message".to_owned()
+    }
+}
+
+/// The reply a caller gets when the worker thread is gone. The log names
+/// why: the worker logs its own death, panic or shutdown.
+pub(crate) const WORKER_STOPPED: &str = "the database worker stopped: its log line names why";
+
+/// Serves one job on the worker thread: the loop body of
+/// [`PgClient::spawn`], lifted out so its panics are caught and logged
+/// instead of ending the thread in silence. `continue` is
+/// [`Flow::Go`], `break` is [`Flow::Stop`].
+#[allow(clippy::too_many_arguments)]
+fn run_job(
+    job: Job,
+    client: &mut Client,
+    setup: &mut Setup,
+    conn: &Conn,
+    tx: &mut TxState,
+    ever_held: &mut bool,
+    fence: Option<&std::sync::Arc<Fence>>,
+) -> Flow {
+    // A transaction the reconnect dropped fails every
+    // statement until its caller ends it. Its COMMIT
+    // never runs: on the fresh session it would answer
+    // Ok about a transaction that is gone. A BEGIN may
+    // pass: the reconnect ended the old tx, so a BEGIN
+    // starts a fresh one on the fresh session, and a new
+    // BEGIN comes only from a new holder of the client,
+    // which the lost transaction cannot reach.
+    if tx.lost() && !job.sql.starts_with("ROLLBACK") && !job.sql.starts_with("BEGIN") {
+        // The caller may be gone, which is fine: the reply
+        // fails, and the job's outcome is the caller's
+        // business. The worker goes on to the next job.
+        let _ = job.reply.send(Err(Error::Unavailable(TX_LOST.into())));
+        return Flow::Go;
+    }
+    // A client the server closed, as after a restart of
+    // the database, connects again: the caller sees one
+    // error at most. A reconnect inside a transaction
+    // loses the transaction.
+    let lost_tx = tx.in_progress();
+    let mut reconnected = false;
+    if client.is_closed() {
+        match reconnect(client, conn) {
+            Ok(fresh) => {
+                *setup = fresh;
+                if lost_tx {
+                    *tx = TxState::Lost;
+                }
+            }
+            Err(error) => {
+                if job.reply.send(Err(error)).is_err() {
+                    return Flow::Stop;
+                }
+                return Flow::Go;
+            }
+        }
+        reconnected = true;
+        // The lock state of the fresh session is checked
+        // here, before any lost-tx reply: a lock lost
+        // across a wedge of dead transactions still fences
+        // the process.
+        if !setup.ok() {
+            if *ever_held && matches!(setup.outcome, SetupOutcome::LockRefused) {
+                trip_fence(fence);
+            }
+            // A database that cannot be reached is no
+            // proof of a takeover: the caller retries.
+            let _ = job.reply.send(Err(setup_error(setup, *ever_held)));
+            return Flow::Go;
+        }
+    }
+    // The setup failed on a client that still lives: a
+    // network break left the old session of this very
+    // connection holding the lock, and the session dies
+    // some while after the connection did. One retry a
+    // job, so the recovery needs no process restart.
+    if !setup.ok() {
+        *setup = Setup::new(conn.schema.as_deref(), conn.exclusive, client);
+    }
+    if !setup.ok() {
+        if *ever_held && matches!(setup.outcome, SetupOutcome::LockRefused) {
+            trip_fence(fence);
+        }
+        let _ = job.reply.send(Err(setup_error(setup, *ever_held)));
+        return Flow::Go;
+    }
+    *ever_held = true;
+    // A transaction the reconnect dropped refuses this job
+    // too: it was asked while the old connection held the
+    // transaction, and the new one holds none (its COMMIT
+    // would answer Ok about a transaction that is gone).
+    // A new BEGIN passes: the reconnect ended the old tx,
+    // so the BEGIN opens a fresh one on the fresh session.
+    // As above: a gone caller is fine, the worker goes on.
+    if reconnected && lost_tx && !job.sql.starts_with("ROLLBACK") && !job.sql.starts_with("BEGIN") {
+        let _ = job.reply.send(Err(Error::Unavailable(TX_LOST.into())));
+        return Flow::Go;
+    }
+    if job.kind == Kind::Raw {
+        let mut job = job;
+        let f = job.raw.take().expect("a raw job carries its closure");
+        let _ = job.reply.send(f(client).map(|(): ()| Reply::Count(0)));
+        return Flow::Go;
+    }
+    let out = run_with_retry(client, setup, conn, &job, tx, *ever_held, fence);
+    if setup.ok() {
+        *ever_held = true;
+    }
+    *tx = tx.after(&job.sql, out.is_ok());
+    if job.reply.send(out).is_err() {
+        return Flow::Stop;
+    }
+    Flow::Go
+}
+
+/// Opens a transaction with `open`'s statements, in one round trip. A
+/// batch whose later command fails after its `BEGIN` ran leaves the
+/// session inside a transaction Postgres has marked aborted: the next
+/// holder of the client would meet "current transaction is aborted" on
+/// every statement until a rollback. So a failed open rolls back before
+/// the error returns; the rollback's own failure (a lost connection)
+/// is fine - the reconnect's setup handles that session.
+fn open_transaction(c: &PgClient, open: &str) -> Result<()> {
+    if let Err(error) = c.batch(open) {
+        let _ = c.execute("ROLLBACK", &[]);
+        return Err(error);
+    }
+    Ok(())
+}
+
 impl PgClient {
+    /// Runs one closure with the client on the worker thread. The sync
+    /// client must never be touched from a tokio thread; the test
+    /// schema's preparation calls it. No production path needs the
+    /// client whole, so the method is test-only.
+    #[cfg(any(test, feature = "test-hooks"))]
+    fn raw(&self, f: RawFn) -> Result<()> {
+        let (reply, rx) = std::sync::mpsc::channel();
+        self.jobs
+            .send(Job {
+                sql: String::new(),
+                params: Vec::new(),
+                kind: Kind::Raw,
+                reply,
+                raw: Some(f),
+            })
+            .map_err(|_| Error::Corrupt(WORKER_STOPPED.into()))?;
+        match rx.recv() {
+            Ok(Ok(Reply::Count(_))) => Ok(()),
+            Ok(Ok(_)) => unreachable!("a raw job replies with a count"),
+            Ok(Err(error)) => Err(error),
+            Err(_) => Err(Error::Corrupt(WORKER_STOPPED.into())),
+        }
+    }
+
     /// Puts `client` on its own worker thread.
     ///
     /// # Errors
@@ -514,112 +838,37 @@ impl PgClient {
                 // cannot hide a takeover from the fence.
                 let mut ever_held = setup.ok();
                 for job in rx {
-                    // A transaction the reconnect dropped fails every
-                    // statement until its caller ends it. Its COMMIT
-                    // never runs: on the fresh session it would answer
-                    // Ok about a transaction that is gone. A BEGIN may
-                    // pass: the reconnect ended the old tx, so a BEGIN
-                    // starts a fresh one on the fresh session, and a new
-                    // BEGIN comes only from a new holder of the client,
-                    // which the lost transaction cannot reach.
-                    if tx.lost()
-                        && !job.sql.starts_with("ROLLBACK")
-                        && !job.sql.starts_with("BEGIN")
-                    {
-                        // The caller may be gone, which is fine: the reply
-                        // fails, and the job's outcome is the caller's
-                        // business. The worker goes on to the next job.
-                        let _ = job.reply.send(Err(Error::Corrupt(TX_LOST.into())));
-                        continue;
-                    }
-                    // A client the server closed, as after a restart of
-                    // the database, connects again: the caller sees one
-                    // error at most. A reconnect inside a transaction
-                    // loses the transaction.
-                    let lost_tx = tx.in_progress();
-                    let mut reconnected = false;
-                    if client.is_closed() {
-                        match reconnect(&mut client, &conn) {
-                            Ok(fresh) => {
-                                setup = fresh;
-                                if lost_tx {
-                                    tx = TxState::Lost;
-                                }
-                            }
-                            Err(error) => {
-                                if job.reply.send(Err(error)).is_err() {
-                                    break;
-                                }
-                                continue;
-                            }
+                    // A panic in this body must not end the thread in
+                    // silence: the caller's only answer would be "the
+                    // worker stopped", with nothing in the log. The body
+                    // runs under the catch, its panic lands in the log,
+                    // and the thread still stops: a panic leaves the
+                    // transaction and the setup state undefined.
+                    let reply = job.reply.clone();
+                    let done = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                        run_job(
+                            job,
+                            &mut client,
+                            &mut setup,
+                            &conn,
+                            &mut tx,
+                            &mut ever_held,
+                            fence.as_ref(),
+                        )
+                    }));
+                    match done {
+                        Ok(Flow::Go) => {}
+                        Ok(Flow::Stop) => break,
+                        Err(payload) => {
+                            tracing::error!(
+                                panic = panic_text(payload.as_ref()),
+                                "the postgres worker thread panicked and stopped; \
+                                 every statement of this client fails until the \
+                                 process restarts"
+                            );
+                            let _ = reply.send(Err(Error::Corrupt(WORKER_STOPPED.into())));
+                            break;
                         }
-                        reconnected = true;
-                        // The lock state of the fresh session is checked
-                        // here, before any lost-tx reply: a lock lost
-                        // across a wedge of dead transactions still fences
-                        // the process.
-                        if !setup.ok() {
-                            if ever_held && matches!(setup.outcome, SetupOutcome::LockRefused) {
-                                trip_fence(fence.as_ref());
-                            }
-                            // A database that cannot be reached is no
-                            // proof of a takeover: the caller retries.
-                            let _ = job.reply.send(Err(setup_error(&setup, ever_held)));
-                            continue;
-                        }
-                    }
-                    // The setup failed on a client that still lives: a
-                    // network break left the old session of this very
-                    // connection holding the lock, and the session dies
-                    // some while after the connection did. One retry a
-                    // job, so the recovery needs no process restart.
-                    if !setup.ok() {
-                        setup = Setup::new(conn.schema.as_deref(), conn.exclusive, &mut client);
-                    }
-                    if !setup.ok() {
-                        if ever_held && matches!(setup.outcome, SetupOutcome::LockRefused) {
-                            trip_fence(fence.as_ref());
-                        }
-                        let _ = job.reply.send(Err(setup_error(&setup, ever_held)));
-                        continue;
-                    }
-                    ever_held = true;
-                    // A transaction the reconnect dropped refuses this job
-                    // too: it was asked while the old connection held the
-                    // transaction, and the new one holds none (its COMMIT
-                    // would answer Ok about a transaction that is gone).
-                    // A new BEGIN passes: the reconnect ended the old tx,
-                    // so the BEGIN opens a fresh one on the fresh session.
-                    // As above: a gone caller is fine, the worker goes on.
-                    if reconnected
-                        && lost_tx
-                        && !job.sql.starts_with("ROLLBACK")
-                        && !job.sql.starts_with("BEGIN")
-                    {
-                        let _ = job.reply.send(Err(Error::Corrupt(TX_LOST.into())));
-                        continue;
-                    }
-                    if job.kind == Kind::Raw {
-                        let mut job = job;
-                        let f = job.raw.take().expect("a raw job carries its closure");
-                        let _ = job.reply.send(f(&mut client).map(|(): ()| Reply::Count(0)));
-                        continue;
-                    }
-                    let out = run_with_retry(
-                        &mut client,
-                        &mut setup,
-                        &conn,
-                        &job,
-                        &mut tx,
-                        ever_held,
-                        fence.as_ref(),
-                    );
-                    if setup.ok() {
-                        ever_held = true;
-                    }
-                    tx = tx.after(&job.sql, out.is_ok());
-                    if job.reply.send(out).is_err() {
-                        break;
                     }
                 }
             })
@@ -642,9 +891,9 @@ impl PgClient {
                 reply,
                 raw: None,
             })
-            .map_err(|_| Error::Corrupt("the database worker stopped".into()))?;
+            .map_err(|_| Error::Internal(WORKER_STOPPED.into()))?;
         rx.recv()
-            .map_err(|_| Error::Corrupt("the database worker stopped".into()))?
+            .map_err(|_| Error::Internal(WORKER_STOPPED.into()))?
     }
 
     /// The rows of one query.
@@ -683,12 +932,31 @@ impl PgClient {
 /// here: it is a statement on the live connection, which the server
 /// cannot lose between connections.
 fn base_options() -> String {
-    // A lock a writer waits for is a busy database: 5 s, like the busy
-    // timeout of the SQLite store. A statement itself may walk the graph
-    // for minutes, so only the lock is under the short clock.
+    // A lock a writer waits for is a busy database: 5 s, the lock
+    // bound. A statement itself may walk the graph for minutes, so only
+    // the lock is under the short clock.
     format!(
-        "-csynchronous_commit=on -cstatement_timeout=600000 -clock_timeout={LOCK_TIMEOUT_FOR_WRITERS}"
+        "-csynchronous_commit=on -cstatement_timeout={budget} -clock_timeout={LOCK_TIMEOUT_FOR_WRITERS}",
+        budget = base_statement_timeout()
     )
+}
+
+/// The per-statement budget every lane's connection opens with, in
+/// milliseconds: a runaway statement is answered instead of hanging the
+/// lane. The migration runner lifts it for the migration window
+/// (`migrate_under_lock`) and puts it back before the client serves
+/// anything else — a migration is the operator's ask, not a lane's call.
+const BASE_STATEMENT_TIMEOUT_MS: u32 = 600_000;
+
+fn base_statement_timeout() -> String {
+    // The timeout tests shrink the base budget so a statement under it
+    // is reachable in a test: the migrate path must not inherit it.
+    // Release builds never read the env.
+    #[cfg(any(test, feature = "test-hooks"))]
+    if let Ok(shrunk) = std::env::var("SCION_TEST_STATEMENT_TIMEOUT") {
+        return shrunk;
+    }
+    BASE_STATEMENT_TIMEOUT_MS.to_string()
 }
 
 /// The lock clock every writer runs under: a lock a writer waits for is a
@@ -703,6 +971,80 @@ const LOCK_TIMEOUT_FOR_WRITERS: &str = "5s";
 /// queue drains as fast as the writers commit.
 const LOCK_TIMEOUT_FOR_KEY: &str = "60s";
 
+/// The write lane's key statement, riding its transaction's open batch
+/// (one round trip instead of two). The batch runs the simple query
+/// protocol, which takes no parameters; this statement carries none
+/// either - `current_schema()` is read server side - so nothing is
+/// formatted into it but its own fixed text. The guards keep their
+/// order: the open batch's `SET LOCAL lock_timeout` is its own
+/// statement, in force before the key's wait begins (`lock_timeout` is
+/// read when the wait starts), and the key's statement - the OFFSET 0
+/// data dependency and the 5 s restore - is byte-identical to the
+/// two-statement shape (`tests/pg_guard_timeouts.rs` pins the plan and
+/// the timing). A wait the batch loses arrives as one error from
+/// `open_transaction`, whose ROLLBACK leaves no transaction behind.
+const LANE_KEY_STATEMENT: &str = "SELECT set_config('lock_timeout', '5s', true) \
+     FROM (SELECT pg_advisory_xact_lock(hashtext(current_schema() || ':gc')) \
+           OFFSET 0) AS held";
+
+/// The one decision an open and a preflight both need, made here so
+/// the two cannot drift.
+pub(crate) enum Pairing {
+    /// The marker and the row name one store.
+    Agree,
+    /// The database names a store the directory has no marker of, and
+    /// the schema holds no repos: a first open cut before its marker.
+    /// The open adopts the database's store and writes the marker.
+    AdoptCut,
+    /// Neither side names a store: the first open mints one.
+    Fresh,
+    /// A refusal, in the open's own words.
+    Refuse(Error),
+}
+
+/// The marker's pairing with the database's store row. `has_repos`:
+/// the schema holds at least one repo row, so a store ever served it -
+/// the one meaning the flag carries at every call.
+pub(crate) fn pairing_decision(
+    marker: Option<[u8; 16]>,
+    held: Option<[u8; 16]>,
+    has_repos: bool,
+) -> Pairing {
+    match (marker, held) {
+        (Some(marker_uuid), Some(held_uuid)) if marker_uuid == held_uuid => Pairing::Agree,
+        (Some(marker_uuid), Some(held_uuid)) => {
+            Pairing::Refuse(Error::FailedPrecondition(format!(
+                "this data directory belongs to the store whose \
+                 UUID is {}, but the database names the store {}: \
+                 one was restored over the other; give the \
+                 directory of the database's own store, or a \
+                 directory the database has never served",
+                hex16(&marker_uuid),
+                hex16(&held_uuid)
+            )))
+        }
+        (None, Some(held_uuid)) if has_repos => {
+            Pairing::Refuse(Error::FailedPrecondition(format!(
+                "this database names the store {}, but the data \
+                 directory carries no marker of it: give the \
+                 directory the database was served with, or a \
+                 directory it has never served",
+                hex16(&held_uuid)
+            )))
+        }
+        (None, Some(_)) => Pairing::AdoptCut,
+        (Some(marker_uuid), None) if !has_repos => {
+            Pairing::Refuse(Error::FailedPrecondition(format!(
+                "this data directory belongs to the store whose UUID \
+                 is {}, but this database holds no store: check \
+                 SCION_POSTGRES_URL and its search_path",
+                hex16(&marker_uuid)
+            )))
+        }
+        (Some(_) | None, None) => Pairing::Fresh,
+    }
+}
+
 /// The identity of this database, minted at the first open. The marker
 /// file of the data directory carries the same UUID, and an open that
 /// finds the two different refuses: a database restored on a directory
@@ -710,16 +1052,41 @@ const LOCK_TIMEOUT_FOR_KEY: &str = "60s";
 /// the mint run before anything else is written, so a refusal leaves the
 /// schema untouched.
 fn store_identity(writer: &mut PgClient, marker: Marker) -> Result<[u8; 16]> {
-    let first = writer.query("SELECT uuid FROM store_uuid WHERE one = 1", &[])?;
+    let first = writer
+        .query("SELECT uuid FROM store_uuid WHERE one = 1", &[])
+        .map_err(|e| {
+            named_step(
+                "the store identity read",
+                "SELECT uuid FROM store_uuid WHERE one = 1",
+                e,
+            )
+        })?;
     if let Some(row) = first.first() {
         // The database already names its store, and the comparison runs
         // before anything is written: no marker, or the marker of
         // another store, both refuse here. A database restored on the
         // directory of another store would serve metadata whose blobs
         // are not on this disk.
-        let uuid = uuid_of(row.get::<_, Vec<u8>>("uuid"));
-        match marker.uuid {
-            None => {
+        let uuid = uuid_of(row.get::<_, Vec<u8>>("uuid"))?;
+        // The repos probe only decides the no-marker case: a schema
+        // that holds repos was served, one that holds none was not. No
+        // arm reads the flag while the marker is there, so the probe
+        // runs then not at all - the reopen costs exactly main's
+        // statements.
+        let has_repos = marker.uuid.is_none()
+            && !writer
+                .query("SELECT 1 FROM repos LIMIT 1", &[])
+                .map_err(|e| {
+                    named_step(
+                        "the store identity's repos probe",
+                        "SELECT 1 FROM repos LIMIT 1",
+                        e,
+                    )
+                })?
+                .is_empty();
+        match pairing_decision(marker.uuid, Some(uuid), has_repos) {
+            Pairing::Agree => {}
+            Pairing::AdoptCut => {
                 // A first open cut between its store's UUID row and
                 // its marker: the row commits early in the open, the
                 // marker is written at its end, and a kill in that
@@ -727,20 +1094,7 @@ fn store_identity(writer: &mut PgClient, marker: Marker) -> Result<[u8; 16]> {
                 // schema with no repos row served nothing, so no
                 // blob of another disk can be named: the directory
                 // takes the database's store as its own, and this
-                // open writes the marker the cut fell before. A
-                // schema that holds repos was served by a store
-                // whose marker went missing - a fresh directory
-                // pointed at a served store - and refuses.
-                let served = writer.query("SELECT 1 FROM repos LIMIT 1", &[])?;
-                if !served.is_empty() {
-                    return Err(Error::FailedPrecondition(format!(
-                        "this database names the store {}, but the data \
-                         directory carries no marker of it: give the \
-                         directory the database was served with, or a \
-                         directory it has never served",
-                        hex16(&uuid)
-                    )));
-                }
+                // open writes the marker the cut fell before.
                 tracing::warn!(
                     "the data directory carries no marker of store {}; \
                      the schema holds no repos, so this open takes the \
@@ -748,18 +1102,8 @@ fn store_identity(writer: &mut PgClient, marker: Marker) -> Result<[u8; 16]> {
                     hex16(&uuid)
                 );
             }
-            Some(held) if held != uuid => {
-                return Err(Error::FailedPrecondition(format!(
-                    "this data directory belongs to the store whose \
-                     UUID is {}, but the database names the store {}: \
-                     one was restored over the other; give the \
-                     directory of the database's own store, or a \
-                     directory the database has never served",
-                    hex16(&held),
-                    hex16(&uuid)
-                )));
-            }
-            Some(_) => {}
+            Pairing::Fresh => unreachable!("the database names its store"),
+            Pairing::Refuse(error) => return Err(error),
         }
         Ok(uuid)
     } else {
@@ -769,32 +1113,47 @@ fn store_identity(writer: &mut PgClient, marker: Marker) -> Result<[u8; 16]> {
         // holds the store it names: a store that ever served wrote
         // its repo rows, so a schema with no repos row was never
         // served by the directory's store, and adopting would give
-        // the marker's identity to an empty schema - a wrong
-        // --postgres-url, a typo in its search_path, or one never
+        // the marker's identity to an empty schema - a wrong URL in
+        // SCION_POSTGRES_URL, a typo in its search_path, or one never
         // served - and every caller would read "repo not found"
         // with no error at the start. An empty schema refuses while
         // the marker names a store, and mints when it names none.
-        let served = writer.query("SELECT 1 FROM repos LIMIT 1", &[])?;
-        if let (Some(held), []) = (marker.uuid, served.as_slice()) {
-            return Err(Error::FailedPrecondition(format!(
-                "this data directory belongs to the store whose UUID \
-                 is {}, but this database holds no store: check \
-                 --postgres-url and its search_path",
-                hex16(&held)
-            )));
-        }
-        let fresh = marker.uuid.unwrap_or_else(uuid_new);
-        writer.query(
-            "INSERT INTO store_uuid (one, uuid) VALUES (1, $1) \
+        let repos = writer
+            .query("SELECT 1 FROM repos LIMIT 1", &[])
+            .map_err(|e| named_step("the repos probe", "SELECT 1 FROM repos LIMIT 1", e))?;
+        let has_repos = !repos.is_empty();
+        let fresh = match pairing_decision(marker.uuid, None, has_repos) {
+            Pairing::Agree | Pairing::AdoptCut => unreachable!("the database holds no store"),
+            Pairing::Fresh => marker.uuid.unwrap_or_else(uuid_new),
+            Pairing::Refuse(error) => return Err(error),
+        };
+        writer
+            .query(
+                "INSERT INTO store_uuid (one, uuid) VALUES (1, $1) \
              ON CONFLICT (one) DO NOTHING",
-            &[P::bytes(&fresh)],
-        )?;
+                &[P::bytes(&fresh)],
+            )
+            .map_err(|e| {
+                named_step(
+                    "the store identity write",
+                    "INSERT INTO store_uuid (one, uuid) VALUES (1, $1) ON CONFLICT (one) DO NOTHING",
+                    e,
+                )
+            })?;
         // A concurrent first open may have minted its own: read the
         // row again, and whatever it holds is the identity.
         Ok(uuid_of(
-            writer.query("SELECT uuid FROM store_uuid WHERE one = 1", &[])?[0]
+            writer
+                .query("SELECT uuid FROM store_uuid WHERE one = 1", &[])
+                .map_err(|e| {
+                    named_step(
+                        "the store identity read",
+                        "SELECT uuid FROM store_uuid WHERE one = 1",
+                        e,
+                    )
+                })?[0]
                 .get::<_, Vec<u8>>("uuid"),
-        ))
+        )?)
     }
 }
 
@@ -805,10 +1164,15 @@ impl Pg {
     /// is checked against this CA (PEM); a CA is required for a host that
     /// is not on this machine.
     ///
+    /// The open does not move the schema: a database that is behind this
+    /// build is refused with the fix named (`scion-server migrate`, or
+    /// `serve --migrate`). A fresh database is created, as before.
+    ///
     /// # Errors
     ///
     /// A URL that does not parse, a database that does not connect, a
-    /// schema of a newer build, or a migration that fails.
+    /// schema of a newer build, a database that is behind this build, or
+    /// a migration that fails.
     pub(crate) fn open(
         url: &str,
         ca: Option<&Path>,
@@ -816,17 +1180,18 @@ impl Pg {
         data: &Path,
         marker: Marker,
     ) -> Result<Self> {
-        Self::open_in(url, ca, readers, data, None, false, marker)
+        Self::open_in(url, ca, readers, data, None, false, marker, None, false)
     }
 
     /// [`Pg::open`], as the one server process of the database: a second
     /// `serve` or `derive` on the same URL is refused. Import runs beside a
-    /// server, so it opens without the lock.
+    /// server, so it opens without the lock. This is the migrating shape:
+    /// `serve --migrate` runs it, and the schema moves here on purpose.
     ///
     /// # Errors
     ///
     /// As [`Pg::open`], and another process holds the one-server lock.
-    pub(crate) fn open_exclusive(
+    pub(crate) fn open_exclusive_migrating(
         url: &str,
         ca: Option<&Path>,
         readers: usize,
@@ -837,11 +1202,29 @@ impl Pg {
         // setup asks the database `current_schema()` and locks that, so
         // parallel servers of distinct schemas do not fence each other,
         // and a plain URL fences the whole default schema.
-        Self::open_in(url, ca, readers, data, None, true, marker)
+        Self::open_in(url, ca, readers, data, None, true, marker, None, true)
+    }
+
+    /// [`Pg::open_exclusive_migrating`], without the right to move the
+    /// schema: `serve` and `derive` refuse a database that is behind
+    /// this build, with the fix named.
+    ///
+    /// # Errors
+    ///
+    /// As [`Pg::open_exclusive_migrating`], and another process holds
+    /// the one-server lock.
+    pub(crate) fn open_exclusive(
+        url: &str,
+        ca: Option<&Path>,
+        readers: usize,
+        data: &Path,
+        marker: Marker,
+    ) -> Result<Self> {
+        Self::open_in(url, ca, readers, data, None, true, marker, None, false)
     }
 
     /// [`Pg::open`], in the search path of `schema` when it is set.
-    #[allow(clippy::unused_self)]
+    #[allow(clippy::unused_self, clippy::too_many_arguments)]
     fn open_in(
         url: &str,
         ca: Option<&Path>,
@@ -850,6 +1233,13 @@ impl Pg {
         schema: Option<&str>,
         exclusive: bool,
         marker: Marker,
+        // The derive walks to run with, or the default cap when `None`.
+        // The test constructor of the walk caps passes its own.
+        flights: Option<crate::derived::DeriveFlights>,
+        // Whether this open may move the schema: true for `serve
+        // --migrate`, `migrate`, and the test openers, false for
+        // everything else.
+        allow_migrate: bool,
     ) -> Result<Self> {
         let options = base_options();
         let fence = Arc::new(Fence::new());
@@ -862,10 +1252,13 @@ impl Pg {
         } else {
             connect_with(url, ca, &options, schema)?
         };
-        let migrated = migrate(&mut writer)?;
+        let migrated = migrate(&mut writer, allow_migrate)?;
         // The durability of a commit is a promise of this backend: check
         // that the server kept its side of it.
-        let on: String = writer.query("SHOW synchronous_commit", &[])?[0].get(0);
+        let on: String = writer
+            .query("SHOW synchronous_commit", &[])
+            .map_err(|e| named_step("the durability check", "SHOW synchronous_commit", e))?[0]
+            .get(0);
         if on != "on" {
             return Err(Error::FailedPrecondition(format!(
                 "the database runs synchronous_commit={on}; this backend \
@@ -878,7 +1271,6 @@ impl Pg {
         // [`store_identity`].
         let store_uuid = store_identity(&mut writer, marker)?;
         let blobs = Blobs::open(data)?;
-        blobs.sweep_tmp(false)?;
         let inner = Arc::new(PgInner {
             writer: Mutex::new(writer),
             fence,
@@ -886,11 +1278,26 @@ impl Pg {
             migrated,
             readers: Readers::new_with(readers, url, ca, &options, schema)?,
             blobs,
-            writers: Mutex::new(0),
-            write_woken: Condvar::new(),
-            derive: crate::derived::DeriveFlights::new(crate::store::DERIVE_WALKS_CAP),
+            writer_gate: Mutex::new(WriterGate::default()),
+            writer_woken: Condvar::new(),
+            derive: flights.unwrap_or_else(|| {
+                crate::derived::DeriveFlights::new(crate::store::DERIVE_WALKS_CAP)
+            }),
+            view_memo: crate::memory::Bytes::named(
+                crate::views::VIEW_MEMO_BYTES * crate::views::VIEW_DERIVES_MAX,
+                "view memo",
+            ),
             #[cfg(any(test, feature = "test-hooks"))]
             hooks: crate::store::test_hooks::ImportHooks::default(),
+            #[cfg(any(test, feature = "test-hooks"))]
+            committed: std::sync::atomic::AtomicU64::new(0),
+            yield_turns: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            txes: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_commits: std::sync::atomic::AtomicU64::new(0),
+            #[cfg(any(test, feature = "test-hooks"))]
+            fail_commits_disk_full: std::sync::atomic::AtomicU64::new(0),
             metrics: std::sync::OnceLock::new(),
         });
         // The probe of a server that lost its lock: once a minute the
@@ -910,8 +1317,21 @@ impl Pg {
                         };
                         // A dead connection or a fenced store both fail
                         // here and are seen on the next real call; the
-                        // probe exists to trip the fence on time.
-                        let _ = inner.writer.lock().unwrap().query_opt("SELECT 1", &[]);
+                        // probe exists to trip the fence on time. The
+                        // lock is taken the way lock_writer takes it: a
+                        // poisoned lock must not kill the probe, whose
+                        // death would end the fence's clock in silence.
+                        let probed = inner
+                            .writer
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner)
+                            .query_opt("SELECT 1", &[]);
+                        if let Err(error) = probed {
+                            tracing::warn!(
+                                error = %error,
+                                "the write client's keepalive probe failed"
+                            );
+                        }
                     }
                 })
                 .map_err(crate::error::Error::Io)?;
@@ -982,15 +1402,16 @@ impl Pg {
     }
 
     /// A read on the write client, so it sees the caller's own commits.
+    /// The land's finish reads now ride the read pool (`read_latest`), so
+    /// the lane serves only the writes that hold their ref's slot.
     pub(crate) fn read_unflushed<T>(
         &self,
         f: impl FnOnce(&mut PgTx<'_>) -> Result<T>,
     ) -> Result<T> {
         self.check_fenced()?;
-        let (mut writer, _waiting) = self.lock_writer();
+        let (mut writer, _waiting) = self.lock_writer(false);
         let mut pending = Vec::new();
         let mut derived = DerivedPending::default();
-        let mut preload = std::collections::HashMap::new();
         let mut history = HistoryPending::default();
         let mut pg = PgTx {
             c: &mut writer,
@@ -999,11 +1420,55 @@ impl Pg {
             cs_batching: false,
             cs_pending: Some(&mut pending),
             derived_pending: Some(&mut derived),
-            derived_preload: Some(&mut preload),
+            derived_preload: Some(std::collections::HashMap::new()),
+            pre_trees: None,
+            pre_history: None,
+            deferred_deletes: Vec::new(),
+            defer_derived: false,
             history_pending: Some(&mut history),
             ended: true,
         };
         f(&mut pg)
+    }
+
+    /// A read on one client of the pool, in one READ COMMITTED READ ONLY
+    /// transaction with the pooled read's bounds: every statement sees
+    /// the newest committed state, and none of them queues behind the
+    /// write client. The land's outcome check and plan ride this: their
+    /// writes happen later, in their own transaction, and the land row's
+    /// pending guard is what stops a twin call, not a shared read.
+    ///
+    /// READ COMMITTED is the per-statement newest state the land's
+    /// outcome check and plan ran under on the writer's autocommit.
+    /// READ ONLY turns a write that slips onto this path into an error
+    /// (25006): a write on a pooled reader would land outside the
+    /// writer's lock and the collector's key, and must not be possible
+    /// to add silently. The statement and idle bounds keep an abandoned
+    /// read from holding a reader; the transaction rolls back at the
+    /// end, like every pooled read.
+    ///
+    /// # Errors
+    ///
+    /// What `f` returns, a database error from begin, or
+    /// [`Error::Unavailable`] when no reader was free in time.
+    pub(crate) fn read_latest<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
+        self.check_fenced()?;
+        let mut reader = self.inner.readers.take(READER_WAIT)?;
+        let out = {
+            let mut tx = PgTx::begin_read(
+                reader.client(),
+                ReadIsolation::ReadCommitted,
+                READ_STATEMENT_TIMEOUT,
+                READ_IDLE_TIMEOUT,
+            )?;
+            let out = f(&mut tx);
+            // A read transaction: nothing to keep. The rollback's own error
+            // must not hide the error of `f`; the drop rolls back anyway.
+            let _ = tx.rollback();
+            out
+        };
+        drop(reader);
+        out
     }
 
     /// A strong read on one client of the pool. The read runs in one
@@ -1035,7 +1500,12 @@ impl Pg {
         self.check_fenced()?;
         let mut reader = self.inner.readers.take(wait)?;
         let out = {
-            let mut tx = PgTx::begin_read(reader.client(), statement, idle)?;
+            let mut tx = PgTx::begin_read(
+                reader.client(),
+                ReadIsolation::RepeatableRead,
+                statement,
+                idle,
+            )?;
             let out = f(&mut tx);
             // A read transaction: nothing to keep. The rollback's own error
             // must not hide the error of `f`; the drop rolls back anyway.
@@ -1054,27 +1524,54 @@ impl Pg {
     ///
     /// What `f` returns, or a database error from begin or commit.
     pub(crate) fn commit<T>(&self, f: impl FnOnce(&mut PgTx<'_>) -> Result<T>) -> Result<T> {
+        self.commit_in_lane(f, false)
+    }
+
+    /// [`Pg::commit`], as a caller that holds its ref's slot: the
+    /// transaction enters the write lane ahead of other waiting
+    /// writers, within the lane's bound. What the slot holder writes is
+    /// what its ref's next land needs, and its wait costs the whole
+    /// queue of its ref, so it stops queueing behind writers it does
+    /// not depend on.
+    pub(crate) fn commit_for_slot_holder<T>(
+        &self,
+        f: impl FnOnce(&mut PgTx<'_>) -> Result<T>,
+    ) -> Result<T> {
+        self.commit_in_lane(f, true)
+    }
+
+    fn commit_in_lane<T>(
+        &self,
+        f: impl FnOnce(&mut PgTx<'_>) -> Result<T>,
+        slot_holder: bool,
+    ) -> Result<T> {
         self.check_fenced()?;
-        let (mut writer, _waiting) = self.lock_writer();
+        let (mut writer, _waiting) = self.lock_writer(slot_holder);
         // A write transaction runs at READ COMMITTED, the Postgres
         // default: every change of the caller checks the newest state of
         // the row it touches (the CAS predicates).
         let mut pending = Vec::new();
         let mut derived = DerivedPending::default();
-        let mut preload = std::collections::HashMap::new();
         let mut history = HistoryPending::default();
+        // The wait inside the open batch is the lane key's wait: the
+        // clock covers the batch, whose bulk is the lock.
+        let key_started = std::time::Instant::now();
         let mut tx = PgTx::begin(
             &mut writer,
             &mut pending,
             &mut derived,
-            &mut preload,
             &mut history,
+            Some(LOCK_TIMEOUT_FOR_KEY),
+            Some(LANE_KEY_STATEMENT),
         )?;
+        if let Some(metrics) = self.inner.metrics.get() {
+            metrics.collector_key_wait(
+                u64::try_from(key_started.elapsed().as_micros()).unwrap_or(u64::MAX),
+            );
+        }
         // Every writer and the collector's batches of one schema order on
-        // one advisory key, held to the end of the transaction: what a
-        // SQLite write transaction gets from the data directory's one
-        // write connection (store.rs `commit`,
-        // `TransactionBehavior::Immediate`).
+        // one advisory key, held to the end of the transaction: the
+        // store's write transactions serialize on it.
         //
         // SHORTCUT: one key per schema orders every writer of the schema
         // against one collector, which is right for one server per schema
@@ -1096,28 +1593,51 @@ impl Pg {
         // transaction is back on the writer's clock, so the row locks it
         // meets later still answer Busy at 5 s (SET LOCAL lasts to the
         // end of the transaction).
-        tx.c.query(
-            &format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT_FOR_KEY}'"),
-            &[],
-        )?;
-        let key_started = std::time::Instant::now();
-        tx.c.query_opt(
-            "SELECT pg_advisory_xact_lock(hashtext(current_schema() || ':gc'))",
-            &[],
-        )?;
-        if let Some(metrics) = self.inner.metrics.get() {
-            metrics.collector_key_wait(
-                u64::try_from(key_started.elapsed().as_micros()).unwrap_or(u64::MAX),
-            );
-        }
-        tx.c.query(
-            &format!("SET LOCAL lock_timeout = '{LOCK_TIMEOUT_FOR_WRITERS}'"),
-            &[],
-        )?;
+        // The 60 s guard is in force before the statement that takes
+        // the key: both ride the transaction's open batch (BEGIN, the
+        // SET LOCAL, and the key - one round trip). `lock_timeout` is
+        // read when the lock wait begins (the timer starts in the
+        // lock's sleep), so the guard cannot ride the same statement as
+        // the key: it stays its own statement, before the key's, inside
+        // the batch.
+        //
+        // The restore is a data dependency, not a target-list neighbor:
+        // it reads FROM the subquery that takes the key, so it cannot
+        // evaluate until the key returned, and the wait always ran under
+        // the 60 s. OFFSET 0 keeps the planner from flattening the
+        // subquery into one target list (tests/pg_guard_timeouts.rs
+        // checks the plan's shape and times the wait).
         match f(&mut tx) {
             Ok(value) => {
                 let unflushed = tx.cs_pending.as_deref().is_some_and(|p| !p.is_empty())
                     || tx.derived_pending.as_deref().is_some_and(|p| !p.is_empty());
+                #[cfg(any(test, feature = "test-hooks"))]
+                if self.inner.fail_commits_disk_full.load(Ordering::Relaxed) > 0 {
+                    self.inner
+                        .fail_commits_disk_full
+                        .fetch_sub(1, Ordering::Relaxed);
+                    // Counted as ended, as a real failed commit is: the
+                    // transaction rolls back below, nothing was written,
+                    // exactly as an out-of-space commit ends.
+                    self.inner.committed.fetch_add(1, Ordering::Release);
+                    let _ = tx.rollback();
+                    let fail = std::io::Error::other(
+                        "the commit was made to fail as out of space by the test hook",
+                    );
+                    return Err(Error::Storage(Storage::disk_full(fail)));
+                }
+                #[cfg(any(test, feature = "test-hooks"))]
+                if self.inner.fail_commits.load(Ordering::Relaxed) > 0 {
+                    self.inner.fail_commits.fetch_sub(1, Ordering::Relaxed);
+                    // Counted as ended, as a real failed commit is: the
+                    // transaction rolls back below, nothing was written,
+                    // exactly as a busy commit ends.
+                    self.inner.committed.fetch_add(1, Ordering::Release);
+                    let _ = tx.rollback();
+                    let fail =
+                        std::io::Error::other("the commit was made to fail by the test hook");
+                    return Err(Error::Storage(Storage::busy(fail)));
+                }
                 if unflushed {
                     // A caller that turned the importer's batching on and
                     // ended the transaction without the flush would
@@ -1137,7 +1657,19 @@ impl Pg {
                         "the transaction holds changeset rows it never flushed".to_owned(),
                     ));
                 }
-                tx.commit()?;
+                #[cfg(any(test, feature = "test-hooks"))]
+                self.inner.committed.fetch_add(1, Ordering::Release);
+                // A write path that deferred its per-row flushes hands
+                // them to the commit, inside the transaction, so a
+                // rollback takes them with it and the end state is the
+                // one the per-call writes would have reached.
+                if tx.defer_derived {
+                    tx.flush_deferred()?;
+                }
+                let committed = tx.commit();
+                #[cfg(any(test, feature = "test-hooks"))]
+                self.inner.txes.fetch_add(1, Ordering::Relaxed);
+                committed?;
                 Ok(value)
             }
             Err(error) => {
@@ -1158,23 +1690,85 @@ impl Pg {
         self.commit(f)
     }
 
+    /// Commits made so far: the seam the tests of the batching watch.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub(crate) fn commits(&self) -> u64 {
+        self.inner.committed.load(Ordering::Acquire)
+    }
+
+    /// Write transactions run so far: the batching tests' counter.
+    #[cfg(any(test, feature = "test-hooks"))]
+    #[must_use]
+    pub(crate) fn txes(&self) -> u64 {
+        self.inner.txes.load(Ordering::Relaxed)
+    }
+
+    /// Sets how many of the next commits fail as a busy database: the
+    /// transaction runs and rolls back, so the retry re-runs it whole.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn fail_next_commits(&self, n: u32) {
+        self.inner
+            .fail_commits
+            .store(u64::from(n), Ordering::Relaxed);
+    }
+
+    /// Sets how many of the next commits fail as a database out of
+    /// space: the transaction runs and rolls back, so the retry re-runs
+    /// it whole. The audit's why reads `disk_full`, not `busy`.
+    #[cfg(any(test, feature = "test-hooks"))]
+    pub(crate) fn fail_next_commits_disk_full(&self, n: u32) {
+        self.inner
+            .fail_commits_disk_full
+            .store(u64::from(n), Ordering::Relaxed);
+    }
+
     /// Takes the write client, counted as a writer that waits: the
     /// derivation walk waits while writers wait, so a steady stream of
     /// writers delays a cold read up to its deadline, never a land
     /// ([#142]). The count falls when the client is back, so a walk step
     /// that ends hands the client to a writer, not to its own next step.
-    fn lock_writer(&self) -> (MutexGuard<'_, PgClient>, PgWriteWaiter<'_>) {
-        *self
+    /// Takes the write client for one transaction, through the lane:
+    /// `slot_holder` marks a caller that holds its ref's slot (the
+    /// settle's commit and the sweep's reject), which enters ahead of
+    /// other waiting writers, within the lane's bound. The invariants
+    /// the one client keeps are listed on [`PgInner`'s gate
+    /// field](Self::writer_gate).
+    fn lock_writer(&self, slot_holder: bool) -> (MutexGuard<'_, PgClient>, PgWriteWaiter<'_>) {
+        let mut gate = self
             .inner
-            .writers
+            .writer_gate
             .lock()
-            .unwrap_or_else(PoisonError::into_inner) += 1;
+            .unwrap_or_else(PoisonError::into_inner);
+        gate.waiting += 1;
+        if slot_holder {
+            gate.holders_waiting += 1;
+        } else {
+            gate.plain_waiting += 1;
+        }
+        while gate.taken || !lane_admits(&gate, slot_holder) {
+            gate = self
+                .inner
+                .writer_woken
+                .wait(gate)
+                .unwrap_or_else(PoisonError::into_inner);
+        }
+        gate.taken = true;
+        if slot_holder {
+            gate.holders_waiting -= 1;
+            gate.holders_ahead += 1;
+        } else {
+            gate.plain_waiting -= 1;
+            gate.holders_ahead = 0;
+        }
+        let writer = self
+            .inner
+            .writer
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         (
-            self.inner
-                .writer
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner),
-            PgWriteWaiter(&self.inner.writers, &self.inner.write_woken),
+            writer,
+            PgWriteWaiter(&self.inner.writer_gate, &self.inner.writer_woken),
         )
     }
 
@@ -1183,18 +1777,54 @@ impl Pg {
         &self.inner.derive
     }
 
+    /// The pool the view derivations reserve their memos from: the cap is
+    /// [`crate::views::VIEW_DERIVES_MAX`] reservations of
+    /// [`crate::views::VIEW_MEMO_BYTES`], and a derivation beyond it waits
+    /// for a place under its call's deadline.
+    pub(crate) fn view_memo_budget(&self) -> &crate::memory::Bytes {
+        &self.inner.view_memo
+    }
+
     /// How many writers wait for the write client right now.
     #[cfg(test)]
     #[must_use]
     pub(crate) fn writers_waiting(&self) -> usize {
-        *self
-            .inner
-            .writers
+        self.inner
+            .writer_gate
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+            .waiting
+    }
+
+    /// How many deadline-less waits for writers ended.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn yield_turns(&self) -> u64 {
+        self.inner.yield_turns.load(Ordering::Relaxed)
+    }
+
+    /// The lane's queue, for the tests: the slot holders and the other
+    /// writers that wait, not granted yet.
+    #[cfg(test)]
+    #[allow(dead_code)] // the lane tests read it through Backend
+    #[must_use]
+    pub(crate) fn writer_lane_waiting(&self) -> (usize, usize) {
+        let gate = self
+            .inner
+            .writer_gate
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        (gate.holders_waiting, gate.plain_waiting)
     }
 
     /// Waits while writers wait for the write client, until the deadline.
+    ///
+    /// Without a deadline the yield to writers is bounded: after
+    /// [`WRITE_YIELD_BOUND`] in total, across every wake-up, the caller
+    /// takes its turn, and the writers wait behind at most one of its
+    /// transactions. The bound is for the whole wait, not per wake-up: a
+    /// writer stream that keeps the count above zero only between two
+    /// wake-ups would otherwise reset the wait forever.
     ///
     /// # Errors
     ///
@@ -1203,27 +1833,44 @@ impl Pg {
         &self,
         deadline: Option<&crate::deadline::Deadline>,
     ) -> Result<()> {
-        let mut waiting = self
+        let mut gate = self
             .inner
-            .writers
+            .writer_gate
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        while *waiting > 0 {
-            let Some(deadline) = deadline else {
-                waiting = self
+        let Some(deadline) = deadline else {
+            let yielded_since = std::time::Instant::now();
+            while gate.waiting > 0 {
+                let bound_left = WRITE_YIELD_BOUND.saturating_sub(yielded_since.elapsed());
+                if bound_left.is_zero() {
+                    // The yield's bound passed with writers still waiting:
+                    // this caller takes its turn. The writers it passes
+                    // wait behind at most one of its transactions.
+                    self.inner.yield_turns.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+                let (guard, timed_out) = self
                     .inner
-                    .write_woken
-                    .wait(waiting)
+                    .writer_woken
+                    .wait_timeout_while(gate, bound_left, |gate| gate.waiting > 0)
                     .unwrap_or_else(PoisonError::into_inner);
-                continue;
-            };
+                gate = guard;
+                if timed_out.timed_out() {
+                    self.inner.yield_turns.fetch_add(1, Ordering::Relaxed);
+                    return Ok(());
+                }
+            }
+            self.inner.yield_turns.fetch_add(1, Ordering::Relaxed);
+            return Ok(());
+        };
+        while gate.waiting > 0 {
             let budget = deadline.remaining();
             let (guard, timed_out) = self
                 .inner
-                .write_woken
-                .wait_timeout_while(waiting, budget, |waiting| *waiting > 0)
+                .writer_woken
+                .wait_timeout_while(gate, budget, |gate| gate.waiting > 0)
                 .unwrap_or_else(PoisonError::into_inner);
-            waiting = guard;
+            gate = guard;
             if timed_out.timed_out() {
                 return Err(Error::DeadlineExceeded(
                     "the call ran past its deadline".to_owned(),
@@ -1234,14 +1881,24 @@ impl Pg {
     }
 }
 
+/// How long a call without a deadline yields to waiting writers before
+/// it takes its turn: the derivation walk's yield keeps #142's promise
+/// (writers first) for this long per step, then the step proceeds, and
+/// the writers it passed wait behind at most one step's transaction.
+const WRITE_YIELD_BOUND: Duration = Duration::from_secs(2);
+
 /// The count of a taken write client, while it is taken: it falls, and
 /// wakes the waiters, when the client is back.
-struct PgWriteWaiter<'a>(&'a Mutex<usize>, &'a Condvar);
+// SHORTCUT: one condvar, notify_all, so a release wakes every waiting
+// writer and a commit costs O(waiters) wake-ups. Per-class condvars if
+// waiting writers often pass ~50.
+struct PgWriteWaiter<'a>(&'a Mutex<WriterGate>, &'a Condvar);
 
 impl Drop for PgWriteWaiter<'_> {
     fn drop(&mut self) {
-        let mut waiting = self.0.lock().unwrap_or_else(PoisonError::into_inner);
-        *waiting -= 1;
+        let mut gate = self.0.lock().unwrap_or_else(PoisonError::into_inner);
+        gate.taken = false;
+        gate.waiting -= 1;
         self.1.notify_all();
     }
 }
@@ -1249,23 +1906,47 @@ impl Drop for PgWriteWaiter<'_> {
 /// The derived rows a batching transaction holds for the flush.
 type DerivedPending = Vec<(String, i64, ChangesetId, Vec<u8>)>;
 
-/// The derived values of the chains a batching transaction preloaded, by
-/// (kind, version, id).
-type DerivedPreload = std::collections::HashMap<(String, i64, Vec<u8>), Vec<u8>>;
+/// The derived values a transaction preloaded, by (kind, version, id):
+/// the same map the pre-transaction read returns.
+use crate::meta::DerivedValues as DerivedPreload;
 
-/// The history nodes a batching transaction holds for the flush, by id.
-/// The nodes are content-addressed, so a put of a node the transaction
-/// already holds is the same row.
-type HistoryPending = std::collections::HashMap<Vec<u8>, Vec<u8>>;
+/// The history nodes a batching transaction holds for the flush, by
+/// id, with their bytes. The nodes are content-addressed, so a put of
+/// a node the transaction already holds is the same row. The count
+/// rides the map, so every view of the buffer counts the same, and
+/// the flush can run mid-transaction when the count passes its bound.
+#[derive(Default)]
+struct HistoryPending {
+    rows: std::collections::HashMap<Vec<u8>, Vec<u8>>,
+    bytes: usize,
+}
+
+/// The isolation level of one read transaction. Repeatable read pins
+/// one snapshot for the whole read; read committed takes the newest
+/// state of each statement. The choices are named, not passed as
+/// strings, so a call site says what its read sees.
+#[derive(Clone, Copy)]
+enum ReadIsolation {
+    RepeatableRead,
+    ReadCommitted,
+}
+
+impl ReadIsolation {
+    fn as_sql(self) -> &'static str {
+        match self {
+            Self::RepeatableRead => "REPEATABLE READ",
+            Self::ReadCommitted => "READ COMMITTED",
+        }
+    }
+}
 
 /// One client of the database, inside one transaction. The queries are its
 /// [`MetaTx`] methods. The transaction is begun and ended with statements
 /// of the client, so a `PgTx` is a plain client handle: it stays covariant
 /// in its lifetime, which the backend enum's transaction needs.
 ///
-/// `pub` with the unreachable-pub allow, like [`SqliteTx`](crate::db::SqliteTx):
-/// [`Meta::Tx`] names it, and the trait re-exports through
-/// `test_support::meta`.
+/// `pub` with the unreachable-pub allow: [`Meta::Tx`] names it, and the
+/// trait re-exports through `test_support::meta`.
 #[allow(unreachable_pub)]
 pub struct PgTx<'a> {
     c: &'a mut PgClient,
@@ -1303,21 +1984,315 @@ pub struct PgTx<'a> {
     /// changesets they name. Shared with the reborrows, like the
     /// changesets' pending list.
     derived_pending: Option<&'a mut DerivedPending>,
-    /// The derived values of the chains the importer preloaded, by
+    /// The derived values the transaction preloaded or adopted, by
     /// (kind, version, id): the batch's reads of ancestors outside the
     /// transaction cost one chain read for the whole chain, not one per
-    /// commit. Shared with the reborrows.
-    derived_preload: Option<&'a mut DerivedPreload>,
+    /// commit. A write path's pre-transaction read installs its own map
+    /// here, so the transaction's per-value reads answer without round
+    /// trips.
+    derived_preload: Option<DerivedPreload>,
+    /// The stored tree bodies a pre-transaction read loaded, by id: the
+    /// build's reads answer from it, and a miss re-reads in the
+    /// transaction (`get_trees` below). `None` when no pre-read ran.
+    pre_trees: Option<std::collections::HashMap<Vec<u8>, Vec<u8>>>,
+    /// The history-node bodies a pre-transaction read loaded, by id: the
+    /// build's derives answer from them, and a miss re-reads in the
+    /// transaction (`get_history_node` below). `None` when no pre-read
+    /// ran.
+    pre_history: Option<std::collections::HashMap<Vec<u8>, Vec<u8>>>,
+    /// The `delete_derived_below` calls a deferring write path made: the
+    /// commit deletes with one statement, honoring the summed limits per
+    /// kind and version. Only `defer_derived_deletes` fills it.
+    deferred_deletes: Vec<(String, i64, i64)>,
+    /// Whether the write path's per-row flushes wait for the commit:
+    /// `delete_derived_below` collects its calls, and history node
+    /// writes collect in the buffer the commit writes with one
+    /// statement. Off for the importer's batching (its flush owns the
+    /// shapes) and for the sweeps, which count the rows they removed.
+    defer_derived: bool,
     /// The history nodes the transaction inserted while batching: the
     /// flush writes them after the derived rows. Shared with the
-    /// reborrows.
+    /// reborrows; the bytes ride the map.
     history_pending: Option<&'a mut HistoryPending>,
     /// The transaction was ended by `commit` or `rollback`; a drop then
     /// leaves the client alone.
     ended: bool,
 }
 
+/// The bytes of history nodes one transaction's buffer may hold before
+/// the flush writes them mid-transaction. A transaction whose writes
+/// pack many commits - the archive restore packs up to 64 MiB of
+/// changeset bodies, tens of thousands of commits with a few nodes
+/// each - would otherwise hold the whole history's nodes in RAM until
+/// the commit, hundreds of MB, and copy them once more into the
+/// flush's chunk arrays. At the bound the flush runs inside the
+/// transaction: the rows land in the table, this transaction's reads
+/// of them read the table, and the commit writes only what came after.
+const HISTORY_PENDING_MAX_BYTES: usize = 16 << 20;
+
+#[cfg(any(test, feature = "test-hooks"))]
+static HISTORY_PENDING_MAX_BYTES_OVERRIDE: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// The bound, as the tests' override holds it when one does.
+fn history_pending_max_bytes() -> usize {
+    #[cfg(any(test, feature = "test-hooks"))]
+    {
+        let small = HISTORY_PENDING_MAX_BYTES_OVERRIDE.load(Ordering::Relaxed);
+        if small != 0 {
+            return small;
+        }
+    }
+    HISTORY_PENDING_MAX_BYTES
+}
+
+/// The most bytes the buffer held at once. The restore test reads it:
+/// a restore that packs many commits per transaction must not hold the
+/// whole history's nodes.
+#[cfg(any(test, feature = "test-hooks"))]
+static HISTORY_PENDING_PEAK: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Holds a small buffer bound for the test that pins the restore's
+/// flush, and resets the peak. The guard puts the server's bound back.
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn test_set_history_pending_bound_for_tests(bytes: usize) -> impl Drop {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            HISTORY_PENDING_MAX_BYTES_OVERRIDE.store(0, Ordering::Relaxed);
+        }
+    }
+    HISTORY_PENDING_MAX_BYTES_OVERRIDE.store(bytes, Ordering::Relaxed);
+    HISTORY_PENDING_PEAK.store(0, Ordering::Relaxed);
+    Reset
+}
+
+/// The most bytes the buffer held since the last reset.
+#[cfg(any(test, feature = "test-hooks"))]
+#[must_use]
+pub fn test_history_pending_peak_bytes() -> usize {
+    HISTORY_PENDING_PEAK.load(Ordering::Relaxed)
+}
+
+/// The deferred trim's shared statements: the ranking CTEs every trim
+/// rides, and the delete of the ranked rows. One builder, so the
+/// commit's standalone flush and the land's verdict fold cannot drift
+/// apart - a reword of one is a reword of both.
+const TRIM_DELETE: &str = "DELETE FROM derived WHERE ctid IN (SELECT ctid FROM v WHERE rn <= step)";
+
+/// The ranking CTEs of the deferred trim, against the derived table.
+/// The trim's three parameters are `$base`, `$base+1` and `$base+2`:
+/// the commit's flush runs the trim alone, its parameters first, and
+/// the land's verdict fold rides the trim after the verdict's own
+/// seven.
+fn trim_ctes(base: u32) -> String {
+    format!(
+        "WITH k AS (
+             SELECT kind, version, SUM(step) AS step
+             FROM unnest(${base}::text[], ${b1}::int8[], ${b2}::int8[]) \
+                 AS t(kind, version, step)
+             GROUP BY kind, version),
+         v AS (
+             SELECT d.ctid AS ctid, k.step AS step,
+                    row_number() OVER (PARTITION BY d.kind
+                                       ORDER BY d.version) AS rn
+             FROM derived d JOIN k ON d.kind = k.kind
+                                    AND d.version < k.version)",
+        base = base,
+        b1 = base + 1,
+        b2 = base + 2,
+    )
+}
+
+/// The land's verdict statement, verbatim in both shapes: alone, and as
+/// the `landed` CTE of the fold that rides the deferred trim with it.
+const LANDS_STATEMENT: &str = "UPDATE lands SET state = $3, result_cs = $4, detail = $5, \
+                 conflict_paths = $6, reject_reason = $7, finished_at = now_epoch() \
+             WHERE repo_id = $1 AND land_id = $2 AND state = 'pending'";
+
+/// Whether one kind appears twice in the transaction's deferred
+/// deletes. No caller reaches that today (#855); the flush's fold and
+/// the land's verdict fold both stay single-statement under the same
+/// check.
+fn deferral_repeats(deferred: &[(String, i64, i64)]) -> bool {
+    let mut seen = std::collections::HashSet::new();
+    deferred.iter().any(|(k, _, _)| !seen.insert(k))
+}
+
+/// The length of the prefix of one kind's rows that the transaction's
+/// deletes take: each call, in call order, adds what its step leaves of
+/// the rows its version still sees, after the calls before it took
+/// theirs from the same low end. Returns one (kind, total) per kind
+/// with calls, in first-call order, for the flush's one delete
+/// statement. `belows` is one count per call, in call order: how many
+/// rows of the kind were still below the call's version.
+fn delete_prefixes(calls: &[(String, i64)], belows: &[i64]) -> (Vec<String>, Vec<i64>) {
+    let mut kinds: Vec<String> = Vec::new();
+    let mut totals: Vec<i64> = Vec::new();
+    for ((kind, step), below) in calls.iter().zip(belows) {
+        let i = if let Some(i) = kinds.iter().position(|k| k == kind) {
+            i
+        } else {
+            kinds.push(kind.clone());
+            totals.push(0);
+            totals.len() - 1
+        };
+        totals[i] += (*step).min((*below - totals[i]).max(0));
+    }
+    (kinds, totals)
+}
+
 impl<'a> PgTx<'a> {
+    /// The derived rows the transaction already holds: the batching's
+    /// pending buffer first, then the preload's. One read filled the
+    /// preload at the start of a write path, and every put of this
+    /// transaction keeps it true. A row it deleted is of an older
+    /// version, which no read of this kind asks for, so no stale answer
+    /// can hide there.
+    ///
+    /// A held answer skips the repo-membership join on purpose: the only
+    /// rows a transaction holds are the parents and the changeset it
+    /// stores into `repo`, and the changesets insert refuses a parent
+    /// `repo` cannot see before any row is written.
+    fn held_derived(&mut self, kind: &str, version: u32, cs: ChangesetId) -> Option<Vec<u8>> {
+        let version = i64::from(version);
+        let key = id_bytes(cs.as_bytes());
+        if self.cs_batching
+            && let Some(pending) = self.derived_pending.as_deref()
+        {
+            for (k, v, c, value) in pending.iter().rev() {
+                if *k == kind && *v == version && id_bytes(c.as_bytes()) == key {
+                    return Some(value.clone());
+                }
+            }
+        }
+        self.derived_preload
+            .as_ref()
+            .and_then(|preload| preload.get(&(kind.to_owned(), version, key.clone())))
+            .cloned()
+    }
+
+    /// The pending-lands quota counts new pending rows. A retry of an
+    /// existing key resumes its land and adds no row, so a client can
+    /// always finish what it started. The count and the insert need no
+    /// lock of their own: every write transaction of the schema holds
+    /// the schema's one advisory key (see `commit`) until it commits, so
+    /// two lands that record at the same time, even from two processes,
+    /// run one after the other, and the second counts the first one's
+    /// row. The one writer serializes them.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::ResourceExhausted`] when the principal is over its cap.
+    /// Writes the per-row flushes a deferring write path collected: the
+    /// history nodes the build wrote, one statement per 1,000 rows, and
+    /// the derived old-row deletes, one query for the counts and one
+    /// statement for the whole transaction. The deletes of one kind, in
+    /// call order, take a prefix of the kind's rows: each call takes up
+    /// to its step from the rows still there below its version, and the
+    /// calls before it took theirs from the same low end. The prefix's
+    /// length folds over the calls in order, so the end state is what
+    /// the per-call deletes would have reached, in order, for any mix
+    /// of kinds and versions - the per-call deletes pick the same low
+    /// end, by version and changeset. Runs inside the transaction at
+    /// its commit, so a rollback takes the writes with it.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn flush_deferred(&mut self) -> Result<()> {
+        self.flush_history_rows()?;
+        if self.deferred_deletes.is_empty() {
+            return Ok(());
+        }
+        let kinds: Vec<String> = self
+            .deferred_deletes
+            .iter()
+            .map(|(k, _, _)| k.clone())
+            .collect();
+        let versions: Vec<i64> = self.deferred_deletes.iter().map(|(_, v, _)| *v).collect();
+        let steps: Vec<i64> = self.deferred_deletes.iter().map(|(_, _, s)| *s).collect();
+        // One version per kind, the case every caller is in today: the
+        // one statement ranks each row once against its kind's single
+        // call and cuts at the step, as it has since the deferral. Only
+        // a kind that repeats in the batch needs the fold, and no caller
+        // reaches that today (#855); the lands' settle statement bound
+        // counts on this shape staying one statement. The trim's
+        // statements come from the one builder the land's verdict fold
+        // shares.
+        let repeats = deferral_repeats(&self.deferred_deletes);
+        if !repeats {
+            let sql = format!("{}\n{TRIM_DELETE}", trim_ctes(1));
+            let deleted = self.c.execute(
+                &sql,
+                &[
+                    P::text_array(kinds),
+                    P::i64_array(versions),
+                    P::i64_array(steps),
+                ],
+            )?;
+            if deleted > 0 {
+                tracing::debug!(deleted, "flushed the transaction's derived deletes");
+            }
+            return Ok(());
+        }
+        // A kind repeated: its calls, in call order, take a prefix of
+        // the kind's rows - each call takes up to its step from the rows
+        // still there below its version, from the same low end the
+        // per-call deletes pick. How many rows each call still had below
+        // its version, one row per call in call order:
+        let belows = self.c.query(
+            "SELECT c.kind, count(d.cs)
+             FROM unnest($1::text[], $2::int8[]) WITH ORDINALITY AS c(kind, version, i)
+             LEFT JOIN derived d ON d.kind = c.kind AND d.version < c.version
+             GROUP BY c.i, c.kind ORDER BY c.i",
+            &[P::text_array(kinds.clone()), P::i64_array(versions)],
+        )?;
+        let belows: Vec<i64> = belows
+            .iter()
+            .map(|row| {
+                row.try_get::<_, i64>(1).map_err(|error| {
+                    Error::Corrupt(format!("the flush's count is no number: {error}"))
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let calls: Vec<(String, i64)> = kinds.iter().cloned().zip(steps).collect();
+        let (kinds, totals) = delete_prefixes(&calls, &belows);
+        let deleted = self.c.execute(
+            "WITH rank AS (
+                 SELECT d.ctid, t.total,
+                        row_number() OVER (PARTITION BY d.kind
+                                           ORDER BY d.version, d.cs) AS rn
+                 FROM derived d
+                 JOIN unnest($1::text[], $2::int8[]) AS t(kind, total)
+                                                      ON d.kind = t.kind)
+             DELETE FROM derived WHERE ctid IN (SELECT ctid FROM rank WHERE rn <= total)",
+            &[P::text_array(kinds), P::i64_array(totals)],
+        )?;
+        if deleted > 0 {
+            tracing::debug!(deleted, "flushed the transaction's derived deletes");
+        }
+        Ok(())
+    }
+
+    /// Takes the transaction's deferred history rows out of the buffer,
+    /// sorted by id for a deterministic statement, and resets the
+    /// buffer's byte count. The settle's statement writes them (its
+    /// `hn` arm); the commit's flush then finds nothing to write.
+    fn drain_history_rows(&mut self) -> Vec<(Vec<u8>, Vec<u8>)> {
+        let Some(pending) = self.history_pending.as_deref_mut() else {
+            return Vec::new();
+        };
+        if pending.rows.is_empty() {
+            return Vec::new();
+        }
+        let mut node_rows: Vec<(Vec<u8>, Vec<u8>)> = pending.rows.drain().collect();
+        pending.bytes = 0;
+        node_rows.sort();
+        node_rows
+    }
+
     /// Writes the history nodes the transaction inserted while batching,
     /// after the derived rows and before the `git_import` rows: one
     /// statement per 1,000 rows. The nodes are content-addressed, so
@@ -1332,7 +2307,8 @@ impl<'a> PgTx<'a> {
         let Some(history) = self.history_pending.as_deref_mut() else {
             return Ok(());
         };
-        let mut node_rows: Vec<(Vec<u8>, Vec<u8>)> = history.drain().collect();
+        let mut node_rows: Vec<(Vec<u8>, Vec<u8>)> = history.rows.drain().collect();
+        history.bytes = 0;
         node_rows.sort();
         for chunk in node_rows.chunks(CHUNK) {
             let ids = chunk.iter().map(|(id, _)| id.clone()).collect::<Vec<_>>();
@@ -1346,20 +2322,37 @@ impl<'a> PgTx<'a> {
                  ON CONFLICT (id) DO NOTHING",
                 &[P::bytea_array(ids), P::bytea_array(bodies)],
             )?;
+            #[cfg(test)]
+            {
+                let bytes: usize = chunk.iter().map(|(_, body)| body.len()).sum();
+                crate::history::note_flushed_node_bytes(bytes);
+            }
         }
         Ok(())
     }
 
     /// Begins one transaction on the client, sharing `pending` with the
     /// caller, which flushes it and refuses to commit while it holds rows.
+    /// `lock_timeout` rides the BEGIN when the transaction's first lock
+    /// wait needs a guard of its own (the collector's key): one round
+    /// trip, and the guard is in force before the key's statement, which
+    /// `lock_timeout`'s read-at-wait rule requires.
     fn begin(
         c: &'a mut PgClient,
         pending: &'a mut Vec<(ChangesetId, Vec<ChangesetId>)>,
         derived: &'a mut DerivedPending,
-        preload: &'a mut DerivedPreload,
         history: &'a mut HistoryPending,
+        lock_timeout: Option<&str>,
+        lane_key: Option<&str>,
     ) -> Result<PgTx<'a>> {
-        c.execute("BEGIN", &[])?;
+        let mut open = match lock_timeout {
+            Some(v) => format!("BEGIN; SET LOCAL lock_timeout = '{v}';"),
+            None => "BEGIN;".to_owned(),
+        };
+        if let Some(key) = lane_key {
+            open.push_str(key);
+        }
+        open_transaction(c, &open)?;
         Ok(Self {
             c,
             gen_cache: std::collections::HashMap::new(),
@@ -1367,38 +2360,56 @@ impl<'a> PgTx<'a> {
             cs_batching: false,
             cs_pending: Some(pending),
             derived_pending: Some(derived),
-            derived_preload: Some(preload),
+            derived_preload: Some(std::collections::HashMap::new()),
+            pre_trees: None,
+            pre_history: None,
+            deferred_deletes: Vec::new(),
+            defer_derived: false,
             history_pending: Some(history),
             ended: false,
         })
     }
 
-    /// Begins one read-only transaction at repeatable read: every
-    /// statement of the caller's read sees one snapshot, not the newest
-    /// state of each statement. The transaction is bounded server side:
+    /// Begins one read-only transaction at the level the caller names:
+    /// every statement of a repeatable-read read sees one snapshot; a
+    /// read-committed read sees the newest state of each statement. The
+    /// transaction is bounded server side:
     /// one statement may take `statement`, and the transaction may sit
     /// idle between statements at most `idle` (the timeouts are
     /// `SET LOCAL`, so they end with the transaction, and a stream that
     /// stopped reading cannot hold the reader forever).
     //
-    // SHORTCUT: every read runs at repeatable read, one snapshot per
-    // read, even though reads that touch only immutable rows would be
-    // safe at read committed with a shorter snapshot hold. Nobody has
-    // measured the gain, and the split needs an audit of every walk that
-    // re-reads a ref. Measure first, then split.
-    fn begin_read(c: &'a mut PgClient, statement: Duration, idle: Duration) -> Result<PgTx<'a>> {
-        // Three statements, not one string: the client prepares its
-        // queries, and Postgres takes no second command in a prepared
-        // statement (E42601).
-        c.execute(
-            "BEGIN TRANSACTION ISOLATION LEVEL REPEATABLE READ READ ONLY",
-            &[],
+    // SHORTCUT: every read but `read_latest` runs at repeatable read,
+    // one snapshot per read, even though reads that touch only immutable
+    // rows would be safe at read committed with a shorter snapshot hold.
+    // Nobody has measured the gain, and the split needs an audit of
+    // every walk that re-reads a ref. Measure first, then split.
+    fn begin_read(
+        c: &'a mut PgClient,
+        isolation: ReadIsolation,
+        statement: Duration,
+        idle: Duration,
+    ) -> Result<PgTx<'a>> {
+        // One round trip for the open: the three statements are
+        // parameterless strings (the durations are interpolated), and the
+        // client's prepared statements take no second command (E42601) -
+        // the batch is the simple protocol, which takes many. A batch
+        // whose SET LOCAL fails after its BEGIN ran leaves the session
+        // inside an aborted transaction: `open_transaction` rolls that
+        // back before it returns the error, so the pooled client is
+        // clean for its next holder.
+        open_transaction(
+            c,
+            &format!(
+                "BEGIN TRANSACTION ISOLATION LEVEL {} READ ONLY; \
+                 SET LOCAL statement_timeout = {}; \
+                 SET LOCAL idle_in_transaction_session_timeout = {};",
+                isolation.as_sql(),
+                statement.as_millis(),
+                idle.as_millis()
+            ),
         )?;
-        // The transaction exists from here on: a SET LOCAL that fails
-        // drops this `PgTx`, and its Drop rolls the transaction back, so
-        // the pooled client never stays inside one whose statements no
-        // longer run.
-        let tx = Self {
+        Ok(Self {
             c,
             gen_cache: std::collections::HashMap::new(),
             inserted_gens: std::collections::HashMap::new(),
@@ -1406,48 +2417,172 @@ impl<'a> PgTx<'a> {
             cs_pending: None,
             derived_pending: None,
             derived_preload: None,
+            pre_trees: None,
+            pre_history: None,
+            deferred_deletes: Vec::new(),
+            defer_derived: false,
             history_pending: None,
             ended: false,
-        };
-        tx.c.execute(
-            &format!("SET LOCAL statement_timeout = {}", statement.as_millis()),
-            &[],
-        )?;
-        tx.c.execute(
-            &format!(
-                "SET LOCAL idle_in_transaction_session_timeout = {}",
-                idle.as_millis()
-            ),
-            &[],
-        )?;
-        Ok(tx)
-    }
-
-    /// One transaction over the same client, for a caller that wraps this
-    /// one. It ends nothing: `commit` and `rollback` stay with the original.
-    pub(crate) fn reborrow(&mut self) -> PgTx<'_> {
-        PgTx {
-            c: self.c,
-            gen_cache: std::collections::HashMap::new(),
-            inserted_gens: std::collections::HashMap::new(),
-            cs_batching: false,
-            // The reborrows share the pending list with the original, so
-            // its commit path sees what they inserted.
-            cs_pending: self.cs_pending.as_deref_mut(),
-            derived_pending: self.derived_pending.as_deref_mut(),
-            derived_preload: self.derived_preload.as_deref_mut(),
-            history_pending: self.history_pending.as_deref_mut(),
-            ended: true,
-        }
+        })
     }
 
     /// Reads back the land another writer recorded for this request key
     /// first: its land wins, and its input must match this one's.
-    fn read_back_land(&mut self, repo: RepoId, caller: &Caller, req: &LandRequest) -> Result<i64> {
-        let (land_id, input, target) = self
+    /// The repo's id and the land a request key recorded, in one read:
+    /// the record's first statement names the repo and the key together.
+    /// A repo with no such land answers its id and no land; a repo that
+    /// does not exist answers [`Error::NotFound`].
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] when no repository has that name;
+    /// [`Error::InvalidArgument`] when the key named a different land;
+    /// [`Error::Corrupt`] when the row's bytes do not decode.
+    fn repo_and_land_by_key(&mut self, caller: &Caller, req: &LandRequest) -> Result<RecordLookup> {
+        // The input's generation rides the lookup as a column: the
+        // record's existence guard for the changeset, one round trip
+        // instead of two (NULL when no changeset has this id in this
+        // repo). The ref check and the caller's pending count ride it
+        // too, so the record's three precheck SELECTs are one statement:
+        // under READ COMMITTED they answer from one snapshot, which the
+        // land's own CAS re-decides (the ref) or may lag one concurrent
+        // record by a statement either way (the quota).
+        let row = self
             .c
             .query_opt(
-                "SELECT land_id, input_cs, target_ref FROM lands
+                "SELECT r.repo_id, l.land_id, l.input_cs, l.target_ref, l.state,
+                        l.detail, l.result_cs, l.conflict_paths, l.reject_reason,
+                        (SELECT gen FROM changesets JOIN repo_changesets ON cs = id
+                         WHERE repo_id = r.repo_id AND id = $4) AS input_gen,
+                        EXISTS(SELECT 1 FROM refs
+                               WHERE repo_id = r.repo_id AND name = $5) AS ref_exists,
+                        (SELECT count(*) FROM lands
+                         WHERE caller = $2 AND state = 'pending') AS pending
+                 FROM repos r
+                 LEFT JOIN lands l
+                   ON l.repo_id = r.repo_id AND l.caller = $2 AND l.request_key = $3
+                 WHERE r.name = $1",
+                &[
+                    P::text(&req.repo),
+                    P::text(&caller.0),
+                    P::text(&req.request_key),
+                    P::bytes(&id_bytes(req.changeset.as_bytes())),
+                    P::text(&req.target_ref),
+                ],
+            )?
+            .map(|row| {
+                (
+                    row.get::<_, i64>(0),
+                    row.get::<_, Option<i64>>(1),
+                    row.get::<_, Option<Vec<u8>>>(2),
+                    row.get::<_, Option<String>>(3),
+                    row.get::<_, Option<String>>(4),
+                    row.get::<_, Option<String>>(5),
+                    row.get::<_, Option<Option<Vec<u8>>>>(6),
+                    row.get::<_, Option<Vec<u8>>>(7),
+                    row.get::<_, Option<String>>(8),
+                    row.get::<_, Option<i64>>(9),
+                    row.get::<_, bool>(10),
+                    row.get::<_, i64>(11),
+                )
+            })
+            .ok_or_else(|| Error::NotFound(format!("repo {:?}", req.repo)))?;
+        let (
+            repo_id,
+            land_id,
+            input,
+            target,
+            state,
+            detail,
+            result_cs,
+            conflict_paths,
+            reason,
+            input_gen,
+            ref_exists,
+            pending,
+        ) = row;
+        let repo = RepoId(repo_id);
+        let Some(land_id) = land_id else {
+            return Ok((repo, input_gen, None, ref_exists, pending));
+        };
+        // A LEFT JOIN's land columns are all set or all null together: the
+        // row exists only when the join found the land.
+        let input = need(input, land_id, repo)?;
+        let target = need(target, land_id, repo)?;
+        let state = need(state, land_id, repo)?;
+        let detail = detail.unwrap_or_default();
+        let reason = reason.unwrap_or_default();
+        let conflict_paths = conflict_paths.unwrap_or_default();
+        if input != req.changeset.as_bytes() || target != req.target_ref {
+            return Err(Error::InvalidArgument(format!(
+                "request key {:?} was already used for a different land",
+                req.request_key
+            )));
+        }
+        // The join wraps the column's own null in the row's presence: one
+        // flatten answers the column, which the early return above already
+        // proved present.
+        let result = result_cs
+            .flatten()
+            .map(|bytes| ChangesetId::try_from(bytes.as_slice()))
+            .transpose()
+            .map_err(|e| Error::Corrupt(format!("land {land_id} result: {e}")))?;
+        let recorded = LandOutcome {
+            moved: false,
+            land_id,
+            state: LandState::parse(&state)?,
+            result,
+            previous: None,
+            detail,
+            conflict_paths: decode_paths(&conflict_paths)
+                .ok_or_else(|| Error::Corrupt(format!("land {land_id} conflict paths")))?,
+            reject_reason: LandRejectReason::parse(&reason)?,
+        };
+        Ok((repo, input_gen, Some(recorded), ref_exists, pending))
+    }
+
+    /// Reads the land a request key recorded back, for the ON CONFLICT
+    /// race: a twin recorded the same key in the same instant, so this
+    /// insert wrote nothing and the twin's row is the answer.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::Corrupt`] when the row vanished or its bytes do not
+    /// decode.
+    fn read_back_land(
+        &mut self,
+        repo: RepoId,
+        caller: &Caller,
+        req: &LandRequest,
+    ) -> Result<LandOutcome> {
+        self.land_by_key(repo, caller, req)?.ok_or_else(|| {
+            Error::Corrupt(format!(
+                "land {:?} of {:?} was recorded by another process and \
+                 then vanished",
+                req.request_key, caller.0
+            ))
+        })
+    }
+
+    /// The land a request key recorded, as its row answers it: the
+    /// record's first read and the read-back share this one shape.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::InvalidArgument`] when the key named a different land;
+    /// [`Error::Corrupt`] when the row's bytes do not decode.
+    fn land_by_key(
+        &mut self,
+        repo: RepoId,
+        caller: &Caller,
+        req: &LandRequest,
+    ) -> Result<Option<LandOutcome>> {
+        let row = self
+            .c
+            .query_opt(
+                "SELECT land_id, input_cs, target_ref, state, detail, result_cs,
+                        conflict_paths, reject_reason
+                 FROM lands
                  WHERE repo_id = $1 AND caller = $2 AND request_key = $3",
                 &[
                     P::i64(repo.0),
@@ -1460,22 +2595,125 @@ impl<'a> PgTx<'a> {
                     row.get::<_, i64>(0),
                     row.get::<_, Vec<u8>>(1),
                     row.get::<_, String>(2),
+                    row.get::<_, String>(3),
+                    row.get::<_, String>(4),
+                    row.get::<_, Option<Vec<u8>>>(5),
+                    row.get::<_, Vec<u8>>(6),
+                    row.get::<_, String>(7),
                 )
-            })
-            .ok_or_else(|| {
-                Error::Corrupt(format!(
-                    "land {:?} of {:?} was recorded by another process and \
-                     then vanished",
-                    req.request_key, caller.0
-                ))
-            })?;
+            });
+        let Some((land_id, input, target, state, detail, result_cs, conflict_paths, reason)) = row
+        else {
+            return Ok(None);
+        };
         if input != req.changeset.as_bytes() || target != req.target_ref {
             return Err(Error::InvalidArgument(format!(
                 "request key {:?} was already used for a different land",
                 req.request_key
             )));
         }
-        Ok(land_id)
+        let result = result_cs
+            .map(|bytes| ChangesetId::try_from(bytes.as_slice()))
+            .transpose()
+            .map_err(|e| Error::Corrupt(format!("land {land_id} result: {e}")))?;
+        Ok(Some(LandOutcome {
+            moved: false,
+            land_id,
+            state: LandState::parse(&state)?,
+            result,
+            previous: None,
+            detail,
+            conflict_paths: decode_paths(&conflict_paths)
+                .ok_or_else(|| Error::Corrupt(format!("land {land_id} conflict paths")))?,
+            reject_reason: LandRejectReason::parse(&reason)?,
+        }))
+    }
+
+    /// Records a land this record starts: the state the ref's existence
+    /// gives it, the quota, the insert, the expiry. A row this insert
+    /// wrote answers from its own columns; a twin that recorded the same
+    /// key in the same instant answers from its read-back.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn record_new_land(
+        &mut self,
+        repo: RepoId,
+        caller: &Caller,
+        req: &LandRequest,
+        pending_limit: Option<usize>,
+        ref_exists: bool,
+        pending: i64,
+    ) -> Result<LandOutcome> {
+        // The ref's existence and the caller's pending count answered in
+        // the record's one precheck statement; the quota is the same
+        // refusal, evaluated here before any row is written.
+        if let Some(limit) = pending_limit
+            && pending >= i64::try_from(limit).unwrap_or(i64::MAX)
+        {
+            return Err(Error::ResourceExhausted(format!(
+                "principal {:?} has its {limit} lands pending \
+                 (--max-principal-pending-lands {limit}); wait for one to finish",
+                caller.0
+            )));
+        }
+        // A land to a ref that does not exist is rejected at once.
+        let detail = format!("ref {:?} does not exist", req.target_ref);
+        let (state, detail, reason) = if ref_exists {
+            (
+                LandState::Pending,
+                String::new(),
+                LandRejectReason::Unspecified,
+            )
+        } else {
+            (LandState::Rejected, detail, LandRejectReason::MissingRef)
+        };
+        let inserted = self
+            .c
+            .query_opt(
+                "INSERT INTO lands
+                     (repo_id, caller, request_key, target_ref, input_cs, state, detail,
+                      reject_reason, finished_at, created_at)
+                     VALUES ($1, $2, $3, $4, $5, $6, $7, $8,
+                         CASE WHEN $6 = 'pending' THEN NULL ELSE now_epoch() END,
+                         now_epoch())
+                     ON CONFLICT DO NOTHING
+                     RETURNING land_id",
+                &[
+                    P::i64(repo.0),
+                    P::text(&caller.0),
+                    P::text(&req.request_key),
+                    P::text(&req.target_ref),
+                    P::bytes(&id_bytes(req.changeset.as_bytes())),
+                    P::text(state.as_str()),
+                    P::text(&detail),
+                    P::text(reason.as_str()),
+                ],
+            )?
+            .map(|row| row.get::<_, i64>(0));
+        let recorded = match inserted {
+            Some(land_id) => {
+                // A row this record wrote: nothing is settled yet.
+                LandOutcome {
+                    moved: false,
+                    land_id,
+                    state,
+                    result: None,
+                    previous: None,
+                    detail,
+                    conflict_paths: Vec::new(),
+                    reject_reason: reason,
+                }
+            }
+            None => {
+                // A twin recorded the same key in the same instant: read
+                // its row back.
+                self.read_back_land(repo, caller, req)?
+            }
+        };
+        self.expire_lands()?;
+        Ok(recorded)
     }
 
     /// Commits the transaction. The client runs again afterwards.
@@ -1498,8 +2736,7 @@ impl<'a> PgTx<'a> {
 
 impl Drop for PgTx<'_> {
     fn drop(&mut self) {
-        // A transaction that its caller did not end rolls back, as a
-        // dropped SQLite transaction does.
+        // A transaction that its caller did not end rolls back.
         if !self.ended {
             let _ = self.c.execute("ROLLBACK", &[]);
         }
@@ -1534,6 +2771,10 @@ struct Setup {
     /// import).
     exclusive: bool,
     outcome: SetupOutcome,
+    /// The statement whose execution failed, with the database's error:
+    /// the error names what waited, and the source keeps the SQLSTATE
+    /// (#905).
+    failed: Option<(String, postgres::Error)>,
 }
 
 impl Setup {
@@ -1544,6 +2785,7 @@ impl Setup {
             schema: schema.map(str::to_owned),
             exclusive,
             outcome: SetupOutcome::Unreachable,
+            failed: None,
         };
         setup.outcome = setup.apply(client);
         setup
@@ -1562,12 +2804,16 @@ impl Setup {
             // Every statement that follows resolves its unqualified names
             // inside the schema, and the cleanup of stale test schemas
             // sees the connection in `pg_stat_activity` under its name.
-            if client
-                .batch_execute(&format!(
-                    "SET search_path TO {schema}; SET application_name TO '{schema}'"
-                ))
-                .is_err()
-            {
+            // The SHARED session lock on the schema's name is the
+            // cleanup's real check: a live connection holds it, so its
+            // schema never yields the cleanup's exclusive try, whatever
+            // a snapshot saw.
+            let sql = format!(
+                "SET search_path TO {schema}; SET application_name TO '{schema}';
+                 SELECT pg_advisory_lock_shared(hashtext('{schema}'))"
+            );
+            if let Err(e) = client.batch_execute(&sql) {
+                self.failed = Some((sql, e));
                 return SetupOutcome::Unreachable;
             }
         }
@@ -1576,8 +2822,12 @@ impl Setup {
             // spelled: a plain URL and one that rides
             // `--search_path=public` land in the same schema and must
             // fence each other, and schemas ride separately.
-            let Ok(row) = client.query_one("SELECT current_schema()::text", &[]) else {
-                return SetupOutcome::Unreachable;
+            let row = match client.query_one("SELECT current_schema()::text", &[]) {
+                Ok(row) => row,
+                Err(e) => {
+                    self.failed = Some(("SELECT current_schema()::text".to_owned(), e));
+                    return SetupOutcome::Unreachable;
+                }
             };
             // A search_path whose members all miss answers NULL: the
             // connection would create nothing, and no lock names it.
@@ -1604,10 +2854,14 @@ fn uuid_new() -> [u8; 16] {
 
 /// The 16 bytes of a UUID row, checked: a row of another length is a
 /// database that is not this backend's.
-fn uuid_of(raw: Vec<u8>) -> [u8; 16] {
+pub(crate) fn uuid_of(raw: Vec<u8>) -> Result<[u8; 16]> {
     let len = raw.len();
-    raw.try_into()
-        .unwrap_or_else(|_| panic!("a store UUID row holds 16 bytes, got {len}"))
+    raw.try_into().map_err(|_| {
+        Error::Corrupt(format!(
+            "the store_uuid row holds {len} bytes, not 16: this \
+             database is not this backend's store"
+        ))
+    })
 }
 
 /// The statement's parameters as the trait objects `postgres` binds.
@@ -1640,12 +2894,19 @@ fn run_with_retry(
     fence: Option<&Arc<Fence>>,
 ) -> Result<Reply> {
     let out = run_statement(client, job);
-    if out.is_ok() || !client.is_closed() {
+    if out.is_ok() || (!client.is_closed() && !connection_gone(&out)) {
         return out;
     }
     let Ok(fresh) = reconnect(client, conn) else {
         // The connection stays dead; the original error stands, and the
-        // next job reconnects.
+        // next job reconnects. A transaction in progress was lost with
+        // the connection either way: record it now, so the loss is
+        // consumed by this transaction's own next statement - a retry,
+        // or the ROLLBACK its guard sends - instead of riding a stale
+        // `InTx` into some later caller's first job.
+        if tx.in_progress() {
+            *tx = TxState::Lost;
+        }
         return out;
     };
     *setup = fresh;
@@ -1659,7 +2920,7 @@ fn run_with_retry(
     // was dropped with the old session, and nothing of it runs here.
     if tx.in_progress() {
         *tx = TxState::Lost;
-        return Err(Error::Corrupt(TX_LOST.into()));
+        return Err(Error::Unavailable(TX_LOST.into()));
     }
     run_statement(client, job)
 }
@@ -1703,6 +2964,31 @@ pub(crate) fn test_reset_statement_count() {
         .clear();
 }
 
+/// The readers this process has taken since the last reset. A walk that
+/// holds one transaction takes one reader, whatever it steps.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn test_reader_takes() -> u64 {
+    TEST_READER_TAKES.load(Ordering::Relaxed)
+}
+
+/// Sets the reader-take count back to zero.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn test_reset_reader_takes() {
+    TEST_READER_TAKES.store(0, Ordering::Relaxed);
+}
+
+/// How many of this backend's readers sit idle in the pool. A walk that
+/// lost its reader to a leaked transaction leaves the pool short.
+#[cfg(any(test, feature = "test-hooks"))]
+pub(crate) fn test_idle_readers(pg: &Pg) -> usize {
+    pg.inner
+        .readers
+        .idle
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .len()
+}
+
 /// Runs one statement of a job on the client.
 fn run_statement(client: &mut Client, job: &Job) -> Result<Reply> {
     #[cfg(any(test, feature = "test-hooks"))]
@@ -1725,16 +3011,24 @@ fn run_statement(client: &mut Client, job: &Job) -> Result<Reply> {
 
 /// The reply of a failed setup: a takeover names the loss; an
 /// unreachable database answers what a client retries against.
-fn setup_error(setup: &Setup, ever_held: bool) -> Error {
+fn setup_error(setup: &mut Setup, ever_held: bool) -> Error {
     if matches!(setup.outcome, SetupOutcome::NoSchema) {
         return Error::FailedPrecondition(
             "the URL's search_path names no existing schema; create it first".into(),
         );
     }
     if matches!(setup.outcome, SetupOutcome::Unreachable) {
-        return Error::Storage(Storage::busy(std::io::Error::other(
-            "the database was unreachable at setup",
-        )));
+        return match setup.failed.take() {
+            Some((sql, source)) => {
+                Error::Storage(Storage::busy(std::io::Error::other(SetupFailure {
+                    sql,
+                    source,
+                })))
+            }
+            None => Error::Storage(Storage::busy(std::io::Error::other(
+                "the database was unreachable at setup, and the failing statement is unnamed",
+            ))),
+        };
     }
     Error::FailedPrecondition(lost_message(ever_held).into())
 }
@@ -1751,9 +3045,14 @@ fn lost_message(setup_held: bool) -> &'static str {
         "this server process lost the database to another \
          server process; it serves nothing from here on"
     } else {
-        "another server holds this store"
+        HOLDER_MESSAGE
     }
 }
+
+/// The text a second open sees while another session still holds the
+/// one-server lock. One name, so a reword cannot silently turn the
+/// test reopen's wait off.
+pub(crate) const HOLDER_MESSAGE: &str = "another server holds this store";
 
 /// Reconnects a dead client, applies the setup again, and hands the new
 /// setup back: the caller folds it into `setup_held` and the lost
@@ -1826,6 +3125,27 @@ struct ClientConfig {
     fence: Option<Arc<Fence>>,
 }
 
+/// The advisory-lock key of one schema's migrations: migrations touch
+/// only their own schema, so two schemas never take turns (#905). The
+/// database's bare key stays the fallback for a connection whose
+/// search path names no schema.
+///
+/// The derivation cannot overflow: XOR has no carry, so a debug build
+/// cannot panic on it. The fixed prefix byte `0x2D` names this key
+/// space; the schema's hash fills the rest. Against the one-server
+/// lock the guarantee is two-fold: a session that already holds
+/// `schema_lock_key` for its own schema re-enters any lock on the same
+/// key, so a running server never blocks its own store's migrations;
+/// and for the same schema the two derivations mix the hash
+/// differently, which the test below pins over a thousand names.
+pub(crate) fn migration_lock_key(schema: &str) -> i64 {
+    let hash = blake3::hash(schema.as_bytes());
+    let mut key = [0u8; 8];
+    key[0] = 0x2D;
+    key[1..].copy_from_slice(&hash.as_bytes()[..7]);
+    SCHEMA_LOCK ^ i64::from_be_bytes(key)
+}
+
 /// The advisory-lock key of one test schema, so parallel tests of
 /// different schemas do not block each other on the one lock.
 pub(crate) fn schema_lock_key(schema: &str) -> i64 {
@@ -1867,12 +3187,170 @@ fn connect_with(
     spawn_client(url, ca, options, schema, false, None)
 }
 
+/// How long the schema reset's drop waits for a stale table lock: an
+/// admin session or a stuck backend cannot hold a failed restore
+/// forever, and a timeout leaves the schema behind, named for the
+/// next restore's start to reset. Longer than the writers' 5 s clock:
+/// the cleanup must not give up behind a peer that is merely slow.
+const RESET_LOCK_TIMEOUT: &str = "60s";
+/// The drop statement's own clock, above the lock's.
+const RESET_STATEMENT_TIMEOUT: &str = "120s";
+
 /// Undoes the identity a failed restore's open minted in the database:
 /// a fresh store names no store, and the next open mints again. The
 /// tables the migration made stay (they are empty, and the next open's
 /// migration is idempotent); only the name goes.
-pub(crate) fn reset_identity(url: &str, ca: Option<&Path>) -> Result<()> {
-    connect_with(url, ca, "", None)?.batch("DELETE FROM store_uuid WHERE one = 1")
+/// Drops the schema the URL names and makes it again, empty: the
+/// restore's staging metadata lives there, and a killed restore's
+/// committed batches (a kill runs no failure path) or a replay that
+/// failed midway must not survive into the next run. Refuses when
+/// another process holds the schema's one-server lock: a live store is
+/// never dropped.
+///
+/// # Errors
+///
+/// Why the database could not be reached, or another server holds the
+/// schema.
+pub(crate) fn reset_schema(url: &str, ca: Option<&Path>) -> Result<()> {
+    let options = base_options();
+    // The one-server lock of the schema the connection lands in: the
+    // setup asks the database `current_schema()` and locks that. A
+    // refusal here is another server's hold, and the drop must not run.
+    let client = connect_exclusive(url, ca, &options, None, Arc::new(Fence::new()))?;
+    // The target schema, resolved ONCE and quoted: the guards, the lock
+    // and the drop must all act on the same name. A URL whose
+    // search_path names another schema resolves current_schema() to
+    // that schema, and the guards would read the public schema empty
+    // while the drop tore the search_path's schema down - the hole the
+    // verifiers found. A search_path whose members all miss answers
+    // NULL: the connection would create nothing, so refuse with the
+    // fix.
+    let schema: Option<String> = client
+        .query_opt("SELECT current_schema()::text", &[])?
+        .and_then(|row| row.get::<_, Option<String>>(0));
+    let Some(schema) = schema else {
+        return Err(Error::InvalidArgument(
+            "the URL's search_path names no existing schema; create it first".into(),
+        ));
+    };
+    // The drop's only other guard is what the schema holds: this is the
+    // one check a stopped store's URL cannot escape - a stopped server
+    // holds no lock, so the schema's own rows decide. A schema that
+    // carries a store's identity and no restore's staging mark is a
+    // real store: refused, unchanged, whatever the lock says. The
+    // lookups take the schema as a bind parameter and quote it as an
+    // identifier in the database (format %I), so a mixed-case name, a
+    // quote or a space is still the one name the guards and the drop
+    // act on - never the hard-wired `public`.
+    let staging: Option<String> = client
+        .query_opt(
+            "SELECT to_regclass(format('%I.restore_staging', $1::text))::text",
+            &[Param::text(schema.clone())],
+        )?
+        .and_then(|row| row.get::<_, Option<String>>(0));
+    let named: Option<String> = client
+        .query_opt(
+            "SELECT to_regclass(format('%I.store_uuid', $1::text))::text",
+            &[Param::text(schema.clone())],
+        )?
+        .and_then(|row| row.get::<_, Option<String>>(0));
+    if staging.is_none() && named.is_some() {
+        return Err(Error::Corrupt(
+            "this database names a store, and no restore's staging mark: \
+             a restore refuses to drop a store it did not make"
+                .to_string(),
+        ));
+    }
+    if staging.is_none() && named.is_none() {
+        // Not ours and not a store: a schema with other objects is not
+        // a restore's leftover, and nothing here may drop it. The
+        // schema rides a bind parameter: no case folding, no literal
+        // escape, whatever the name carries.
+        let foreign: i64 = client.query(
+            "SELECT count(*) FROM pg_catalog.pg_class \
+                 WHERE relnamespace = (SELECT oid FROM pg_namespace \
+                 WHERE nspname = $1) AND relkind = 'r'",
+            &[Param::text(schema.clone())],
+        )?[0]
+            .get(0);
+        if foreign > 0 {
+            return Err(Error::Corrupt(format!(
+                "this schema holds {foreign} table(s) that no store and no restore made: \
+                 a restore refuses to drop what it did not make"
+            )));
+        }
+    }
+    // The drop waits out a stale table lock a dead replay's peer left
+    // behind - but on a clock, so a stuck backend cannot hold a failed
+    // restore forever. A live store is already refused by the
+    // one-server lock above, before any drop runs.
+    client.batch(&format!(
+        "SET lock_timeout = '{RESET_LOCK_TIMEOUT}'; SET statement_timeout = '{RESET_STATEMENT_TIMEOUT}'"
+    ))?;
+    // One batch: a crash between the drop and the create would leave
+    // the next open a database with no schema to land in. The name is
+    // quoted as an identifier, so a mixed-case schema drops exactly.
+    let quoted = schema.replace('"', "\"\"");
+    if let Err(why) = client.batch(&format!(
+        "DROP SCHEMA IF EXISTS \"{quoted}\" CASCADE; CREATE SCHEMA \"{quoted}\""
+    )) {
+        return Err(Error::Corrupt(format!(
+            "the staging schema {schema} is left behind: {why}; the next restore's start resets it"
+        )));
+    }
+    // This schema is now the restore's staging, and its mark is what
+    // the next restore's start looks for: a schema with the mark is a
+    // restore's leftover, whatever a kill did to the process that made
+    // it. A store's identity never has it. The mark's table is created
+    // in the resolved schema (the connection's search_path already
+    // lands there).
+    let mut id = [0_u8; 16];
+    getrandom::fill(&mut id).expect("system randomness");
+    let id: String = id
+        .iter()
+        .fold(String::new(), |acc, b| acc + &format!("{b:02x}"));
+    client.batch(&format!(
+        "CREATE TABLE restore_staging (id text primary key, started timestamptz default now()); \
+         INSERT INTO restore_staging (id) VALUES ('{id}')"
+    ))?;
+    Ok(())
+}
+
+/// The failure path's reset: the schema this restore reset at its
+/// start, marked as staging, holds only this run's rows - a failed
+/// replay's committed batches and the identity its open minted. Drop
+/// it unconditionally: everything in it is the restore's, and the
+/// bounded clocks still apply (W1).
+///
+/// # Errors
+///
+/// Why the database could not be reached, or the drop ran out of its
+/// clock with the schema left behind (named, for the next restore's
+/// start to reset).
+pub(crate) fn reset_own_staging(url: &str, ca: Option<&Path>) -> Result<()> {
+    let options = base_options();
+    let client = connect_exclusive(url, ca, &options, None, Arc::new(Fence::new()))?;
+    client.batch(&format!(
+        "SET lock_timeout = '{RESET_LOCK_TIMEOUT}'; SET statement_timeout = '{RESET_STATEMENT_TIMEOUT}'"
+    ))?;
+    let schema: String = client.query("SELECT current_schema()", &[])?[0]
+        .try_get(0)
+        .map_err(|error| {
+            Error::Corrupt(format!("the database answers no current schema: {error}"))
+        })?;
+    // The name rides as an identifier, quoted the way reset_schema
+    // quotes it: a schema whose name holds a quote or a space is still
+    // one name, and a raw interpolation here is a SQL injection the
+    // URL's search_path reaches.
+    let quoted = schema.replace('"', "\"\"");
+    if let Err(why) = client.batch(&format!(
+        "DROP SCHEMA IF EXISTS \"{quoted}\" CASCADE; CREATE SCHEMA \"{quoted}\""
+    )) {
+        return Err(Error::Corrupt(format!(
+            "the staging schema {schema} is left behind: {why}; the next restore's start resets it"
+        )));
+    }
+    Ok(())
 }
 
 /// [`connect_with`], as the one server process of the database: the
@@ -1891,7 +3369,9 @@ fn connect_exclusive(
     // server starts against a taken database sees it now, and not in the
     // errors of the first call a client makes.
     let client = spawn_client(url, ca, options, schema, true, Some(fence))?;
-    client.query_opt("SELECT 1", &[])?;
+    client
+        .query_opt("SELECT 1", &[])
+        .map_err(|e| named_step("the one-server lock's probe", "SELECT 1", e))?;
     Ok(client)
 }
 
@@ -1934,8 +3414,124 @@ fn merged_options(from_url: Option<&str>, own: &str) -> String {
     }
 }
 
+/// The whole connect's deadline: the socket connect, its TLS, the
+/// startup message, the authentication. tokio-postgres's
+/// `connect_timeout` covers only the socket connect (the
+/// `connect_socket` step of `connect_once`); a database that accepts
+/// the connection and never answers its startup would hold the open,
+/// the readers' connect and every reconnect forever, so the connect
+/// runs on its own thread and the caller stops waiting at the
+/// deadline. `tcp_user_timeout` cannot cover the wait: a client that
+/// waits for an answer has no unacknowledged data, and the peer's
+/// kernel answers the keepalive probes. A connect past the deadline
+/// leaves its thread parked on the socket - tokio-postgres offers no
+/// cancel - so the connect registers itself as parked, and the server
+/// starts no new connect while
+/// [`CONNECT_PARKED_MAX`] of them are parked: a connect that would be
+/// the next fails at once, naming the host and how long the oldest has
+/// been parked. The cap ends the FD storm a reconnecting server would
+/// otherwise grow against a database that stalls its connects - one
+/// thread and socket a retry, forever - because once the cap fills,
+/// every new connect fails at once, and only the connects already in
+/// flight when it filled can park: a batch bounded by the worker
+/// count, not a thread an hour. The upgrade is a connector whose
+/// stream fails at the deadline, so no thread parks at all (SHORTCUT:
+/// a cap of [`CONNECT_PARKED_MAX`] registered parks, one socket and
+/// thread each, until a tokio-postgres that takes a deadline for the
+/// whole connect).
+const CONNECT_DEADLINE: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// How many connects may sit parked on silent sockets at once. Two:
+/// one for the writers' path, one for a reader, so an outage still
+/// names itself in the log twice before the calls fail fast.
+const CONNECT_PARKED_MAX: usize = 2;
+
+/// The connects parked on silent sockets: their tokens and the moments
+/// they started, so the next connect past the cap can name how long
+/// the oldest has waited.
+static PARKED_CONNECTS: std::sync::LazyLock<Mutex<Vec<(u64, std::time::Instant)>>> =
+    std::sync::LazyLock::new(|| Mutex::new(Vec::new()));
+
+static PARKED_TOKEN: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// Refuses a new connect while the cap of parked connects is held: the
+/// error names the host and how long the oldest parked connect has
+/// waited.
+fn park_refuse(host: &str) -> Result<()> {
+    let parked = PARKED_CONNECTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if parked.len() >= CONNECT_PARKED_MAX {
+        let oldest = parked
+            .iter()
+            .map(|(_, since)| since.elapsed().as_secs())
+            .max()
+            .unwrap_or(0);
+        return Err(Error::Unavailable(format!(
+            "the database at {host} already has {} connects parked on a \
+             socket that never answers, the oldest for {oldest} s: not starting another",
+            parked.len()
+        )));
+    }
+    Ok(())
+}
+
+/// Registers a connect whose caller gave up waiting: its thread is
+/// still parked on the socket. Past the cap the register keeps no row
+/// - the thread parks anyway, one of the batch the cap bounded.
+fn park_register(token: u64) {
+    let mut parked = PARKED_CONNECTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    if parked.len() < CONNECT_PARKED_MAX {
+        parked.push((token, std::time::Instant::now()));
+    }
+}
+
+/// Gives a parked connect's row back: the connect's thread ended, so
+/// its socket is no longer held.
+fn park_release(token: u64) {
+    PARKED_CONNECTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .retain(|(held, _)| *held != token);
+}
+
 /// [`connect_with`]'s work: parse, then connect.
 fn connect_on(url: &str, ca: Option<&Path>, options: &str) -> Result<Client> {
+    connect_on_deadline(url, ca, options, CONNECT_DEADLINE)
+}
+
+/// [`connect_on`], with the whole connect's deadline a parameter, so
+/// the test that pins it does not wait the server's thirty seconds.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn connect_on_deadline_for_tests(
+    url: &str,
+    ca: Option<&Path>,
+    options: &str,
+    deadline: std::time::Duration,
+) -> Result<Client> {
+    connect_on_deadline(url, ca, options, deadline)
+}
+
+/// The tests' reset of the parked-connect slots: every slot goes back,
+/// so a test starts its count from empty.
+#[doc(hidden)]
+#[cfg(any(test, feature = "test-hooks"))]
+pub fn test_reset_parked_connects() {
+    PARKED_CONNECTS
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clear();
+}
+
+fn connect_on_deadline(
+    url: &str,
+    ca: Option<&Path>,
+    options: &str,
+    deadline: std::time::Duration,
+) -> Result<Client> {
     let mut config: Config = url
         .parse()
         .map_err(|e| Error::InvalidArgument(format!("cannot parse the database URL: {e}")))?;
@@ -1972,14 +3568,46 @@ fn connect_on(url: &str, ca: Option<&Path>, options: &str) -> Result<Client> {
                 .to_owned(),
         ));
     }
+    // The host the error names: the first host of the URL, with the
+    // port, or the socket's path.
+    let host = match config.get_hosts().first() {
+        Some(postgres::config::Host::Tcp(host)) => {
+            let port = config.get_ports().first().copied().unwrap_or(5432);
+            format!("{host}:{port}")
+        }
+        Some(postgres::config::Host::Unix(path)) => path.display().to_string(),
+        None => "no host".to_owned(),
+    };
     // A connect that fails is a database the caller may wait for: the
     // same states a statement answers, mapped the same way, so a caller
-    // that retries a busy database retries a starting one too.
-    let client = match (local, ca) {
+    // that retries a busy database retries a starting one too. The
+    // connect runs on its own thread, and the caller stops waiting at
+    // `deadline`: a database that accepts the connection and never
+    // answers its startup fails here instead of holding the open, the
+    // readers' connect and every reconnect forever.
+    let (connected, wait) = std::sync::mpsc::channel();
+    park_refuse(&host)?;
+    let token = PARKED_TOKEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let attempt = match (local, ca) {
         // The connector upgrades every connection, and checks the
         // certificate the server presents against `ca`.
-        (_, Some(ca)) => config.connect(make_tls(ca)?).map_err(map_pg_error)?,
-        (true, None) => config.connect(NoTls).map_err(map_pg_error)?,
+        (_, Some(ca)) => {
+            let tls = make_tls(ca)?;
+            std::thread::Builder::new()
+                .name("postgres-connect".to_owned())
+                .spawn(move || {
+                    let answer = config.connect(tls);
+                    park_release(token);
+                    let _ = connected.send(answer);
+                })
+        }
+        (true, None) => std::thread::Builder::new()
+            .name("postgres-connect".to_owned())
+            .spawn(move || {
+                let answer = config.connect(NoTls);
+                park_release(token);
+                let _ = connected.send(answer);
+            }),
         (false, None) => {
             return Err(Error::InvalidArgument(
                 "the database host is off this machine: give --postgres-ca, \
@@ -1987,14 +3615,75 @@ fn connect_on(url: &str, ca: Option<&Path>, options: &str) -> Result<Client> {
                     .to_owned(),
             ));
         }
-    };
-    Ok(client)
+    }
+    .map_err(|e| Error::Internal(format!("could not start the connect thread: {e}")))?;
+    if let Ok(answer) = wait.recv_timeout(deadline) {
+        answer.map_err(map_pg_error)
+    } else {
+        // The connect's thread is now parked on the socket: registered,
+        // so the next connects past the cap refuse at once.
+        park_register(token);
+        let why = format!(
+            "the database at {host} did not finish its connect within {} s: \
+             the socket may have connected, but its startup, its TLS \
+             or its authentication never answered",
+            deadline.as_secs()
+        );
+        tracing::error!(
+            "{why}; the connect thread {} is left on the socket",
+            attempt.thread().name().unwrap_or("?")
+        );
+        Err(Error::DeadlineExceeded(why))
+    }
 }
 
 /// A database error that a caller may retry maps to a busy [`Storage`]:
 /// the importer retries a batch on it, and the gRPC status becomes
 /// UNAVAILABLE. The rest keep the engine's error as the source.
-fn map_pg_error(e: postgres::Error) -> Error {
+/// Whether the statement's error says the connection is gone, even
+/// when the client's closed flag has not caught up: the server sent a
+/// connection-fatal (an administrator's terminate, a shutdown, the
+/// startup races) or the socket broke under the statement. A FATAL can
+/// be the statement's own answer on a connection the worker still reads
+/// as open, and the caller must take the reconnect path, not the raw
+/// error (#922).
+fn connection_gone(out: &Result<Reply>) -> bool {
+    use std::error::Error as _;
+    let Err(error) = out else {
+        return false;
+    };
+    let Error::Storage(storage) = error else {
+        return false;
+    };
+    let Some(pg) = storage
+        .source()
+        .and_then(|source| source.downcast_ref::<postgres::Error>())
+    else {
+        return false;
+    };
+    if pg.is_closed() {
+        return true;
+    }
+    match pg.as_db_error() {
+        // An administrator's terminate (57P01), a shutdown in progress
+        // (57P02, 57P03), or the connection class itself: the backend is
+        // going away whatever the client's flag says.
+        Some(db) => {
+            matches!(db.code().code(), "57P01" | "57P02" | "57P03")
+                || db.code().code().starts_with("08")
+        }
+        // An error with no database part - a conversion, a bad
+        // parameter, a row-count mismatch - is a bug of the caller, not
+        // a lost connection: only a socket error reads as one. The
+        // source of such an error is the io error itself, when there
+        // was one.
+        None => pg
+            .source()
+            .is_some_and(<dyn std::error::Error + 'static>::is::<std::io::Error>),
+    }
+}
+
+pub(crate) fn map_pg_error(e: postgres::Error) -> Error {
     let code = e
         .code()
         .map(postgres::error::SqlState::code)
@@ -2002,13 +3691,108 @@ fn map_pg_error(e: postgres::Error) -> Error {
     pg_error_of(code.as_deref(), e)
 }
 
+/// The setup's failure: the statement rides the message, and the
+/// database's own error - the SQLSTATE with it - stays the source
+/// (#905).
+#[derive(Debug)]
+struct SetupFailure {
+    sql: String,
+    source: postgres::Error,
+}
+
+impl std::fmt::Display for SetupFailure {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the database was unreachable at setup, waiting on:\n{}",
+            self.sql
+        )
+    }
+}
+
+impl std::error::Error for SetupFailure {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// An open step's failure: the step's name and statement ride the
+/// error's display, and the source stays the mapped engine error, whose
+/// own source is the database's error - the whole chain survives
+/// (#905).
+#[derive(Debug)]
+struct NamedStep {
+    step: &'static str,
+    sql: String,
+    source: Error,
+}
+
+impl std::fmt::Display for NamedStep {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "the open step `{}` waited or failed:\n{}",
+            self.step, self.sql
+        )
+    }
+}
+
+impl std::error::Error for NamedStep {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
+}
+
+/// The step of the open that failed, with its statement, in the class
+/// the mapped error already carries (#905).
+pub(crate) fn named_step(step: &'static str, sql: &str, err: Error) -> Error {
+    use crate::error::StorageClass;
+    let class = match &err {
+        Error::Storage(storage) => Some(storage.class()),
+        _ => None,
+    };
+    let named = NamedStep {
+        step,
+        sql: sql.to_owned(),
+        source: err,
+    };
+    match class {
+        Some(StorageClass::Busy) => Error::Storage(Storage::busy(std::io::Error::other(named))),
+        Some(StorageClass::DiskFull) => {
+            Error::Storage(Storage::disk_full(std::io::Error::other(named)))
+        }
+        Some(StorageClass::Internal) => {
+            Error::Storage(Storage::internal(std::io::Error::other(named)))
+        }
+        // The classes a step's own message carries: the clock's answer
+        // names the step, and the rest stand - a NotFound or a
+        // precondition is the step's own words already.
+        None => match named.source {
+            Error::DeadlineExceeded(why) => Error::DeadlineExceeded(format!(
+                "{why}; the open step `{}` waited or failed:\n{}",
+                named.step, named.sql
+            )),
+            other => other,
+        },
+    }
+}
+
 /// The mapping on one SQLSTATE, split from [`map_pg_error`] so a unit
 /// test can hand it a code: the `postgres` crate's error type cannot be
 /// built with a chosen one.
 fn pg_error_of(code: Option<&str>, e: postgres::Error) -> Error {
+    let closed = e.is_closed();
+    pg_error_of_source(code, closed, Box::new(e))
+}
+
+fn pg_error_of_source(
+    code: Option<&str>,
+    closed: bool,
+    source: Box<dyn std::error::Error + Send + Sync>,
+) -> Error {
     // A connection the database dropped is as retryable as a busy one.
-    if e.is_closed() {
-        return Error::Storage(Storage::busy(e));
+    if closed {
+        return Error::Storage(Storage::busy(source));
     }
     match code {
         // Deadlock, serialization failure, an administrative shutdown, a
@@ -2017,21 +3801,21 @@ fn pg_error_of(code: Option<&str>, e: postgres::Error) -> Error {
             if matches!(code, "40P01" | "40001" | "57P01" | "57P03" | "55P03")
                 || code.starts_with("08") =>
         {
-            tracing::warn!("the database is busy: {e}");
-            Error::Storage(Storage::busy(e))
+            tracing::warn!("the database is busy: {source}");
+            Error::Storage(Storage::busy(source))
         }
-        // The lock or the statement waited past its clock, as a SQLite
-        // write does past its busy timeout: the caller has been at it
-        // too long, and the client retries past its own deadline.
+        // The lock or the statement waited past its clock: the caller
+        // has been at it too long, and the client retries past its own
+        // deadline.
         Some("57014") => {
-            tracing::warn!("the database gave the statement up: {e}");
+            tracing::warn!("the database gave the statement up: {source}");
             Error::DeadlineExceeded("the database kept the caller waiting".to_owned())
         }
         // A violation the code handles (a duplicate key, a check, a
         // foreign key) is one answer among many: it logs quietly.
         Some(code) if code.starts_with("23") => {
-            tracing::debug!("the database refused a statement: {e}");
-            Error::Storage(Storage::internal(e))
+            tracing::debug!("the database refused a statement: {source}");
+            Error::Storage(Storage::internal(source))
         }
         // Out of space: the same shortage, wherever the metadata lives.
         // 53100 is the database's one disk-full code - errcode_for_file_access
@@ -2045,23 +3829,23 @@ fn pg_error_of(code: Option<&str>, e: postgres::Error) -> Error {
         // succeed - and 58030 is an io_error - a failing device is the
         // EIO row's internal, not a space shortage.
         Some("53100") => {
-            tracing::error!("the server is out of disk space: {e}");
-            Error::Storage(Storage::disk_full(e))
+            tracing::error!("the server is out of disk space: {source}");
+            Error::Storage(Storage::disk_full(source))
         }
         // A statement the database never saw: the connection could not
         // be made or was cut on the way. No SQLSTATE names it, and a
         // client retries it as it retries a busy one.
         None => {
-            tracing::warn!("the database is unreachable: {e}");
-            Error::Storage(Storage::busy(e))
+            tracing::warn!("the database is unreachable: {source}");
+            Error::Storage(Storage::busy(source))
         }
         // The rest keep the engine's error as the source, and it reaches
         // the log in full: a bug of this backend, such as a bad parameter,
         // must not look busy, or the importer retries it and the log says
         // nothing but "busy".
         _ => {
-            tracing::warn!("the database refused a statement: {e}");
-            Error::Storage(Storage::internal(e))
+            tracing::warn!("the database refused a statement: {source}");
+            Error::Storage(Storage::internal(source))
         }
     }
 }
@@ -2095,89 +3879,348 @@ fn make_tls(ca: &Path) -> Result<MakeRustlsConnect> {
     Ok(MakeRustlsConnect::new(config))
 }
 
+/// What every store opener answers when the database is behind this
+/// build and the opener may not migrate: the fix is named.
+pub(crate) fn pending_migration_message(db: u32, build: u32) -> String {
+    format!(
+        "the database is at schema version {db}, this build ships {build}; \
+         run `scion-server migrate` first, or pass --migrate to serve"
+    )
+}
+
+/// One raw connection for preflight: the URL's own TLS and option
+/// rules, the pool's connect discipline, and no setup - no schema
+/// write, and no lock of any kind: the one-server lock and the
+/// schema's shared lock both stay untouched. The session is read-only
+/// at the database itself (`default_transaction_read_only=on`), so a
+/// check cannot write even by accident.
+/// A URL that does not parse, refused where it was read: the message
+/// names the parse error and `read_from` (the file's path or the
+/// environment variable), never the URL's own text, whose password
+/// must not reach a log or a fail line. The read sites (the CLI's
+/// `postgres_url_of` and preflight's `postgres_url`) call this before
+/// any connect, so serve, migrate and preflight answer the same words.
+/// #963.
+///
+/// # Errors
+///
+/// An [`Error::InvalidArgument`] naming the parse error and
+/// `read_from`, when the URL does not parse.
+pub fn check_db_url(url: &str, read_from: &str) -> Result<()> {
+    let _ = url.parse::<postgres::Config>().map_err(|e| {
+        Error::InvalidArgument(format!(
+            "cannot parse the database URL from {read_from}: {e}",
+        ))
+    })?;
+    Ok(())
+}
+
+pub(crate) fn preflight_client(url: &str, ca: Option<&Path>) -> Result<Client> {
+    connect_on(
+        url,
+        ca,
+        &format!(
+            "-cdefault_transaction_read_only=on -cstatement_timeout=600000 \
+             -clock_timeout={LOCK_TIMEOUT_FOR_WRITERS}"
+        ),
+    )
+}
+
+/// The schema version the database stands at, read without writing:
+/// version 0 is a database with no schema yet. The check and the open's
+/// pending-migration refusal read it; the migration itself runs under
+/// the schema's lock, and its first step makes the ledger.
+/// The two statement paths one schema-state read may take: the open's
+/// migration reads through the worker's client, the preflight's check
+/// and `migrate --check`'s read through a plain session of their own.
+/// One trait, so the read is one code path, not a copy.
+pub(crate) trait SchemaRows {
+    /// The statement's rows, in this backend's errors.
+    fn schema_query(&mut self, sql: &str) -> Result<Vec<postgres::Row>>;
+}
+
+impl SchemaRows for Client {
+    fn schema_query(&mut self, sql: &str) -> Result<Vec<postgres::Row>> {
+        Client::query(self, sql, &[]).map_err(map_pg_error)
+    }
+}
+
+impl SchemaRows for PgClient {
+    fn schema_query(&mut self, sql: &str) -> Result<Vec<postgres::Row>> {
+        self.query(sql, &[])
+    }
+}
+
+fn schema_version(client: &mut impl SchemaRows) -> Result<u32> {
+    let ledger: Option<String> = client
+        .schema_query("SELECT to_regclass('schema_migrations')::text")?
+        .into_iter()
+        .next()
+        .and_then(|row| row.get(0));
+    if ledger.is_none() {
+        return Ok(0);
+    }
+    let version: i64 = client
+        .schema_query("SELECT max(version) FROM schema_migrations")?
+        .first()
+        .and_then(|row| row.get::<_, Option<i64>>(0))
+        .unwrap_or(0);
+    u32::try_from(version).map_err(|_| {
+        Error::FailedPrecondition(format!(
+            "database schema version {version} is not a version"
+        ))
+    })
+}
+
+/// What `migrate --check` reports: the version the database stands at,
+/// this build's version, and the names of the migrations the build
+/// would run. Read without the schema's lock and without writing, so a
+/// check is safe beside a live server.
+pub struct SchemaCheck {
+    db_version: u32,
+    pending: &'static [&'static str],
+}
+
+impl SchemaCheck {
+    /// Whether the database is behind this build: `migrate --check`
+    /// exits non-zero on it, and the names are the steps it would run.
+    #[must_use]
+    pub fn is_pending(&self) -> bool {
+        !self.pending.is_empty()
+    }
+
+    /// The pending migrations' names, in the order `migrate` runs them.
+    #[must_use]
+    pub fn pending(&self) -> &[&'static str] {
+        self.pending
+    }
+
+    /// The version the database stands at.
+    #[must_use]
+    pub fn db_version(&self) -> u32 {
+        self.db_version
+    }
+
+    /// The version this build ships.
+    #[must_use]
+    pub fn build_version(&self) -> u32 {
+        PG_SCHEMA_VERSION
+    }
+}
+
+/// Reads the schema state for `migrate --check`, without the schema's
+/// lock and without writing.
+///
+/// # Errors
+///
+/// What the database returns, and the newer-schema refusal a newer
+/// database gives every opener.
+pub fn check_schema(url: &str, ca: Option<&Path>) -> Result<SchemaCheck> {
+    let mut client = connect_with(url, ca, &base_options(), None)?;
+    check_schema_on(&mut client)
+}
+
+/// [`check_schema`]'s decision, on a caller's connection: the preflight
+/// runs it on its read-only session, so the check opens no second
+/// session outside that discipline.
+///
+/// # Errors
+///
+/// What the database returns, and the newer-schema refusal a newer
+/// database gives every opener.
+pub(crate) fn check_schema_on(client: &mut impl SchemaRows) -> Result<SchemaCheck> {
+    let db_version = schema_version(client)?;
+    if db_version > PG_SCHEMA_VERSION {
+        return Err(Error::FailedPrecondition(format!(
+            "database schema version {db_version} is newer than this build \
+             ({PG_SCHEMA_VERSION}); run this build's older server, or upgrade it"
+        )));
+    }
+    Ok(SchemaCheck {
+        db_version,
+        pending: &PG_MIGRATION_NAMES[db_version as usize..],
+    })
+}
+
+/// Runs the migrations on purpose: the same path the open runs, with
+/// the same logs and the same schema lock. The caller records the move
+/// in its audit log.
+///
+/// The schema's one-server lock comes first, held for the migration on
+/// this connection: a live server holds it for its life, so a migrate
+/// beside one refuses before the schema can move under it - a migration
+/// an old server does not know (a rename, a drop) would break the
+/// process that serves. The wait is none: the operator's next step is
+/// stopping the server, not queuing behind it. `serve --migrate` holds
+/// the same lock by its open, so an unattended start keeps working.
+///
+/// # Errors
+///
+/// What the database returns, the newer-schema refusal, the
+/// no-schema refusal, or the one-server lock held by a live server.
+pub fn migrate_store(url: &str, ca: Option<&Path>) -> Result<Option<(u32, u32)>> {
+    let mut client = connect_with(url, ca, &base_options(), None)?;
+    // What the connection actually writes into, whatever the URL
+    // spelled: the same current-schema read the open's exclusive setup
+    // makes, so a plain URL and one that rides `--search_path=public`
+    // take the same lock.
+    let current = client
+        .query("SELECT current_schema()::text", &[])?
+        .into_iter()
+        .next()
+        .and_then(|row| row.get::<_, Option<String>>(0))
+        .ok_or_else(|| {
+            Error::FailedPrecondition(
+                "the URL's search_path names no existing schema; create it first".into(),
+            )
+        })?;
+    // The one-server lock, tried, not waited on: the operator's next
+    // step is stopping the server, not queuing behind it.
+    let held = client
+        .query(
+            "SELECT pg_try_advisory_lock($1)",
+            &[P::i64(schema_lock_key(&current))],
+        )?
+        .into_iter()
+        .next()
+        .is_some_and(|row| row.get::<_, bool>(0));
+    if !held {
+        return Err(Error::FailedPrecondition(format!(
+            "{HOLDER_MESSAGE}; stop the server first"
+        )));
+    }
+    migrate(&mut client, true)
+}
+
 /// Brings the database to this build's schema: runs every migration it has
 /// not run yet, in one transaction each, and refuses a schema of a newer
 /// build. Returns the `(from, to)` versions when it migrated, and `None`
 /// when the database was at this build's version already. A database of
 /// version 0 was no schema at all: the first open creates one, and a
 /// creation moves nothing.
+///
+/// When `allow` is false, a database that is behind this build is
+/// refused instead of migrated: every store opener but `migrate` and
+/// `serve --migrate` passes false, so an upgrade happens when the
+/// operator asks for it.
 #[allow(clippy::needless_pass_by_ref_mut)]
-fn migrate(client: &mut PgClient) -> Result<Option<(u32, u32)>> {
+fn migrate(client: &mut PgClient, allow: bool) -> Result<Option<(u32, u32)>> {
     // One process at a time migrates: a lock of the session, held across
     // the migrations, so a server and an import started together take
     // turns while the migrations are quick, and the version the loser
     // reads is the one the winner left. A lock past its 5 s clock leaves
     // the taker busy: an open that hits one waits and tries again.
-    client.query_opt("SELECT pg_advisory_lock($1)", &[P::i64(SCHEMA_LOCK)])?;
-    let outcome = migrate_under_lock(client);
+    //
+    // The lock is the schema's, not the database's: the migrations touch
+    // only their own schema, so two schemas never take turns, and a
+    // database with one schema behaves as it did (#905).
+    //
+    // The database's bare key is taken SHARED beside it: an older build
+    // takes that key alone, exclusive, so an older migrator and this
+    // one still take turns on the same schema, while two opens of this
+    // build - whose shared takes agree - never queue on each other.
+    // When the search path names no schema, both takes land on the
+    // bare key itself - exclusive, then shared, which one session may
+    // hold together - and the two unlocks below match them one for
+    // one.
+    let schema: Option<String> = client
+        .query_opt("SELECT current_schema()::text", &[])
+        .map_err(|e| {
+            named_step(
+                "the migration lock's schema read",
+                "SELECT current_schema()::text",
+                e,
+            )
+        })?
+        .and_then(|row| row.get::<_, Option<String>>(0));
+    let lock = schema.as_deref().map_or(SCHEMA_LOCK, migration_lock_key);
+    client
+        .query_opt("SELECT pg_advisory_lock($1)", &[P::i64(lock)])
+        .map_err(|e| {
+            named_step(
+                "the schema migration lock",
+                "SELECT pg_advisory_lock($1)",
+                e,
+            )
+        })?;
+    client
+        .query_opt("SELECT pg_advisory_lock_shared($1)", &[P::i64(SCHEMA_LOCK)])
+        .map_err(|e| {
+            // The schema's own key stays on this session: the failed
+            // open drops the client, and the connection's death takes
+            // every session lock with it.
+            named_step(
+                "the migration's shared turn on the database",
+                "SELECT pg_advisory_lock_shared($1)",
+                e,
+            )
+        })?;
+    let outcome = migrate_under_lock(client, allow);
+    // The base statement budget goes back whatever the migrations did:
+    // only the migration window ran without it, and this client — for
+    // `serve --migrate`, the writer the store keeps — must not serve a
+    // statement at a budget the open did not choose. A restore that
+    // fails fails the open, and the operator sees why: an unbounded
+    // writer with no answer is the silent path the base budget exists
+    // to prevent. The migration's own error comes first, and the
+    // restore's failure answers when the migrations left none.
+    let restored = client
+        .execute(
+            &format!("SET statement_timeout = '{}'", base_statement_timeout()),
+            &[],
+        )
+        .map_err(|e| {
+            named_step(
+                "the base budget's return",
+                "SET statement_timeout = <the open's budget>",
+                e,
+            )
+        });
     // The lock lives on the client's session: it goes back whatever the
     // migrations did. A client that died mid-migration lost the lock with
     // its connection, and the unlock names a lock the new connection
     // never held, which answers false and costs nothing.
-    let _ = client.query_opt("SELECT pg_advisory_unlock($1)", &[P::i64(SCHEMA_LOCK)]);
-    outcome
+    let _ = client.query_opt("SELECT pg_advisory_unlock($1)", &[P::i64(lock)]);
+    let _ = client.query_opt(
+        "SELECT pg_advisory_unlock_shared($1)",
+        &[P::i64(SCHEMA_LOCK)],
+    );
+    outcome.and_then(|value| restored.map(|_| value))
 }
 
-/// The migrations themselves, under the session's schema lock.
-fn migrate_under_lock(client: &mut PgClient) -> Result<Option<(u32, u32)>> {
-    // The ledger of the versions, made first, in its own transaction: a
-    // migration that fails leaves the ledger and every version before it.
-    client.batch(
-        "CREATE TABLE IF NOT EXISTS schema_migrations (
-             version BIGINT PRIMARY KEY,
-             name    TEXT NOT NULL
-         )",
-    )?;
-    let version: i64 = client
-        .query("SELECT max(version) FROM schema_migrations", &[])?
-        .first()
-        .and_then(|row| row.get::<_, Option<i64>>(0))
-        .unwrap_or(0);
-    let version = u32::try_from(version).map_err(|_| {
-        Error::FailedPrecondition(format!(
-            "database schema version {version} is not a version"
-        ))
-    })?;
-    if version > PG_SCHEMA_VERSION {
-        return Err(Error::FailedPrecondition(format!(
-            "database schema version {version} is newer than this build \
-             ({PG_SCHEMA_VERSION}); run this build's older server, or upgrade it"
-        )));
-    }
-    if version == PG_SCHEMA_VERSION {
-        return Ok(None);
-    }
-    tracing::info!(
-        from_version = version,
-        to_version = PG_SCHEMA_VERSION,
-        "migrating the metadata schema"
-    );
-    for (n, sql) in PG_MIGRATIONS.iter().enumerate() {
-        let n = u32::try_from(n + 1).expect("a schema version fits in a u32");
-        if n <= version {
-            continue;
-        }
-        // One transaction per migration, with its version bump: a
-        // migration that fails rolls its own statements back, and the
-        // versions before it stand.
-        let step = std::time::Instant::now();
-        let mut pending = Vec::new();
-        let mut derived = DerivedPending::default();
-        let mut preload = std::collections::HashMap::new();
-        let mut history = HistoryPending::default();
-        let mut tx = PgTx::begin(
-            client,
-            &mut pending,
-            &mut derived,
-            &mut preload,
-            &mut history,
-        )?;
-        tx.c.batch(&format!(
-            "{sql}\nINSERT INTO schema_migrations (version, name) \
+/// One migration, in its own transaction with its version bump: a
+/// migration that fails rolls its own statements back, and the
+/// versions before it stand. The steps name themselves, with the
+/// migration's ledger name in the statement the failure names (#905).
+/// `from_version` is the version the database stood at before the
+/// open: a fresh database's story is a creation, not a migration, so
+/// the step log only answers a database that had one.
+fn run_one_migration(client: &mut PgClient, from_version: u32, n: u32, sql: &str) -> Result<()> {
+    let step = std::time::Instant::now();
+    let mut pending = Vec::new();
+    let mut derived = DerivedPending::default();
+    let mut history = HistoryPending::default();
+    let step_name = PG_MIGRATION_NAMES
+        .get(usize::try_from(n).expect("a schema version fits in usize") - 1)
+        .copied()
+        .unwrap_or("unnamed");
+    let mut tx = PgTx::begin(client, &mut pending, &mut derived, &mut history, None, None)
+        .map_err(|e| named_step("the migration's begin", "BEGIN", e))?;
+    tx.c.batch(&format!(
+        "{sql}\nINSERT INTO schema_migrations (version, name) \
              VALUES ({}, 'postgres schema')",
-            i64::from(n)
-        ))?;
-        tx.commit()?;
+        i64::from(n)
+    ))
+    .map_err(|e| {
+        named_step(
+            "the migration itself",
+            &format!("migration {n} ({step_name})"),
+            e,
+        )
+    })?;
+    tx.commit()
+        .map_err(|e| named_step("the migration's commit", "COMMIT", e))?;
+    if from_version != 0 {
         tracing::info!(
             from_version = n - 1,
             to_version = n,
@@ -2185,11 +4228,116 @@ fn migrate_under_lock(client: &mut PgClient) -> Result<Option<(u32, u32)>> {
             "the metadata schema migrated one step"
         );
     }
-    tracing::info!(
-        from_version = version,
-        to_version = PG_SCHEMA_VERSION,
-        "the metadata migration is done"
-    );
+    Ok(())
+}
+
+/// The migrations themselves, under the session's schema lock. `allow`
+/// is the opener's right to move the schema: false turns a behind
+/// database into the refusal that names `scion-server migrate`.
+fn migrate_under_lock(client: &mut PgClient, allow: bool) -> Result<Option<(u32, u32)>> {
+    // The version the database stands at, read without writing: a
+    // missing ledger is version 0. The refusals below run before this
+    // open has written anything, so a refusing open leaves the catalog
+    // alone — and a role that may read the ledger but not create in the
+    // schema still reaches the refusal instead of dying on the ledger's
+    // DDL first.
+    let version = schema_version(client).map_err(|e| {
+        named_step(
+            "the migration's version read",
+            "the schema_migrations ledger",
+            e,
+        )
+    })?;
+    if version > PG_SCHEMA_VERSION {
+        return Err(Error::FailedPrecondition(format!(
+            "database schema version {version} is newer than this build \
+             ({PG_SCHEMA_VERSION}); run this build's older server, or upgrade it"
+        )));
+    }
+    // A fresh database (version 0) is made by whatever opens it, as
+    // before; a database that is behind this build moves only when the
+    // opener asked to migrate.
+    if !allow && version != 0 && version < PG_SCHEMA_VERSION {
+        return Err(Error::FailedPrecondition(pending_migration_message(
+            version,
+            PG_SCHEMA_VERSION,
+        )));
+    }
+    if version == PG_SCHEMA_VERSION {
+        return Ok(None);
+    }
+    // The runner will write: a migration is the operator's ask, not a
+    // lane's call, so its statements are not bounded by the open's
+    // per-statement budget. `migrate` puts the base budget back.
+    client
+        .execute("SET statement_timeout = 0", &[])
+        .map_err(|e| {
+            named_step(
+                "the migration window's budget lift",
+                "SET statement_timeout = 0",
+                e,
+            )
+        })?;
+    // The ledger of the versions, made first, in its own transaction: a
+    // migration that fails leaves the ledger and every version before it.
+    client
+        .batch(
+            "CREATE TABLE IF NOT EXISTS schema_migrations (
+             version BIGINT PRIMARY KEY,
+             name    TEXT NOT NULL
+         )",
+        )
+        .map_err(|e| {
+            named_step(
+                "the migration ledger's create",
+                "CREATE TABLE IF NOT EXISTS schema_migrations",
+                e,
+            )
+        })?;
+    if version != 0 {
+        tracing::info!(
+            from_version = version,
+            to_version = PG_SCHEMA_VERSION,
+            "migrating the metadata schema"
+        );
+    }
+    for (n, sql) in PG_MIGRATIONS.iter().enumerate() {
+        let n = u32::try_from(n + 1).expect("a schema version fits in a u32");
+        if n <= version {
+            continue;
+        }
+        // The timeout test's lever: one statement inside the migration
+        // window, longer than the shrunken base budget, so a test can
+        // prove the lifted budget covers the migration's own statements.
+        // Release builds never read the env.
+        #[cfg(any(test, feature = "test-hooks"))]
+        if let Ok(ms) = std::env::var("SCION_TEST_MIGRATION_SLEEP_MS")
+            && let Ok(ms) = ms.parse::<f64>()
+            && ms > 0.0
+        {
+            // Test-only, env-set: the value formats into the statement
+            // (the schema's params are integers, text, and bytes, and a
+            // sleep needs no more than a literal).
+            let sql = format!("SELECT pg_sleep({})", ms / 1000.0);
+            client.execute(&sql, &[])?;
+        }
+        // One transaction per migration, with its version bump: a
+        // migration that fails rolls its own statements back, and the
+        // versions before it stand.
+        run_one_migration(client, version, n, sql)?;
+    }
+    if version == 0 {
+        tracing::info!(
+            to_version = PG_SCHEMA_VERSION,
+            "the metadata schema was created"
+        );
+    } else {
+        tracing::info!(
+            from_version = version,
+            to_version = PG_SCHEMA_VERSION,
+            "the metadata migration is done"
+        );
+    }
     // Version 0 was no schema at all: the first open creates one, and a
     // creation moves nothing.
     let migrated = if version == 0 {
@@ -2226,7 +4374,215 @@ fn id_bytes(id: &[u8; 32]) -> Vec<u8> {
     id.to_vec()
 }
 
+impl PgTx<'_> {
+    /// The settle's one statement: a CTE chain whose arm per row kind
+    /// keeps its own `ON CONFLICT` rule, and a top `SELECT` that answers
+    /// each arm's inserted count. The history arm carries the
+    /// transaction's deferred nodes (#1031); the count names name each
+    /// arm, in order.
+    fn settle_statement(
+        trees: &[(TreeId, Vec<u8>)],
+        rows: &[(String, u32, ChangesetId, Vec<u8>)],
+        repo: RepoId,
+        blobs: &[BlobId],
+        history: &[(Vec<u8>, Vec<u8>)],
+    ) -> (String, Vec<Param>, Vec<String>) {
+        let mut arms: Vec<String> = Vec::new();
+        let mut params: Vec<Param> = Vec::new();
+        let mut n = 1usize;
+        let mut counts: Vec<String> = Vec::new();
+        if !trees.is_empty() {
+            let ids: Vec<Vec<u8>> = trees
+                .iter()
+                .map(|(id, _)| id_bytes(id.as_bytes()))
+                .collect();
+            let bodies: Vec<Vec<u8>> = trees.iter().map(|(_, body)| body.clone()).collect();
+            params.push(Param::ByteaArray(ids));
+            params.push(Param::ByteaArray(bodies));
+            arms.push(format!(
+                "tr AS (
+                   INSERT INTO trees (id, body)
+                   SELECT * FROM unnest(${n}::bytea[], ${next}::bytea[])
+                   ON CONFLICT (id) DO NOTHING
+                   RETURNING 1
+                 )",
+                n = n,
+                next = n + 1
+            ));
+            counts.push("tr".to_owned());
+            n += 2;
+        }
+        if !rows.is_empty() {
+            let kinds: Vec<String> = rows.iter().map(|(kind, _, _, _)| kind.clone()).collect();
+            let versions: Vec<i64> = rows.iter().map(|(_, v, _, _)| i64::from(*v)).collect();
+            let css: Vec<Vec<u8>> = rows
+                .iter()
+                .map(|(_, _, cs, _)| id_bytes(cs.as_bytes()))
+                .collect();
+            let values: Vec<Vec<u8>> = rows.iter().map(|(_, _, _, value)| value.clone()).collect();
+            params.push(Param::TextArray(kinds));
+            params.push(Param::I64Array(versions));
+            params.push(Param::ByteaArray(css));
+            params.push(Param::ByteaArray(values));
+            arms.push(format!(
+                "der AS (
+                   INSERT INTO derived (kind, version, cs, value)
+                   SELECT * FROM unnest(${n}::text[], ${next}::int8[], ${next2}::bytea[], ${next3}::bytea[])
+                   ON CONFLICT (kind, version, cs) DO NOTHING
+                   RETURNING 1
+                 )",
+                n = n,
+                next = n + 1,
+                next2 = n + 2,
+                next3 = n + 3
+            ));
+            counts.push("der".to_owned());
+            n += 4;
+        }
+        if !blobs.is_empty() {
+            let ids: Vec<Vec<u8>> = blobs.iter().map(|blob| id_bytes(blob.as_bytes())).collect();
+            params.push(Param::I64(repo.0));
+            params.push(Param::ByteaArray(ids));
+            arms.push(format!(
+                "blb AS (
+                   INSERT INTO repo_blobs (repo_id, blob)
+                   SELECT ${n}, x FROM unnest(${next}::bytea[]) AS x
+                   ON CONFLICT (repo_id, blob) DO NOTHING
+                   RETURNING 1
+                 )",
+                n = n,
+                next = n + 1
+            ));
+            counts.push("blb".to_owned());
+            n += 2;
+        }
+        if !history.is_empty() {
+            let ids: Vec<Vec<u8>> = history.iter().map(|(id, _)| id.clone()).collect();
+            let bodies: Vec<Vec<u8>> = history.iter().map(|(_, body)| body.clone()).collect();
+            params.push(Param::ByteaArray(ids));
+            params.push(Param::ByteaArray(bodies));
+            arms.push(format!(
+                "hn AS (
+                   INSERT INTO history_nodes (id, body)
+                   SELECT * FROM unnest(${n}::bytea[], ${next}::bytea[])
+                   ON CONFLICT (id) DO NOTHING
+                   RETURNING 1
+                 )",
+                n = n,
+                next = n + 1
+            ));
+            counts.push("hn".to_owned());
+            #[cfg(test)]
+            {
+                let bytes: usize = history.iter().map(|(_, body)| body.len()).sum();
+                crate::history::note_flushed_node_bytes(bytes);
+            }
+        }
+        // The top SELECT answers each arm's inserted count.
+        let selects: Vec<String> = counts
+            .iter()
+            .map(|arm| format!("(SELECT count(*) FROM {arm})"))
+            .collect();
+        let sql = format!("WITH {} SELECT {}", arms.join(",\n"), selects.join(", "));
+        (sql, params, counts)
+    }
+    /// A short derived count is a stored row for one of the keys: legal
+    /// when it agrees, corrupt when it differs. Checked row by row on
+    /// this rare path.
+    fn check_derived_conflicts(
+        c: &mut Self,
+        rows: &[(String, u32, ChangesetId, Vec<u8>)],
+        inserted_count: i64,
+    ) -> Result<()> {
+        let inserted = u64::try_from(inserted_count).unwrap_or(0);
+        if inserted == rows.len() as u64 {
+            return Ok(());
+        }
+        for (kind, version, cs, value) in rows {
+            if c.get_derived(kind, *version, *cs)?.as_deref() != Some(value) {
+                return Err(Error::Corrupt(format!(
+                    "derived {kind} v{version} for {cs} differs from the stored value"
+                )));
+            }
+        }
+        Ok(())
+    }
+    /// The changeset chain's one statement: the changesets row, the
+    /// parents (when there are any) and the repo membership, each arm
+    /// keeping its own ON CONFLICT DO NOTHING. Returns whether the
+    /// changesets arm inserted.
+    fn insert_changeset_chain(
+        c: &mut Self,
+        repo: RepoId,
+        id: &ChangesetId,
+        generation: i64,
+        body: &[u8],
+        parents: &[Vec<u8>],
+    ) -> Result<i64> {
+        let rows = if parents.is_empty() {
+            c.c.query(
+                "WITH cs AS (
+                   INSERT INTO changesets (id, gen, body) VALUES ($1, $2, $3)
+                   ON CONFLICT (id) DO NOTHING
+                   RETURNING 1
+                 ), mem AS (
+                   INSERT INTO repo_changesets (repo_id, cs) VALUES ($4, $1)
+                   ON CONFLICT (repo_id, cs) DO NOTHING
+                 )
+                 SELECT (SELECT count(*) FROM cs)::bigint",
+                &[
+                    P::bytes(&id_bytes(id.as_bytes())),
+                    P::i64(generation),
+                    P::bytes(body),
+                    P::i64(repo.0),
+                ],
+            )?
+        } else {
+            c.c.query(
+                "WITH cs AS (
+                   INSERT INTO changesets (id, gen, body) VALUES ($1, $2, $3)
+                   ON CONFLICT (id) DO NOTHING
+                   RETURNING 1
+                 ), par AS (
+                   INSERT INTO changeset_parents (cs, n, parent)
+                   SELECT $1, ord - 1, parent
+                   FROM unnest($4::bytea[]) WITH ORDINALITY AS parents(parent, ord)
+                   ON CONFLICT (cs, n) DO NOTHING
+                 ), mem AS (
+                   INSERT INTO repo_changesets (repo_id, cs) VALUES ($5, $1)
+                   ON CONFLICT (repo_id, cs) DO NOTHING
+                 )
+                 SELECT (SELECT count(*) FROM cs)::bigint",
+                &[
+                    P::bytes(&id_bytes(id.as_bytes())),
+                    P::i64(generation),
+                    P::bytes(body),
+                    P::bytea_array(parents.to_vec()),
+                    P::i64(repo.0),
+                ],
+            )?
+        };
+        Ok(rows[0].get::<_, i64>(0))
+    }
+}
+
 impl MetaTx for PgTx<'_> {
+    /// Installs a pre-transaction read's results: the derived values the
+    /// read loaded carry no generation (the transaction reads the
+    /// generation itself), the tree and history-node bodies answer the
+    /// build's reads, and every miss re-reads in the transaction.
+    fn adopt_pre_read(&mut self, pre: PreRead) -> Result<()> {
+        self.derived_preload = Some(pre.preload);
+        let mut trees = std::collections::HashMap::with_capacity(pre.trees.len());
+        for (id, tree) in pre.trees {
+            let (body, _) = tree.encode_with_id();
+            trees.insert(id_bytes(id.as_bytes()), body);
+        }
+        self.pre_trees = Some(trees);
+        self.pre_history = Some(pre.history);
+        Ok(())
+    }
+
     /// Creates a repository, or returns the existing one with that name.
     fn create_repo(&mut self, name: &str) -> Result<RepoId> {
         self.c.execute(
@@ -2317,18 +4673,7 @@ impl MetaTx for PgTx<'_> {
                 self.gen_cache.insert((repo.0, key.clone()), parent_gen_i);
             }
         }
-        self.c.execute(
-            "INSERT INTO changesets (id, gen, body) VALUES ($1, $2, $3)
-             ON CONFLICT (id) DO NOTHING",
-            &[
-                P::bytes(&id_bytes(id.as_bytes())),
-                P::i64(parent_gen + 1),
-                P::bytes(&body),
-            ],
-        )?;
         let generation = parent_gen + 1;
-        self.inserted_gens
-            .insert(id_bytes(id.as_bytes()), generation);
         self.gen_cache
             .insert((repo.0, id_bytes(id.as_bytes())), generation);
         // While the import's batching is on, the parents and the repo
@@ -2341,31 +4686,45 @@ impl MetaTx for PgTx<'_> {
         // order the foreign keys read: changesets, changeset_parents,
         // repo_changesets, derived, history, git_import.
         if self.cs_batching {
+            let inserted = self.c.execute(
+                "INSERT INTO changesets (id, gen, body) VALUES ($1, $2, $3)
+                 ON CONFLICT (id) DO NOTHING",
+                &[
+                    P::bytes(&id_bytes(id.as_bytes())),
+                    P::i64(parent_gen + 1),
+                    P::bytes(&body),
+                ],
+            )?;
+            if inserted > 0 {
+                self.inserted_gens
+                    .insert(id_bytes(id.as_bytes()), generation);
+            }
             if let Some(pending) = self.cs_pending.as_deref_mut() {
                 pending.push((id, cs.parents().to_vec()));
             }
             return Ok(id);
         }
-        // Every parent as one statement, however many a merge has: the
-        // row number is the parent's place in the array, counting from
+        // The changeset's row, its parents and its repo membership in
+        // one statement: three INSERTs in a CTE chain, each keeping its
+        // own ON CONFLICT DO NOTHING (#1004, the #935 pattern). The
+        // parents ride one unnest, however many a merge has: the row
+        // number is the parent's place in the array, counting from
         // zero, as the first-parent readers and the seed writer count.
-        if !parents.is_empty() {
-            self.c.execute(
-                "INSERT INTO changeset_parents (cs, n, parent)
-                 SELECT $1, ord - 1, parent
-                 FROM unnest($2::bytea[]) WITH ORDINALITY AS parents(parent, ord)
-                 ON CONFLICT (cs, n) DO NOTHING",
-                &[
-                    P::bytes(&id_bytes(id.as_bytes())),
-                    P::bytea_array(parents.clone()),
-                ],
-            )?;
+        // A failed arm aborts the statement whole, so the three tables
+        // agree or the transaction sees none of them.
+        let chain_inserted =
+            Self::insert_changeset_chain(self, repo, &id, generation, &body, &parents)?;
+        let inserted = usize::try_from(chain_inserted).unwrap_or(0);
+        // Only a row this statement wrote is the transaction's own. A
+        // conflicting row predates the transaction (a land rebases onto
+        // the head its input changeset already hangs from), and the
+        // write path asks `inserted_this_tx` to tell the two apart: the
+        // stored derived rows of an old changeset are real and must be
+        // read, the ones of a new one cannot exist.
+        if inserted > 0 {
+            self.inserted_gens
+                .insert(id_bytes(id.as_bytes()), generation);
         }
-        self.c.execute(
-            "INSERT INTO repo_changesets (repo_id, cs) VALUES ($1, $2)
-             ON CONFLICT (repo_id, cs) DO NOTHING",
-            &[P::i64(repo.0), P::bytes(&id_bytes(id.as_bytes()))],
-        )?;
         Ok(id)
     }
 
@@ -2517,7 +4876,7 @@ impl MetaTx for PgTx<'_> {
             return Ok(());
         }
         let rows = self.get_derived_chain(kind, version, start, limit)?;
-        if let Some(preload) = self.derived_preload.as_deref_mut() {
+        if let Some(preload) = self.derived_preload.as_mut() {
             for (cs, value) in rows {
                 preload.insert(
                     (kind.to_owned(), i64::from(version), id_bytes(cs.as_bytes())),
@@ -2530,6 +4889,17 @@ impl MetaTx for PgTx<'_> {
 
     /// Adds `blob` to the blobs that `repo` may name. Returns whether it is
     /// new.
+    /// One statement over `repo_blobs`: the hash-agg of its distinct
+    /// blobs. Bounded: it reads one table once, and returns one number.
+    fn blob_count(&mut self) -> Result<u64> {
+        let rows = self.c.query(
+            "SELECT count(*) FROM (SELECT DISTINCT blob FROM repo_blobs) t",
+            &[],
+        )?;
+        let n: i64 = rows[0].get(0);
+        Ok(u64::try_from(n).unwrap_or(0))
+    }
+
     fn add_repo_blob(&mut self, repo: RepoId, blob: BlobId) -> Result<bool> {
         let added = self.c.execute(
             "INSERT INTO repo_blobs (repo_id, blob) VALUES ($1, $2)
@@ -2584,11 +4954,20 @@ impl MetaTx for PgTx<'_> {
             )?;
             for row in rows {
                 let bytes: Vec<u8> = row.get(0);
-                missing.push(BlobId::from_bytes(
-                    bytes
-                        .try_into()
-                        .expect("the stored blob column holds 32-byte ids"),
-                ));
+                // The bytes come back from the statement's own array (the
+                // SELECT reads unnest($2), not the table), so today they
+                // are always 32 bytes; the guard keeps a future SELECT
+                // from the table honest instead of panicking a request.
+                let id = BlobId::try_from(bytes.as_slice()).map_err(|_| {
+                    Error::Corrupt(format!(
+                        "repo {}: the missing-blob statement read back a \
+                         blob id of {} bytes, not 32 - the id is the \
+                         statement's own parameter array, not a stored row",
+                        repo.0,
+                        bytes.len()
+                    ))
+                })?;
+                missing.push(id);
             }
         }
         Ok(missing)
@@ -2601,6 +4980,8 @@ impl MetaTx for PgTx<'_> {
     /// [`Error::NotFound`] if `repo` does not have it, [`Error::Corrupt`]
     /// if it does not decode or match.
     fn get_changeset(&mut self, repo: RepoId, id: ChangesetId) -> Result<Changeset> {
+        #[cfg(test)]
+        CHANGESET_READS.set(CHANGESET_READS.get() + 1);
         let body: Vec<u8> = self
             .c
             .query_opt(
@@ -2621,6 +5002,28 @@ impl MetaTx for PgTx<'_> {
     }
 
     /// Whether `repo` may see changeset `id`.
+    fn repo_and_membership(
+        &mut self,
+        name: &str,
+        ids: &[ChangesetId],
+    ) -> Result<Option<(RepoId, Vec<bool>)>> {
+        let ids: Vec<Vec<u8>> = ids.iter().map(|id| id_bytes(id.as_bytes())).collect();
+        let rows = self.c.query(
+            "SELECT r.repo_id, (m.cs IS NOT NULL) FROM repos r
+             CROSS JOIN LATERAL unnest($2::bytea[]) WITH ORDINALITY AS u(cs, ord)
+             LEFT JOIN repo_changesets m ON m.repo_id = r.repo_id AND m.cs = u.cs
+             WHERE r.name = $1
+             ORDER BY u.ord",
+            &[P::text(name), P::bytea_array(ids)],
+        )?;
+        let Some(first) = rows.first() else {
+            return Ok(None);
+        };
+        let repo = RepoId(first.get::<_, i64>(0));
+        let membership = rows.iter().map(|row| row.get::<_, bool>(1)).collect();
+        Ok(Some((repo, membership)))
+    }
+
     fn has_changeset(&mut self, repo: RepoId, id: ChangesetId) -> Result<bool> {
         Ok(self
             .c
@@ -2631,11 +5034,65 @@ impl MetaTx for PgTx<'_> {
             .is_some())
     }
 
+    /// The changesets of `repo` that the ids name, in the order asked,
+    /// one statement: the ids travel as one bytea array, the reply has at
+    /// most one row per id, and each body is checked against its ID, as
+    /// `get_changeset` checks one.
+    fn get_changeset_many(&mut self, repo: RepoId, ids: &[ChangesetId]) -> Result<Vec<Changeset>> {
+        let cs = ids
+            .iter()
+            .map(|id| id_bytes(id.as_bytes()))
+            .collect::<Vec<_>>();
+        let rows = self.c.query(
+            "SELECT c.id, c.body FROM changesets c
+             JOIN repo_changesets rc ON rc.repo_id = $1 AND rc.cs = c.id
+             WHERE c.id = ANY($2)",
+            &[P::i64(repo.0), P::bytea_array(cs)],
+        )?;
+        let bodies = rows
+            .into_iter()
+            .map(|row| {
+                let cs: Vec<u8> = row.get(0);
+                Ok((to_id(&cs)?, row.get::<_, Vec<u8>>(1)))
+            })
+            .collect::<Result<std::collections::HashMap<_, _>>>()?;
+        ids.iter()
+            .map(|id| {
+                #[cfg(test)]
+                CHANGESET_READS.set(CHANGESET_READS.get() + 1);
+                let body = bodies
+                    .get(id)
+                    .ok_or_else(|| Error::NotFound(format!("changeset {id}")))?;
+                let (cs, actual) = Changeset::decode_with_id(body)
+                    .map_err(|e| Error::Corrupt(format!("changeset {id}: {e}")))?;
+                if actual != *id {
+                    return Err(Error::Corrupt(format!(
+                        "changeset {id} does not match its ID"
+                    )));
+                }
+                Ok(cs)
+            })
+            .collect()
+    }
+
     /// One page of the first-parent chain, one statement: the recursive
-    /// term follows the indexed first-parent rows (cs, n = 0), so every
-    /// hop is one index lookup, and the join carries the generation and
-    /// the body. Every fetched changeset is an ancestor of `start`, so
-    /// the repo check rides the start row, as `get_changeset` checks it.
+    /// term follows the indexed first-parent rows (cs, n = 0) that the
+    /// repo may see, so every hop is one index lookup plus one membership
+    /// probe, and the join carries the generation and the body. A link
+    /// the repo may not see ends the walk, and the page stays short.
+    /// Every fetched changeset is a member of `repo` and an ancestor of
+    /// `start`. The page is short at the root of the history, and the
+    /// walk's last link is checked to tell a root from a tampered row:
+    /// one whose parent the repo does not hold is corruption, refused
+    /// with [`Error::Corrupt`] naming the changeset, its first parent
+    /// and the repo, so a truncated history never reads as a whole one.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if `repo` does not hold `start`.
+    /// [`Error::Corrupt`] if a row's id is not a changeset id, or the
+    /// page's last changeset names a first parent the repo does not
+    /// hold.
     fn first_parent_page(
         &mut self,
         repo: RepoId,
@@ -2650,6 +5107,7 @@ impl MetaTx for PgTx<'_> {
                      SELECT cp.parent, w.depth + 1
                      FROM walk w
                      JOIN changeset_parents cp ON cp.cs = w.id AND cp.n = 0
+                     JOIN repo_changesets rc ON rc.repo_id = $1 AND rc.cs = cp.parent
                      WHERE w.depth < $3
                  )
                  SELECT c.id, c.gen, c.body FROM walk
@@ -2663,6 +5121,34 @@ impl MetaTx for PgTx<'_> {
         )?;
         if rows.is_empty() {
             return Err(Error::NotFound(format!("changeset {start}")));
+        }
+        // A page short of its limit ended the walk: at a root, whose last
+        // changeset has no first-parent row, or at a tampered link, whose
+        // last changeset names a parent this repo does not hold. One
+        // probe tells the two apart, and the tampered one is corruption:
+        // a truncated history must not read as a whole one.
+        // `limit` is a link count, far from any wrap.
+        #[allow(clippy::cast_possible_wrap)]
+        if rows.len() as i64 <= limit {
+            let last = rows.last().unwrap();
+            let last = to_id(last.get::<_, Vec<u8>>(0).as_slice())?;
+            let hop = self.c.query_opt(
+                "SELECT cp.parent, rc.cs IS NOT NULL AS member
+                 FROM changeset_parents cp
+                 LEFT JOIN repo_changesets rc ON rc.repo_id = $1 AND rc.cs = cp.parent
+                 WHERE cp.cs = $2 AND cp.n = 0",
+                &[P::i64(repo.0), P::bytes(&id_bytes(last.as_bytes()))],
+            )?;
+            if let Some(hop) = hop
+                && !hop.get::<_, bool>(1)
+            {
+                let parent: Vec<u8> = hop.get(0);
+                let parent = to_id(&parent)?;
+                return Err(Error::Corrupt(format!(
+                    "changeset {last} points at first parent {parent}, which repo {} does not hold",
+                    repo.0
+                )));
+            }
         }
         rows.into_iter()
             .map(|row| {
@@ -2905,6 +5391,51 @@ impl MetaTx for PgTx<'_> {
         Ok(())
     }
 
+    /// One statement for the walk's start: the generation rides the
+    /// repo-membership join (the guard), the value is a left join on the
+    /// same row. A hold in the transaction's memory answers with
+    /// [`StartRead::Stored`] and no statement - the only rows the
+    /// transaction holds are the parents and the changeset it stores
+    /// into `repo`, and the changesets insert refuses a parent `repo`
+    /// cannot see before any row is written.
+    fn generation_and_stored(
+        &mut self,
+        repo: RepoId,
+        kind: &str,
+        version: u32,
+        cs: ChangesetId,
+    ) -> Result<StartRead> {
+        if let Some(bytes) = self.held_derived(kind, version, cs) {
+            return Ok(StartRead::Stored(bytes));
+        }
+        let version = i64::from(version);
+        let key = id_bytes(cs.as_bytes());
+        let row = self
+            .c
+            .query_opt(
+                "SELECT gen, value FROM changesets
+                 JOIN repo_changesets ON cs = id
+                 LEFT JOIN derived
+                   ON derived.cs = changesets.id AND kind = $2 AND version = $3
+                 WHERE repo_id = $1 AND changesets.id = $4",
+                &[
+                    P::i64(repo.0),
+                    P::text(kind),
+                    P::i64(version),
+                    P::bytes(&key),
+                ],
+            )?
+            .ok_or_else(|| Error::NotFound(format!("changeset {cs}")))?;
+        let generation: i64 = row.get(0);
+        // The read caches, like `generation` does: the write that follows
+        // the walk asks the same changeset's generation, and the cache
+        // answers it.
+        self.gen_cache.insert((repo.0, key), generation);
+        Ok(row
+            .get::<_, Option<Vec<u8>>>(1)
+            .map_or(StartRead::Generation(generation), StartRead::Stored))
+    }
+
     /// The stored bytes of a derived value, if computed. While the
     /// importer's batching is on, the values this transaction inserted
     /// answer first (newest insert wins), then the chains the importer
@@ -2917,24 +5448,11 @@ impl MetaTx for PgTx<'_> {
         version: u32,
         cs: ChangesetId,
     ) -> Result<Option<Vec<u8>>> {
+        if let Some(bytes) = self.held_derived(kind, version, cs) {
+            return Ok(Some(bytes));
+        }
         let version = i64::from(version);
         let key = id_bytes(cs.as_bytes());
-        if self.cs_batching {
-            if let Some(pending) = self.derived_pending.as_deref() {
-                for (k, v, c, value) in pending.iter().rev() {
-                    if *k == kind && *v == version && id_bytes(c.as_bytes()) == key {
-                        return Ok(Some(value.clone()));
-                    }
-                }
-            }
-            if let Some(value) = self
-                .derived_preload
-                .as_deref()
-                .and_then(|preload| preload.get(&(kind.to_owned(), version, key.clone())))
-            {
-                return Ok(Some(value.clone()));
-            }
-        }
         Ok(self
             .c
             .query_opt(
@@ -2964,15 +5482,18 @@ impl MetaTx for PgTx<'_> {
              WHERE kind = $1 AND version = $2 AND cs = ANY($3)",
             &[P::text(kind), P::i64(version), P::bytea_array(cs)],
         )?;
-        let mut found = rows
+        let found = rows
             .into_iter()
             .map(|row| {
                 let cs: Vec<u8> = row.get(0);
                 Ok((to_id(&cs)?, row.get::<_, Option<Vec<u8>>>(1)))
             })
             .collect::<Result<std::collections::HashMap<_, _>>>()?;
+        // Answered from the map without removing it: a batch may name the
+        // same id twice (two merges can share a side parent), and each
+        // ask gets the row - the reply has one entry per ASKED id.
         ids.iter()
-            .map(|id| Ok(found.remove(id).flatten()))
+            .map(|id| Ok(found.get(id).cloned().flatten()))
             .collect()
     }
 
@@ -3014,6 +5535,48 @@ impl MetaTx for PgTx<'_> {
             .map(|row| {
                 let cs: Vec<u8> = row.get(0);
                 Ok((to_id(&cs)?, row.get(1)))
+            })
+            .collect()
+    }
+
+    /// Every link of the first-parent chain that starts at `start`, up to
+    /// `limit` of them, newest first, each with its stored value or `None`
+    /// where none is stored. One statement: the recursive term follows the
+    /// indexed first-parent rows, as `get_derived_chain` follows them, and
+    /// the left join keeps every link. The caller decides what a missing
+    /// value means.
+    fn get_derived_chain_links(
+        &mut self,
+        kind: &str,
+        version: u32,
+        start: ChangesetId,
+        limit: i64,
+    ) -> Result<Vec<(ChangesetId, Option<Vec<u8>>)>> {
+        let version = i64::from(version);
+        let rows = self.c.query(
+            "WITH RECURSIVE walk(id, depth) AS (
+                 SELECT $1::bytea, 0::bigint
+                 UNION ALL
+                 SELECT cp.parent, w.depth + 1
+                 FROM walk w
+                 JOIN changeset_parents cp ON cp.cs = w.id AND cp.n = 0
+                 WHERE w.depth < $2
+             )
+             SELECT walk.id, d.value FROM walk
+             LEFT JOIN derived d ON d.cs = walk.id
+                 AND d.kind = $3 AND d.version = $4
+             ORDER BY walk.depth",
+            &[
+                P::bytes(id_bytes(start.as_bytes()).as_slice()),
+                P::i64(limit),
+                P::text(kind),
+                P::i64(version),
+            ],
+        )?;
+        rows.into_iter()
+            .map(|row| {
+                let cs: Vec<u8> = row.get(0);
+                Ok((to_id(&cs)?, row.get::<_, Option<Vec<u8>>>(1)))
             })
             .collect()
     }
@@ -3120,6 +5683,138 @@ impl MetaTx for PgTx<'_> {
                 "derived {kind} v{version} for {cs} differs from the stored value"
             )));
         }
+        // The transaction's memory follows its writes, so a later read
+        // of the same row answers with what was written. It follows
+        // after the check above: the check must see the stored row, not
+        // the value just written.
+        if let Some(preload) = self.derived_preload.as_mut() {
+            preload.insert(
+                (kind.to_owned(), version64, id_bytes(cs.as_bytes())),
+                value.to_vec(),
+            );
+        }
+        Ok(())
+    }
+
+    /// The settle's whole write in one statement: the trees, the derived
+    /// rows and the repo's blob membership, three INSERTs in a CTE chain
+    /// whose arms keep their own ON CONFLICT rules (#1004). The top
+    /// SELECT answers the derived arm's inserted count, so the
+    /// disagreeing-row check keeps the shape `put_derived_all` applies.
+    /// The empty arms drop out; a single arm runs alone.
+    fn put_settle_rows(
+        &mut self,
+        trees: &[(TreeId, Vec<u8>)],
+        rows: &[(String, u32, ChangesetId, Vec<u8>)],
+        repo: RepoId,
+        blobs: &[BlobId],
+    ) -> Result<()> {
+        // The importer's batching owns the derived rows already; the
+        // blobs and the trees keep their own shapes there.
+        if self.cs_batching {
+            self.put_trees(trees)?;
+            self.put_derived_all(rows)?;
+            self.add_repo_blobs(repo, blobs)?;
+            return Ok(());
+        }
+        // The transaction's deferred history nodes ride the same
+        // statement: the settle wrote them through the buffer, and the
+        // commit's flush finds nothing to write. The importer's chunked
+        // flush keeps its path (the early return above), and a
+        // transaction that never deferred keeps `put_history_node`'s
+        // direct insert - there is no settle statement to ride there.
+        // The nodes are content-addressed, so their order does not
+        // matter; the ids sort for a deterministic statement, as the
+        // flush sorts its chunks.
+        let history = self.drain_history_rows();
+        if trees.is_empty() && rows.is_empty() && blobs.is_empty() && history.is_empty() {
+            return Ok(());
+        }
+        let (sql, params, counts) = Self::settle_statement(trees, rows, repo, blobs, &history);
+        let rows_out = self.c.query(&sql, &params)?;
+        for (i, arm) in counts.iter().enumerate() {
+            if arm == "der" {
+                let count: i64 = rows_out[0].get(i);
+                // The check reads before the memory write below, so it
+                // sees the stored row, not the value just written (the
+                // order that matters, as in `put_derived_all`).
+                Self::check_derived_conflicts(self, rows, count)?;
+            }
+        }
+        // The transaction's memory follows its writes, as the three
+        // calls did.
+        if !rows.is_empty()
+            && let Some(preload) = self.derived_preload.as_mut()
+        {
+            for (kind, version, cs, value) in rows {
+                preload.insert(
+                    (kind.clone(), i64::from(*version), id_bytes(cs.as_bytes())),
+                    value.clone(),
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Records derived values, one statement for the whole batch, and
+    /// follows the writes into the transaction's memory. The callers
+    /// write rows of changesets this transaction just stored, so any
+    /// conflict is corrupt state and refuses.
+    fn put_derived_all(&mut self, rows: &[(String, u32, ChangesetId, Vec<u8>)]) -> Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        // The importer's batching owns batched writes already: the
+        // flush writes the pending rows one statement per 1,000.
+        if self.cs_batching
+            && let Some(pending) = self.derived_pending.as_deref_mut()
+        {
+            for (kind, version, cs, value) in rows {
+                pending.push((kind.clone(), i64::from(*version), *cs, value.clone()));
+            }
+            return Ok(());
+        }
+        let kinds: Vec<String> = rows.iter().map(|(kind, _, _, _)| kind.clone()).collect();
+        let versions: Vec<i64> = rows.iter().map(|(_, v, _, _)| i64::from(*v)).collect();
+        let css: Vec<Vec<u8>> = rows
+            .iter()
+            .map(|(_, _, cs, _)| id_bytes(cs.as_bytes()))
+            .collect();
+        let values: Vec<Vec<u8>> = rows.iter().map(|(_, _, _, value)| value.clone()).collect();
+        let inserted = self.c.execute(
+            "INSERT INTO derived (kind, version, cs, value)
+             SELECT * FROM unnest($1::text[], $2::int8[], $3::bytea[], $4::bytea[])
+             ON CONFLICT (kind, version, cs) DO NOTHING",
+            &[
+                P::text_array(kinds),
+                P::i64_array(versions),
+                P::bytea_array(css),
+                P::bytea_array(values),
+            ],
+        )?;
+        // A short count is a stored row for one of the batch's keys:
+        // legal when it agrees (a fill may have stored the same value
+        // for the head before this transaction began), corrupt when it
+        // differs - the same rule the single put applies, checked row
+        // by row on this rare path.
+        if inserted != rows.len() as u64 {
+            for (kind, version, cs, value) in rows {
+                if self.get_derived(kind, *version, *cs)?.as_deref() != Some(value) {
+                    return Err(Error::Corrupt(format!(
+                        "derived {kind} v{version} for {cs} differs from the stored value"
+                    )));
+                }
+            }
+        }
+        // The transaction's memory follows its writes.
+        if let Some(preload) = self.derived_preload.as_mut() {
+            for (kind, version, cs, value) in rows {
+                preload.insert(
+                    (kind.clone(), i64::from(*version), id_bytes(cs.as_bytes())),
+                    value.clone(),
+                );
+            }
+        }
         Ok(())
     }
 
@@ -3133,15 +5828,148 @@ impl MetaTx for PgTx<'_> {
         if self.cs_batching {
             return Ok(0);
         }
-        let version = i64::from(version);
-        let limit = i64::try_from(limit).unwrap_or(i64::MAX);
+        let version64 = i64::from(version);
+        // A write path that deferred its deletes collects this call; the
+        // commit deletes for the whole transaction with one statement,
+        // honoring the summed limits. The callers that count the rows
+        // (the old-value sweep) never turn the deferral on.
+        if self.defer_derived {
+            self.deferred_deletes.push((
+                kind.to_owned(),
+                version64,
+                i64::try_from(limit).unwrap_or(i64::MAX),
+            ));
+            return Ok(0);
+        }
         let deleted = self.c.execute(
             "DELETE FROM derived WHERE (kind, version, cs) IN (
                  SELECT kind, version, cs FROM derived
-                 WHERE kind = $1 AND version < $2 LIMIT $3)",
-            &[P::text(kind), P::i64(version), P::i64(limit)],
+                 WHERE kind = $1 AND version < $2 ORDER BY version, cs LIMIT $3)",
+            &[
+                P::text(kind),
+                P::i64(version64),
+                P::i64(i64::try_from(limit).unwrap_or(i64::MAX)),
+            ],
         )?;
         Ok(usize::try_from(deleted).unwrap_or(0))
+    }
+
+    /// The stored value of the kind for the changeset the transaction
+    /// itself inserted cannot exist unless the transaction wrote it, and
+    /// its own memory answers that: the stored check reads nothing.
+    fn inserted_this_tx(&self, cs: ChangesetId) -> bool {
+        self.inserted_gens.contains_key(&id_bytes(cs.as_bytes()))
+    }
+
+    /// Reads the derived values of the write path's kinds for the
+    /// changeset's parents into the transaction's memory, one statement:
+    /// every per-value read of the path then answers without a round
+    /// trip. A value written later in the same transaction updates the
+    /// memory, so the answers stay the transaction's own.
+    fn preload_derived(
+        &mut self,
+        repo: RepoId,
+        kinds: &[(&'static str, u32)],
+        css: &[ChangesetId],
+    ) -> Result<()> {
+        if kinds.is_empty() || css.is_empty() {
+            return Ok(());
+        }
+        let kind_names: Vec<String> = kinds.iter().map(|(name, _)| (*name).to_owned()).collect();
+        let versions: Vec<i64> = kinds
+            .iter()
+            .map(|(_, version)| i64::from(*version))
+            .collect();
+        let keys: Vec<Vec<u8>> = css.iter().map(|cs| id_bytes(cs.as_bytes())).collect();
+        // The generation rides the rows under the repo-membership join -
+        // the same guard every generation read keeps - and the read
+        // caches it: the changesets insert of the write that follows asks
+        // the first parent's generation, and the cache answers it.
+        let rows = self.c.query(
+            "SELECT kind, version, cs, value,
+                    (SELECT gen FROM changesets
+                     JOIN repo_changesets ON cs = id
+                     WHERE repo_id = $4 AND id = d.cs) AS gen
+             FROM derived AS d
+             WHERE cs = ANY($3)
+               AND (kind, version) IN (SELECT kind, version
+                                       FROM unnest($1::text[], $2::int8[]) AS t(kind, version))",
+            &[
+                P::text_array(kind_names),
+                P::i64_array(versions),
+                P::bytea_array(keys),
+                P::i64(repo.0),
+            ],
+        )?;
+        let Some(preload) = self.derived_preload.as_mut() else {
+            return Ok(());
+        };
+        for row in rows {
+            preload.insert((row.get(0), row.get(1), row.get(2)), row.get(3));
+            if let Some(read_gen) = row.try_get::<_, Option<i64>>(4).map_err(map_pg_error)? {
+                let cs: Vec<u8> = row.get(2);
+                self.gen_cache.insert((repo.0, cs), read_gen);
+            }
+        }
+        Ok(())
+    }
+
+    /// The derived values of the named kinds for the named changesets,
+    /// read for a pre-transaction phase. The map carries no generation:
+    /// the transaction reads the generation itself (the insert's own
+    /// read), so the pre-read carries none. The values themselves are
+    /// written once at their own changeset's settle - the der arm's ON
+    /// CONFLICT DO NOTHING - so a committed answer cannot be stale.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn read_derived_preload(
+        &mut self,
+        _repo: RepoId,
+        kinds: &[(&'static str, u32)],
+        css: &[ChangesetId],
+    ) -> Result<DerivedPreload> {
+        let mut preload = DerivedPreload::new();
+        if kinds.is_empty() || css.is_empty() {
+            return Ok(preload);
+        }
+        let kind_names: Vec<String> = kinds.iter().map(|(name, _)| (*name).to_owned()).collect();
+        let versions: Vec<i64> = kinds
+            .iter()
+            .map(|(_, version)| i64::from(*version))
+            .collect();
+        let keys: Vec<Vec<u8>> = css.iter().map(|cs| id_bytes(cs.as_bytes())).collect();
+        // No generation column: the pre-transaction read answers the
+        // build's value reads only. The repo param exists for the
+        // generation's repo-membership join alone, so it drops too; the
+        // transaction's own repo check gates the values it uses.
+        let rows = self.c.query(
+            "SELECT kind, version, cs, value
+             FROM derived AS d
+             WHERE cs = ANY($3)
+               AND (kind, version) IN (SELECT kind, version
+                                       FROM unnest($1::text[], $2::int8[]) AS t(kind, version))",
+            &[
+                P::text_array(kind_names),
+                P::i64_array(versions),
+                P::bytea_array(keys),
+            ],
+        )?;
+        for row in rows {
+            preload.insert((row.get(0), row.get(1), row.get(2)), row.get(3));
+        }
+        Ok(preload)
+    }
+
+    /// Defers the write path's per-row flushes to the commit: the
+    /// collected `delete_derived_below` calls wait for the commit's
+    /// one-statement flush, and the history nodes the write path
+    /// buffers do too. The deferral lasts to the commit. One-way -
+    /// there is no off, because an off would silently drop deletes the
+    /// transaction already promised.
+    fn defer_derived_deletes(&mut self) {
+        self.defer_derived = true;
     }
 
     /// The view that the per-tree memo holds for a (rule set, version,
@@ -3311,19 +6139,46 @@ impl MetaTx for PgTx<'_> {
     /// The stored bytes of the trees the ids name, in the order asked.
     /// One statement per 1,000 ids: the ids travel as one bytea array.
     fn get_trees(&mut self, ids: &[TreeId]) -> Result<Vec<Option<Vec<u8>>>> {
-        let mut out = Vec::with_capacity(ids.len());
-        for chunk in ids.chunks(crate::meta::DERIVED_BATCH) {
-            let keys: Vec<Vec<u8>> = chunk.iter().map(|id| id_bytes(id.as_bytes())).collect();
-            let rows = self.c.query(
-                "SELECT id, body FROM trees WHERE id = ANY($1)",
-                &[P::bytea_array(keys.clone())],
-            )?;
-            let mut bodies: std::collections::HashMap<Vec<u8>, Vec<u8>> = rows
-                .into_iter()
-                .map(|row| (row.get::<_, Vec<u8>>(0), row.get::<_, Vec<u8>>(1)))
-                .collect();
-            for key in keys {
-                out.push(bodies.remove(&key));
+        // The pre-transaction read's answers come first: the rows it read
+        // are committed and content-addressed, so an answer cannot be
+        // stale. A miss re-reads in the transaction, which also keeps the
+        // answer for a tree whose row committed after the pre-read began.
+        // The misses' positions ride a map, so one pass builds the ask
+        // and one pass per found key fills the slots - no scan per chunk,
+        // and a land's whole level (the land carries no pre-read) is one
+        // pass and one statement per 1,000 keys, as on main.
+        let pre = self.pre_trees.as_ref();
+        let mut out: Vec<Option<Vec<u8>>> = Vec::with_capacity(ids.len());
+        let mut miss_at: std::collections::HashMap<Vec<u8>, Vec<usize>> =
+            std::collections::HashMap::new();
+        for (i, id) in ids.iter().enumerate() {
+            let key = id_bytes(id.as_bytes());
+            if let Some(body) = pre.and_then(|map| map.get(&key)) {
+                out.push(Some(body.clone()));
+            } else {
+                out.push(None);
+                miss_at.entry(key).or_default().push(i);
+            }
+        }
+        if !miss_at.is_empty() {
+            let keys: Vec<&Vec<u8>> = miss_at.keys().collect();
+            for chunk in keys.chunks(crate::meta::DERIVED_BATCH) {
+                let chunk: Vec<Vec<u8>> = chunk.iter().map(|key| (*key).clone()).collect();
+                let rows = self.c.query(
+                    "SELECT id, body FROM trees WHERE id = ANY($1)",
+                    &[P::bytea_array(chunk.clone())],
+                )?;
+                let bodies: std::collections::HashMap<Vec<u8>, Vec<u8>> = rows
+                    .into_iter()
+                    .map(|row| (row.get::<_, Vec<u8>>(0), row.get::<_, Vec<u8>>(1)))
+                    .collect();
+                for key in &chunk {
+                    if let (Some(body), Some(positions)) = (bodies.get(key), miss_at.get(key)) {
+                        for &i in positions {
+                            out[i] = Some(body.clone());
+                        }
+                    }
+                }
             }
         }
         Ok(out)
@@ -3365,97 +6220,30 @@ impl MetaTx for PgTx<'_> {
         req: &LandRequest,
         pending_limit: Option<usize>,
     ) -> Result<(RepoId, LandOutcome)> {
-        let repo = self.repo_id(&req.repo)?;
-        self.generation(repo, req.changeset)?;
-        let existing = self
-            .c
-            .query_opt(
-                "SELECT land_id, input_cs, target_ref FROM lands
-                 WHERE repo_id = $1 AND caller = $2 AND request_key = $3",
-                &[
-                    P::i64(repo.0),
-                    P::text(&caller.0),
-                    P::text(&req.request_key),
-                ],
-            )?
-            .map(|row| {
-                (
-                    row.get::<_, i64>(0),
-                    row.get::<_, Vec<u8>>(1),
-                    row.get::<_, String>(2),
-                )
-            });
-        let land_id = if let Some((land_id, input, target)) = existing {
-            if input != req.changeset.as_bytes() || target != req.target_ref {
-                return Err(Error::InvalidArgument(format!(
-                    "request key {:?} was already used for a different land",
-                    req.request_key
-                )));
-            }
-            land_id
+        // The outcome's columns ride the lookup the record already runs:
+        // the caller learns a settled twin without a second read of the
+        // row, the repo's id rides the same statement, so the record
+        // pays no separate repos read, and the input's generation rides
+        // it as a column, so the record pays no separate gen read. A row
+        // that is still pending must be finished: the land's own next
+        // step reads the outcome in its first transaction, where a twin
+        // that settles between the record and the finish answers.
+        let (repo, input_gen, recorded, ref_exists, pending) =
+            self.repo_and_land_by_key(caller, req)?;
+        // The generation ride is the input's existence guard: a land
+        // whose changeset does not exist fails here, before any pending
+        // row is written, and the found value warms the cache the
+        // separate read warmed.
+        let generation =
+            input_gen.ok_or_else(|| Error::NotFound(format!("changeset {}", req.changeset)))?;
+        self.gen_cache
+            .insert((repo.0, id_bytes(req.changeset.as_bytes())), generation);
+        let recorded = if let Some(recorded) = recorded {
+            recorded
         } else {
-            let (state, detail) = if self.get_ref(repo, &req.target_ref)?.is_some() {
-                (LandState::Pending, String::new())
-            } else {
-                let detail = format!("ref {:?} does not exist", req.target_ref);
-                (LandState::Rejected, detail)
-            };
-            if let Some(limit) = pending_limit {
-                // The pending-lands quota counts new pending rows. A retry
-                // of an existing key resumes its land and adds no row, so a
-                // client can always finish what it started. The count and
-                // the insert need no lock of their own: every write
-                // transaction of the schema holds the schema's one advisory
-                // key (see `commit`) until it commits, so two lands that
-                // record at the same time, even from two processes, run
-                // one after the other, and the second counts the first
-                // one's row. SQLite gets the same from its one writer.
-                let pending: i64 = self
-                    .c
-                    .query_opt(
-                        "SELECT count(*) FROM lands WHERE caller = $1 AND state = 'pending'",
-                        &[P::text(&caller.0)],
-                    )?
-                    .and_then(|row| row.get(0))
-                    .unwrap_or(0);
-                if pending >= i64::try_from(limit).unwrap_or(i64::MAX) {
-                    return Err(Error::ResourceExhausted(format!(
-                        "principal {:?} has its {limit} lands pending \
-                         (--max-principal-pending-lands {limit}); wait for one to finish",
-                        caller.0
-                    )));
-                }
-            }
-            let inserted = self
-                .c
-                .query_opt(
-                    "INSERT INTO lands
-                     (repo_id, caller, request_key, target_ref, input_cs, state, detail,
-                      finished_at, created_at)
-                     VALUES ($1, $2, $3, $4, $5, $6, $7,
-                         CASE WHEN $6 = 'pending' THEN NULL ELSE now_epoch() END,
-                         now_epoch())
-                     ON CONFLICT DO NOTHING
-                     RETURNING land_id",
-                    &[
-                        P::i64(repo.0),
-                        P::text(&caller.0),
-                        P::text(&req.request_key),
-                        P::text(&req.target_ref),
-                        P::bytes(&id_bytes(req.changeset.as_bytes())),
-                        P::text(state.as_str()),
-                        P::text(&detail),
-                    ],
-                )?
-                .map(|row| row.get::<_, i64>(0));
-            let land_id = match inserted {
-                Some(land_id) => land_id,
-                None => self.read_back_land(repo, caller, req)?,
-            };
-            self.expire_lands()?;
-            land_id
+            self.record_new_land(repo, caller, req, pending_limit, ref_exists, pending)?
         };
-        Ok((repo, self.land_outcome(repo, caller, land_id)?))
+        Ok((repo, recorded))
     }
 
     /// The pending lands that started more than `stale_secs` ago.
@@ -3483,7 +6271,8 @@ impl MetaTx for PgTx<'_> {
     /// Rejects a land that is still pending; 1 if it changed, else 0.
     fn reject_stale_land(&mut self, land_id: i64, detail: String) -> Result<u64> {
         let changed = self.c.execute(
-            "UPDATE lands SET state = 'rejected', detail = $1, finished_at = now_epoch()
+            "UPDATE lands SET state = 'rejected', detail = $1, \
+                 reject_reason = 'abandoned', finished_at = now_epoch()
              WHERE land_id = $2 AND state = 'pending'",
             &[P::text(&detail), P::i64(land_id)],
         )?;
@@ -3509,25 +6298,71 @@ impl MetaTx for PgTx<'_> {
         Ok(())
     }
 
-    /// A land that `caller` started in `repo`.
-    fn land_outcome(&mut self, repo: RepoId, caller: &Caller, land_id: i64) -> Result<LandOutcome> {
+    /// A land that `caller` started in `repo`. With `ref_name`, the ref's
+    /// state rides the same statement: the finish's outcome check and the
+    /// plan's ref read run in one read-only transaction, and one
+    /// statement answers both from the same snapshot.
+    ///
+    /// # Errors
+    ///
+    /// [`Error::NotFound`] if the repo has no such land.
+    fn land_outcome(
+        &mut self,
+        repo: RepoId,
+        caller: &Caller,
+        land_id: i64,
+        ref_name: Option<&str>,
+    ) -> Result<(LandOutcome, Option<RefState>, bool)> {
+        // The ref rides a LEFT JOIN: a ref deleted between the record and
+        // the finish answers no ref columns, and the land's outcome
+        // stands alone - the plan then sees a missing ref, as a separate
+        // read would have. The head tree's presence rides the same
+        // statement: a scalar subselect on the ref's target, so the
+        // finish knows whether the fill runs before the write
+        // transaction, from the snapshot the head itself rode.
         let row = self
             .c
             .query_opt(
-                "SELECT state, result_cs, detail, conflict_paths FROM lands
-                 WHERE repo_id = $1 AND land_id = $2 AND caller = $3",
-                &[P::i64(repo.0), P::i64(land_id), P::text(&caller.0)],
+                "SELECT l.state, l.result_cs, l.detail, l.conflict_paths, l.reject_reason,
+                        r.target, r.version,
+                        COALESCE((SELECT d.value IS NOT NULL FROM derived d
+                                  WHERE d.kind = $5 AND d.version = $6
+                                    AND d.cs = r.target),
+                                 false)
+                 FROM lands l
+                 LEFT JOIN refs r ON r.repo_id = l.repo_id AND r.name = $4
+                 WHERE l.repo_id = $1 AND l.land_id = $2 AND l.caller = $3",
+                &[
+                    P::i64(repo.0),
+                    P::i64(land_id),
+                    P::text(&caller.0),
+                    P::text(ref_name.unwrap_or_default()),
+                    P::text(<RootTree as crate::derived::Kind>::NAME),
+                    P::i64(i64::from(<RootTree as crate::derived::Kind>::VERSION)),
+                ],
             )?
             .ok_or_else(|| Error::NotFound(format!("land {land_id}")))?;
         let state: String = row.get(0);
         let result: Option<Vec<u8>> = row.get(1);
         let detail: String = row.get(2);
         let paths: Vec<u8> = row.get(3);
+        let reason: String = row.get(4);
+        let ref_target: Option<Vec<u8>> = row.get(5);
+        let ref_version: Option<i64> = row.get(6);
+        let head_tree: bool = row.get(7);
+        let head = match (ref_target, ref_version) {
+            (Some(target), Some(version)) => Some(RefState {
+                target: to_id(&target)?,
+                version,
+            }),
+            (None, None) => None,
+            _ => return Err(Error::Corrupt(format!("land {land_id} ref half-read"))),
+        };
         let result = result
             .map(|bytes| ChangesetId::try_from(bytes.as_slice()))
             .transpose()
             .map_err(|e| Error::Corrupt(format!("land {land_id} result: {e}")))?;
-        Ok(LandOutcome {
+        let out = LandOutcome {
             moved: false,
             land_id,
             state: LandState::parse(&state)?,
@@ -3536,10 +6371,13 @@ impl MetaTx for PgTx<'_> {
             detail,
             conflict_paths: decode_paths(&paths)
                 .ok_or_else(|| Error::Corrupt(format!("land {land_id} conflict paths")))?,
-        })
+            reject_reason: LandRejectReason::parse(&reason)?,
+        };
+        Ok((out, head, head_tree))
     }
 
     /// Moves a pending land to its final state and returns the outcome.
+    #[allow(clippy::too_many_arguments)] // the one row's own columns: state, result, detail, paths and reason land together
     fn set_land_state(
         &mut self,
         repo: RepoId,
@@ -3548,20 +6386,74 @@ impl MetaTx for PgTx<'_> {
         result: Option<ChangesetId>,
         detail: String,
         conflict_paths: Vec<RepoPath>,
+        reject_reason: LandRejectReason,
     ) -> Result<LandOutcome> {
-        let updated = self.c.execute(
-            "UPDATE lands SET state = $3, result_cs = $4, detail = $5,
-                 conflict_paths = $6, finished_at = now_epoch()
-             WHERE repo_id = $1 AND land_id = $2 AND state = 'pending'",
-            &[
-                P::i64(repo.0),
-                P::i64(land_id),
-                P::text(state.as_str()),
-                P::opt_bytes(result.as_ref().map(|id| id_bytes(id.as_bytes()))),
-                P::text(&detail),
-                P::bytes(&encode_paths(&conflict_paths)),
-            ],
-        )?;
+        // The land's trim rides the verdict: the deferred deletes the
+        // settle transaction collected run as data-modifying CTEs of
+        // the verdict's UPDATE - one round trip instead of two - and
+        // the flush at the commit finds nothing left. The trim is the
+        // same statement the commit's flush runs, from the one builder,
+        // and the whole statement rolls back with the transaction: a
+        // verdict that fails trims nothing. No deferral, or a repeated
+        // kind (#855, the flush's own fallback), keeps today's shape.
+        let updated = if self.defer_derived
+            && !self.deferred_deletes.is_empty()
+            && !deferral_repeats(&self.deferred_deletes)
+        {
+            let kinds: Vec<String> = self
+                .deferred_deletes
+                .iter()
+                .map(|(k, _, _)| k.clone())
+                .collect();
+            let versions: Vec<i64> = self.deferred_deletes.iter().map(|(_, v, _)| *v).collect();
+            let steps: Vec<i64> = self.deferred_deletes.iter().map(|(_, _, s)| *s).collect();
+            let sql = format!(
+                "{}, trim AS ({TRIM_DELETE} RETURNING 1), \
+                 landed AS ({LANDS_STATEMENT} RETURNING land_id) \
+                 SELECT (SELECT count(*) FROM landed)::bigint AS landed, \
+                        (SELECT count(*) FROM trim)::bigint AS trimmed",
+                trim_ctes(8)
+            );
+            let rows = self.c.query(
+                &sql,
+                &[
+                    P::i64(repo.0),
+                    P::i64(land_id),
+                    P::text(state.as_str()),
+                    P::opt_bytes(result.as_ref().map(|id| id_bytes(id.as_bytes()))),
+                    P::text(&detail),
+                    P::bytes(&encode_paths(&conflict_paths)),
+                    P::text(reject_reason.as_str()),
+                    P::text_array(kinds),
+                    P::i64_array(versions),
+                    P::i64_array(steps),
+                ],
+            )?;
+            self.deferred_deletes.clear();
+            let trimmed: i64 = rows[0]
+                .try_get(1)
+                .map_err(|error| Error::Corrupt(format!("the verdict's fold count: {error}")))?;
+            if trimmed > 0 {
+                tracing::debug!(trimmed, "the verdict's fold trimmed the deferred deletes");
+            }
+            let landed: i64 = rows[0]
+                .try_get(0)
+                .map_err(|error| Error::Corrupt(format!("the verdict's fold count: {error}")))?;
+            u64::try_from(landed).unwrap_or(0)
+        } else {
+            self.c.execute(
+                LANDS_STATEMENT,
+                &[
+                    P::i64(repo.0),
+                    P::i64(land_id),
+                    P::text(state.as_str()),
+                    P::opt_bytes(result.as_ref().map(|id| id_bytes(id.as_bytes()))),
+                    P::text(&detail),
+                    P::bytes(&encode_paths(&conflict_paths)),
+                    P::text(reject_reason.as_str()),
+                ],
+            )?
+        };
         if updated != 1 {
             return Err(Error::Corrupt(format!(
                 "land {land_id} is no longer pending"
@@ -3575,22 +6467,8 @@ impl MetaTx for PgTx<'_> {
             previous: None,
             detail,
             conflict_paths,
+            reject_reason,
         })
-    }
-
-    /// Records that a git commit became the changeset. Safe to repeat.
-    fn put_git_import(&mut self, repo: RepoId, commit: ObjectId, cs: ChangesetId) -> Result<()> {
-        self.c.execute(
-            "INSERT INTO git_import (repo_id, git_algo, git_oid, cs) VALUES ($1, $2, $3, $4)
-             ON CONFLICT (repo_id, git_algo, git_oid) DO NOTHING",
-            &[
-                P::i64(repo.0),
-                P::i64(SHA1),
-                P::bytes(commit.as_slice()),
-                P::bytes(&id_bytes(cs.as_bytes())),
-            ],
-        )?;
-        Ok(())
     }
 
     /// Records that the git commits became the changesets. One statement
@@ -3644,22 +6522,35 @@ impl MetaTx for PgTx<'_> {
     }
 
     /// Stores a history node under its content address. Safe to repeat.
-    /// Returns whether the row was new.
-    fn put_history_node(&mut self, id: NodeId, body: Vec<u8>) -> Result<(NodeId, bool)> {
+    fn put_history_node(&mut self, id: NodeId, body: Vec<u8>) -> Result<NodeId> {
         // While the importer's batching is on, the row waits for the
         // flush, which writes it in batches after the derived rows; the
-        // buffer answers this transaction's reads of the same node.
-        if self.cs_batching
-            && let Some(pending) = self.history_pending.as_deref_mut()
+        // buffer answers this transaction's reads of the same node. A
+        // deferring write path collects the same way: its commit writes
+        // the transaction's nodes with one statement, however many
+        // levels the history tree grew. A row the buffer already holds
+        // takes the newer body, the same bytes under the same address:
+        // the content-addressed body makes the repeat free.
+        if let Some(pending) = self.history_pending.as_deref_mut()
+            && (self.cs_batching || self.defer_derived)
         {
-            pending.insert(id.0.to_vec(), body);
-            return Ok((id, true));
+            let added = body.len();
+            if let Some(old) = pending.rows.insert(id.0.to_vec(), body) {
+                pending.bytes -= old.len();
+            }
+            pending.bytes += added;
+            #[cfg(any(test, feature = "test-hooks"))]
+            HISTORY_PENDING_PEAK.fetch_max(pending.bytes, Ordering::Relaxed);
+            if pending.bytes > history_pending_max_bytes() {
+                self.flush_history_rows()?;
+            }
+            return Ok(id);
         }
-        let stored = self.c.execute(
+        self.c.execute(
             "INSERT INTO history_nodes (id, body) VALUES ($1, $2) ON CONFLICT (id) DO NOTHING",
             &[P::bytes(&id.0), P::bytes(&body)],
         )?;
-        Ok((id, stored == 1))
+        Ok(id)
     }
 
     /// Reads a history node and checks it against its ID. Also returns the
@@ -3669,11 +6560,26 @@ impl MetaTx for PgTx<'_> {
     ///
     /// [`Error::Corrupt`] if absent or if it does not match its ID.
     fn get_history_node(&mut self, id: NodeId) -> Result<(Vec<u8>, usize)> {
-        if self.cs_batching
-            && let Some(body) = self
-                .history_pending
-                .as_deref()
-                .and_then(|pending| pending.get(id.0.as_slice()))
+        // A row the transaction holds for its flush answers from the
+        // buffer, batching or not: a deferred write is the transaction's
+        // own state.
+        if let Some(body) = self
+            .history_pending
+            .as_deref()
+            .and_then(|pending| pending.rows.get(id.0.as_slice()))
+        {
+            let len = body.len();
+            return Ok((body.clone(), len));
+        }
+        // A row the pre-transaction read loaded answers from it: the read
+        // verified the body against its ID (the SQL path below), and a
+        // content-addressed row cannot change. A miss re-reads in the
+        // transaction, which also covers a node whose row committed after
+        // the pre-read began.
+        if let Some(body) = self
+            .pre_history
+            .as_ref()
+            .and_then(|pre| pre.get(id.0.as_slice()))
         {
             let len = body.len();
             return Ok((body.clone(), len));
@@ -3818,15 +6724,6 @@ impl MetaTx for PgTx<'_> {
         Ok(rows.iter().map(|row| row.get(0)).collect())
     }
 
-    /// Removes the row that names `blob` for `repo`.
-    fn delete_repo_blob(&mut self, repo: RepoId, blob: &[u8]) -> Result<()> {
-        self.c.execute(
-            "DELETE FROM repo_blobs WHERE repo_id = $1 AND blob = $2",
-            &[P::i64(repo.0), P::bytes(blob)],
-        )?;
-        Ok(())
-    }
-
     /// Removes the rows that name any of `blobs` for `repo`. One
     /// statement: the blobs travel as one bytea array.
     fn delete_repo_blobs(&mut self, repo: RepoId, blobs: &[Vec<u8>]) -> Result<()> {
@@ -3837,8 +6734,8 @@ impl MetaTx for PgTx<'_> {
         Ok(())
     }
 
-    /// Whether any repo names `blob`. Driven from `repos`, as the SQLite
-    /// one is: `repo_blobs` has no index on `blob` alone.
+    /// Whether any repo names `blob`. Driven from `repos`:
+    /// `repo_blobs` has no index on `blob` alone.
     fn any_repo_names(&mut self, blob: &[u8]) -> Result<bool> {
         Ok(self
             .c
@@ -3850,6 +6747,19 @@ impl MetaTx for PgTx<'_> {
                 &[P::bytes(blob)],
             )?
             .is_some())
+    }
+
+    /// See the data directory's `repos_naming`: one probe per repo, same
+    /// shape.
+    fn repos_naming(&mut self, blob: &[u8]) -> Result<Vec<RepoId>> {
+        let rows = self.c.query(
+            "SELECT r.repo_id FROM repos r
+             WHERE EXISTS (SELECT 1 FROM repo_blobs rb
+                           WHERE rb.repo_id = r.repo_id AND rb.blob = $1)
+             ORDER BY r.repo_id",
+            &[P::bytes(blob)],
+        )?;
+        Ok(rows.iter().map(|row| RepoId(row.get(0))).collect())
     }
 
     /// The `(changeset ID, body)` of the changesets after `from`, in ID
@@ -3996,6 +6906,14 @@ impl MetaTx for PgTx<'_> {
                 ))
             })
             .collect()
+    }
+
+    fn clear_restore_mark(&mut self) -> Result<()> {
+        // Publication is atomic with this: the caller's transaction
+        // holds, so the store that answers reads never carries the
+        // mark, and a mark that survives only survives a kill.
+        self.c.batch("DROP TABLE IF EXISTS restore_staging")?;
+        Ok(())
     }
 }
 
@@ -4150,7 +7068,7 @@ impl Meta for Pg {
         // synchronous_commit is on: a commit is durable when it returns.
         // The blob files are the backend's own disk state, though: on a
         // drive whose cache fsync does not clear, they reach the drive on
-        // their own schedule, like a SQLite store's.
+        // their own schedule.
         if crate::store::FSYNC_LEAVES_DRIVE_CACHE {
             self.inner.blobs.full_flush()?;
         }
@@ -4160,10 +7078,139 @@ impl Meta for Pg {
 
 #[cfg(test)]
 mod tests {
-    use super::{Client, NoTls, P, merged_options};
-    use crate::backend::old_store;
-    use crate::pg::Pg;
+    use super::{
+        Client, Conn, Job, Kind, NoTls, Setup, SetupFailure, TxState, connect_on, connection_gone,
+        delete_prefixes, merged_options, run_with_retry,
+    };
+    use crate::error::{Error, Storage};
+    use crate::pg::{Pairing, Pg, pairing_decision};
     use std::sync::Arc;
+
+    /// The pairing decision's whole table: every arm of the match, on
+    /// both sides of the repos flag. A rename or an arm that flips
+    /// shows here, not in a store that refuses or adopts wrongly.
+    #[test]
+    fn the_pairing_table_covers_every_case() {
+        let marker = [1u8; 16];
+        let held = [2u8; 16];
+        let refuse = |pairing: Pairing| matches!(pairing, Pairing::Refuse(_));
+        // One store on both sides agrees, whatever the schema holds.
+        assert!(matches!(
+            pairing_decision(Some(marker), Some(marker), true),
+            Pairing::Agree
+        ));
+        assert!(matches!(
+            pairing_decision(Some(marker), Some(marker), false),
+            Pairing::Agree
+        ));
+        // Two stores on one disk refuse, whatever the schema holds.
+        assert!(refuse(pairing_decision(Some(marker), Some(held), true)));
+        assert!(refuse(pairing_decision(Some(marker), Some(held), false)));
+        // A served database with no marker refuses; a schema that
+        // never served is a first open's cut, and the marker is
+        // written.
+        assert!(refuse(pairing_decision(None, Some(held), true)));
+        assert!(matches!(
+            pairing_decision(None, Some(held), false),
+            Pairing::AdoptCut
+        ));
+        // A marker over a schema that holds no store and no repos is
+        // the wrong-URL refusal; over one that holds repos it is a
+        // dump beside its own directory, and the open mints the row.
+        assert!(refuse(pairing_decision(Some(marker), None, false)));
+        assert!(matches!(
+            pairing_decision(Some(marker), None, true),
+            Pairing::Fresh
+        ));
+        // Neither side names a store: a first boot, whatever the
+        // schema holds.
+        assert!(matches!(pairing_decision(None, None, true), Pairing::Fresh));
+        assert!(matches!(
+            pairing_decision(None, None, false),
+            Pairing::Fresh
+        ));
+    }
+
+    #[test]
+    fn the_delete_prefix_folds_the_calls_of_one_kind_in_order() {
+        // Two versions of one kind, the higher version called first:
+        // the first call takes 2 of the 6 rows below it, the second 1
+        // of the 3 rows its lower version still sees. The per-call
+        // deletes would leave 6 - 2 - 1 = 3 rows.
+        let kind = "k".to_owned();
+        let (kinds, totals) = delete_prefixes(&[(kind.clone(), 2), (kind, 2)], &[6, 3]);
+        assert_eq!(kinds, vec!["k"]);
+        assert_eq!(totals, vec![3]);
+        // Kinds interleave in the call order; each kind folds alone: a's
+        // first call takes the 2 rows below it, its second 5 of the 8
+        // still below, so 7; b sees no rows below its version.
+        let (kinds, totals) = delete_prefixes(
+            &[
+                ("a".to_owned(), 5),
+                ("b".to_owned(), 1),
+                ("a".to_owned(), 5),
+            ],
+            &[2, 0, 10],
+        );
+        assert_eq!(kinds, vec!["a", "b"]);
+        assert_eq!(totals, vec![7, 0]);
+        // A later call's version sees fewer rows than the calls before
+        // it took: its share is nothing.
+        let kind = "k".to_owned();
+        let (_, totals) = delete_prefixes(&[(kind.clone(), 5), (kind, 5)], &[10, 2]);
+        assert_eq!(totals, vec![5]);
+    }
+
+    #[test]
+    fn a_worker_panic_logs_its_payload_and_the_error_names_the_log() {
+        // The shared subscriber is one and global, so the line the
+        // worker thread logs lands where this test reads it.
+        crate::service::test_init_log();
+        let url = crate::backend::test_hooks::test_url().unwrap();
+        let client = super::test_hooks::connect(&url, None).unwrap();
+        let error = client
+            .raw(Box::new(|_| -> crate::error::Result<()> {
+                panic!("the worker's test panic");
+            }))
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("its log line names why"),
+            "{error}"
+        );
+        let text = crate::service::test_log_text();
+        assert!(
+            text.contains("the worker's test panic"),
+            "the log holds the panic payload: {text}"
+        );
+        assert!(
+            text.contains("the postgres worker thread panicked and stopped"),
+            "the log says the worker stopped: {text}"
+        );
+    }
+
+    /// A `store_uuid` row that is not 16 bytes refuses the reopen with the
+    /// row's length, instead of panicking it: a database of another
+    /// backend's shape is corrupt data, and corrupt data is refused.
+    #[test]
+    fn a_store_uuid_row_of_the_wrong_length_refuses_the_open() {
+        let _slot = super::damage::slot();
+        let dir = crate::test_support::private_tempdir();
+        let store = crate::Backend::open_test(dir.path()).unwrap();
+        super::damage::corrupt_store_uuid(&store).unwrap();
+        drop(store);
+        // The corrupt row is the answer the database gives once the old
+        // session has ended; the reopen waits for that session the way
+        // the one-server lock test does, instead of racing the worker's
+        // close.
+        let Err(error) = crate::Backend::reopen_test(dir.path()) else {
+            panic!("a store_uuid row of 1 byte refuses the open");
+        };
+        assert!(
+            matches!(&error, crate::error::Error::Corrupt(message)
+                if message.contains("the store_uuid row holds 1 bytes, not 16")),
+            "{error:?}"
+        );
+    }
 
     const OWN: &str = "-csynchronous_commit=on -cstatement_timeout=600000 -clock_timeout=5000";
 
@@ -4180,14 +7227,11 @@ mod tests {
     /// only the schema is missing.
     #[test]
     fn a_search_path_that_names_no_schema_refuses_with_the_fix() {
-        if !crate::Backend::test_is_postgres() {
-            return;
-        }
         let url = crate::backend::test_hooks::test_url().unwrap();
         let mut client = Client::connect(&url, NoTls).unwrap();
-        let setup = super::Setup::new(Some("scion_test_missing"), true, &mut client);
+        let mut setup = super::Setup::new(Some("scion_test_missing"), true, &mut client);
         assert!(!setup.ok(), "a missing schema cannot hold the setup");
-        let error = super::setup_error(&setup, false);
+        let error = super::setup_error(&mut setup, false);
         assert!(
             error
                 .to_string()
@@ -4237,125 +7281,9 @@ mod tests {
         assert_eq!(merged_options(Some(""), OWN), OWN);
     }
 
-    /// A Postgres store of schema version 1 opens on this build, migrates
-    /// forward through every migration it has not run, and serves what it
-    /// held ([#318]). The fixture is the schema of
-    /// `migrations/postgres/0001` with the rows an old build's write
-    /// paths left: one repo, its root changeset, the blobs it names, and
-    /// its ref. The plain open runs migrations 2 to the end under the
-    /// schema lock, and the shared asserts of `backend::old_store` run
-    /// the rest. Postgres only: it needs the test database.
-    #[test]
-    fn a_store_of_schema_version_1_opens_upgrades_and_serves() {
-        if !crate::Backend::test_is_postgres() {
-            return;
-        }
-        let url = crate::backend::test_hooks::test_url().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let schema = crate::backend::test_hooks::test_schema(dir.path());
-        // The blob files, made by this build's writer and copied into the
-        // old store's object folder: blob files carry no schema.
-        let (blob_a, blob_b) = {
-            let scratch = tempfile::tempdir().unwrap();
-            let store = crate::store::Store::open(scratch.path()).unwrap();
-            let a = store.blobs().put(old_store::A).unwrap();
-            let b = store.blobs().put(old_store::B).unwrap();
-            for id in [a, b] {
-                // The file of `id` sits at objects/blob/<2 hex>/<rest>;
-                // the copy must land at the same place in the old store's
-                // object folder. A prefix strip would miss: an open may
-                // spell the same directory through its canonical path.
-                let (_, from) = store.blobs().location(id);
-                let hex = id.to_string();
-                let to = dir
-                    .path()
-                    .join("objects")
-                    .join("blob")
-                    .join(&hex[..2])
-                    .join(&hex[2..]);
-                std::fs::create_dir_all(to.parent().unwrap()).unwrap();
-                std::fs::copy(from, &to).unwrap();
-            }
-            (a, b)
-        };
-        // The metadata at version 1: the schema of 0001, the ledger at 1,
-        // and the rows an old build's write paths left.
-        let cs = old_store::changeset(blob_a, blob_b);
-        let (body, id) = cs.encode_with_id();
-        {
-            let mut db = Client::connect(&url, NoTls).unwrap();
-            db.batch_execute(&format!(
-                "CREATE SCHEMA {schema}; SET search_path TO {schema}"
-            ))
-            .unwrap();
-            db.batch_execute(super::PG_MIGRATIONS[0]).unwrap();
-            // The ledger is not a migration file: an old build's open
-            // made it under its lock, at the shape of `migrate_under_lock`.
-            db.batch_execute(
-                "CREATE TABLE IF NOT EXISTS schema_migrations (
-                     version BIGINT PRIMARY KEY,
-                     name    TEXT NOT NULL
-                 )",
-            )
-            .unwrap();
-            db.batch_execute(
-                "INSERT INTO schema_migrations (version, name) \
-                 VALUES (1, 'postgres schema')",
-            )
-            .unwrap();
-            db.execute("INSERT INTO repos (repo_id, name) VALUES (1, 'main')", &[])
-                .unwrap();
-            db.execute(
-                "INSERT INTO changesets (id, gen, body) VALUES ($1, 1, $2)",
-                &[&P::bytes(&id.as_bytes()[..]), &P::bytes(&body)],
-            )
-            .unwrap();
-            db.execute(
-                "INSERT INTO repo_changesets (repo_id, cs) VALUES (1, $1)",
-                &[&P::bytes(&id.as_bytes()[..])],
-            )
-            .unwrap();
-            db.execute(
-                "INSERT INTO repo_blobs (repo_id, blob) VALUES (1, $1), (1, $2)",
-                &[
-                    &P::bytes(&blob_a.as_bytes()[..]),
-                    &P::bytes(&blob_b.as_bytes()[..]),
-                ],
-            )
-            .unwrap();
-            db.execute(
-                "INSERT INTO refs (repo_id, name, target, version) \
-                 VALUES (1, 'main', $1, 1)",
-                &[&P::bytes(&id.as_bytes()[..])],
-            )
-            .unwrap();
-        }
-        // A plain open of this build runs the migrations it has not run,
-        // under the schema's lock, and serves.
-        let pg = Pg::open_test(
-            &url,
-            &schema,
-            2,
-            dir.path(),
-            crate::backend::Marker::read(dir.path()),
-        )
-        .unwrap();
-        let ledger: i64 = {
-            let mut db = Client::connect(&url, NoTls).unwrap();
-            db.batch_execute(&format!("SET search_path TO {schema}"))
-                .unwrap();
-            db.query_one("SELECT max(version) FROM schema_migrations", &[])
-                .unwrap()
-                .get(0)
-        };
-        assert_eq!(ledger, i64::from(super::PG_SCHEMA_VERSION));
-        let backend = crate::Backend::postgres(pg);
-        old_store::assert_serves(&backend, &cs, id, blob_a, blob_b);
-    }
-
-    /// The shipped Postgres migrations are frozen, like the SQLite ones
-    /// (the twin test in store.rs): a database an old build made was
-    /// built from these files as they shipped, and an edit would cut it
+    /// The shipped Postgres migrations are frozen: a database an old
+    /// build made was built from these files as they shipped, and an
+    /// edit would cut it
     /// off ([#318]).
     #[test]
     fn the_shipped_migrations_stay_as_they_shipped() {
@@ -4393,11 +7321,8 @@ mod tests {
     /// metrics: the gauge an operator watches for a busy database.
     #[test]
     fn a_commit_records_its_wait_for_the_collectors_key() {
-        if !crate::Backend::test_is_postgres() {
-            return;
-        }
         let url = crate::backend::test_hooks::test_url().unwrap();
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let schema = crate::backend::test_hooks::test_schema(dir.path());
         let metrics = std::sync::Arc::new(crate::metrics::Metrics::default());
         let pg = Pg::open_test(
@@ -4443,29 +7368,310 @@ mod tests {
             "{text}"
         );
     }
+
+    /// A transaction in progress whose reconnect fails is recorded as
+    /// lost at the failure, not carried as a stale `InTx` into some
+    /// later caller's first job: the transaction is gone with the
+    /// connection whatever a reconnect does next (#942). The red proof
+    /// on main read `InTx` here.
+    #[test]
+    fn a_failed_reconnect_records_a_transaction_in_progress_as_lost() {
+        let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+        let mut client = connect_on(&url, None, "").unwrap();
+        let mut setup = Setup::new(None, false, &mut client);
+        assert!(setup.ok());
+        let mut tx = TxState::InTx;
+
+        // The statement's own backend dies under it, and the reconnect
+        // dials a port nothing answers: the reconnect fails, and the
+        // original error stands.
+        let pid: i32 = client
+            .query_one("SELECT pg_backend_pid()", &[])
+            .unwrap()
+            .get(0);
+        let mut killer = postgres::Client::connect(&url, NoTls).unwrap();
+        killer
+            .execute("SELECT pg_terminate_backend($1)", &[&pid])
+            .unwrap();
+        drop(killer);
+
+        let (reply_tx, _reply_rx) = std::sync::mpsc::channel();
+        let job = Job {
+            sql: "SELECT 1".to_owned(),
+            params: Vec::new(),
+            kind: Kind::Count,
+            reply: reply_tx,
+            raw: None,
+        };
+        let dead = Conn {
+            url: "postgres://127.0.0.1:1/scion".to_owned(),
+            ca: None,
+            options: String::new(),
+            schema: None,
+            exclusive: false,
+        };
+        let out = run_with_retry(&mut client, &mut setup, &dead, &job, &mut tx, false, None);
+        assert!(out.is_err());
+        assert!(matches!(tx, TxState::Lost));
+    }
+
+    /// The consumption path the recording relies on: the lost
+    /// transaction's own next statement - the ROLLBACK its guard sends
+    /// when the connection has recovered - answers the loss and resets
+    /// the state, so the next caller's first `BEGIN` opens a fresh
+    /// transaction instead of meeting one that is gone.
+    #[test]
+    fn a_lost_transactions_own_rollback_consumes_the_loss_and_the_next_begin_starts_clean() {
+        let url = std::env::var("SCION_TEST_POSTGRES_URL").unwrap();
+        let mut client = connect_on(&url, None, "").unwrap();
+        let mut setup = Setup::new(None, false, &mut client);
+        assert!(setup.ok());
+        let mut tx = TxState::Lost;
+        let conn = Conn {
+            url: url.clone(),
+            ca: None,
+            options: String::new(),
+            schema: None,
+            exclusive: false,
+        };
+        let job_of = |sql: &str| {
+            let (reply_tx, _reply_rx) = std::sync::mpsc::channel();
+            Job {
+                sql: sql.to_owned(),
+                params: Vec::new(),
+                kind: Kind::Count,
+                reply: reply_tx,
+                raw: None,
+            }
+        };
+
+        // The client is fresh here, so the ROLLBACK runs on a live
+        // session: the loop's gate answers the loss (Lost fails every
+        // non-ROLLBACK, non-BEGIN job), the ROLLBACK itself passes, and
+        // the state resets to Idle the way the worker folds `after`.
+        let out = run_with_retry(
+            &mut client,
+            &mut setup,
+            &conn,
+            &job_of("ROLLBACK"),
+            &mut tx,
+            false,
+            None,
+        );
+        assert!(out.is_ok());
+        tx = tx.after("ROLLBACK", out.is_ok());
+        assert!(matches!(tx, TxState::Idle));
+
+        // The next caller's first BEGIN opens a real transaction: it
+        // meets no loss recorded from a caller it never knew.
+        let out = run_with_retry(
+            &mut client,
+            &mut setup,
+            &conn,
+            &job_of("BEGIN"),
+            &mut tx,
+            false,
+            None,
+        );
+        assert!(out.is_ok());
+        tx = tx.after("BEGIN", out.is_ok());
+        assert!(matches!(tx, TxState::InTx));
+        let _ = client.execute("ROLLBACK", &[]);
+    }
+
+    /// A real `postgres::Error` from a connect to a port nothing
+    /// answers: its source is the io error, no database error behind it.
+    /// A helper, because `expect_err` needs a `Debug` the client's ok
+    /// type does not have.
+    fn connect_error() -> postgres::Error {
+        match postgres::Client::connect("postgres://127.0.0.1:1/scion", NoTls) {
+            Err(error) => error,
+            Ok(_) => unreachable!("nothing answers on port 1"),
+        }
+    }
+
+    /// `connection_gone` finds the statement's `postgres::Error` only as
+    /// the Storage error's direct source. Every error `run_statement`
+    /// produces rides there directly (`map_pg_error` boxes it as the
+    /// source), so the reconnect path classifies today; but the setup
+    /// path wraps two levels deep (`io::Error::other(SetupFailure)`),
+    /// and a future `run_statement` wrapper of the same shape would
+    /// silently unclassify - the raw FATAL would reach the caller again
+    /// with every test green. The pin holds the shape: one level
+    /// classifies gone, the two-level wrap of the very same error does
+    /// not, so a change in either direction fails here and names the
+    /// assumption.
+    #[test]
+    fn connection_gone_reads_the_source_chain_one_level_deep() {
+        // A connect to a port nothing answers: a real `postgres::Error`
+        // whose source is the io error, no database error behind it.
+        let pg_error = connect_error();
+        let one_level = Err(Error::Storage(Storage::busy(pg_error)));
+        assert!(connection_gone(&one_level));
+
+        // The setup path's shape: the same error two levels down, inside
+        // the io error that carries the failing statement's name.
+        let pg_error = connect_error();
+        let two_level = Err(Error::Storage(Storage::busy(std::io::Error::other(
+            SetupFailure {
+                sql: "SET search_path".to_owned(),
+                source: pg_error,
+            },
+        ))));
+        assert!(!connection_gone(&two_level));
+    }
 }
 
 #[cfg(test)]
-mod pool_tests {
+mod lane_key_tests {
+    use super::{LANE_KEY_STATEMENT, LOCK_TIMEOUT_FOR_WRITERS};
+
+    /// The key statement spells the writers' clock as a literal (the
+    /// simple query protocol takes no parameters). This pin fails if
+    /// the literal and `LOCK_TIMEOUT_FOR_WRITERS` ever drift (#917).
+    #[test]
+    fn the_lane_key_names_the_writers_clock_from_the_constant() {
+        assert!(
+            LANE_KEY_STATEMENT.contains(&format!("'{LOCK_TIMEOUT_FOR_WRITERS}'")),
+            "the lane key's restore spells the writers' clock: {LANE_KEY_STATEMENT}"
+        );
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod pool_tests {
     use super::*;
     use crate::store::READERS;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::{Mutex, MutexGuard, PoisonError};
 
-    /// A Postgres backend of a test database, or [`None`] on SQLite: the
-    /// pool is a Postgres shape, so the pool tests skip the data
-    /// directory.
-    fn pg() -> Option<Pg> {
-        if !crate::backend::Backend::test_is_postgres() {
-            eprintln!("skip on sqlite: the reader pool is Postgres");
-            return None;
-        }
-        let data = tempfile::tempdir().unwrap();
-        let backend = crate::backend::Backend::open_test(data.path()).unwrap();
-        let pg = backend
-            .as_postgres()
-            .cloned()
-            .expect("the env named postgres");
-        Some(pg)
+    /// The tests that hold a pool of the server's size run one at a
+    /// time: each holds a write connection and `READERS` readers, and
+    /// the suite's other backends fill the rest of the database's
+    /// `max_connections` (E53300, "too many clients").
+    pub(crate) static SERVER_SIZED_POOL: Mutex<()> = Mutex::new(());
+
+    fn server_sized_pool() -> MutexGuard<'static, ()> {
+        SERVER_SIZED_POOL
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A Postgres backend of a test database, with the pool gate: the
+    /// caller holds the pair for its whole test body.
+    /// An open whose batch fails after its BEGIN ran leaves no open
+    /// transaction behind: the helper rolls the aborted transaction back
+    /// before the error returns, and the client answers its next holder
+    /// cleanly. Without the rollback, the session would sit in an
+    /// aborted transaction - "current transaction is aborted" on every
+    /// statement until someone rolls it back.
+    /// The finish's joined read answers a land whose ref vanished after
+    /// the record: the land's outcome stands alone (LEFT JOIN), the ref
+    /// half answers None, and the plan then sees a missing ref - the
+    /// same answer a separate ref read would have given. An inner join
+    /// would lose the land's row with its ref.
+    #[test]
+    fn a_finish_still_reads_the_land_when_its_ref_vanished() {
+        let data = crate::test_support::private_tempdir();
+        let store = crate::Backend::open_test(data.path()).unwrap();
+        let cs = store
+            .commit(|c| {
+                let repo = c.create_repo("r")?;
+                let cs = c.insert_changeset(
+                    repo,
+                    &Changeset::new(
+                        vec![],
+                        scion_core::IdentityTime::new(
+                            b"Ada".to_vec(),
+                            b"ada@example.com".to_vec(),
+                            0,
+                            0,
+                        )
+                        .expect("identity fits the format"),
+                        None,
+                        b"root".to_vec(),
+                        std::collections::BTreeMap::new(),
+                    )
+                    .expect("changeset fits the format"),
+                )?;
+                assert!(c.cas_ref(repo, "main", None, cs)?);
+                Ok(cs)
+            })
+            .unwrap();
+        let req = LandRequest {
+            repo: "r".into(),
+            changeset: cs,
+            target_ref: "main".into(),
+            request_key: "k".into(),
+            deadline: crate::deadline::Deadline::new(Instant::now() + Duration::from_secs(60)),
+        };
+        let (_, recorded) = store
+            .commit(|c| c.record_land(&Caller("t".into()), &req, None))
+            .unwrap();
+        assert_eq!(recorded.state, LandState::Pending);
+        let pg = store.into_pg();
+        // The join answers the ref while it exists.
+        let (row, head, head_tree) = crate::meta::Meta::read(&pg, |c| {
+            let repo = c.repo_id("r")?;
+            c.land_outcome(repo, &Caller("t".into()), recorded.land_id, Some("main"))
+        })
+        .unwrap();
+        assert_eq!(row.state, LandState::Pending);
+        assert!(head.is_some());
+        // This fixture never derived its head's root tree - no land has
+        // run - so the read answers false while the ref stands, and the
+        // answer still rides the joined row.
+        assert!(!head_tree, "the fixture's head tree was never derived");
+        // The ref goes away (the API never deletes refs; an operator or a
+        // future gc can), and the land's outcome must survive it.
+        let mut reader = pg.inner.readers.take(READER_WAIT).unwrap();
+        reader
+            .client()
+            .execute("DELETE FROM refs WHERE name = 'main'", &[])
+            .unwrap();
+        drop(reader);
+        let (row, head, head_tree) = crate::meta::Meta::read(&pg, |c| {
+            let repo = c.repo_id("r")?;
+            c.land_outcome(repo, &Caller("t".into()), recorded.land_id, Some("main"))
+        })
+        .unwrap();
+        assert_eq!(row.state, LandState::Pending, "the land row stands alone");
+        assert!(head.is_none(), "the ref half answers None");
+        assert!(!head_tree, "no ref, no head, no tree to fill");
+    }
+
+    #[test]
+    fn an_open_whose_set_local_failed_leaves_no_open_transaction() {
+        let (_pool, pg) = pg();
+        let mut reader = pg.inner.readers.take(READER_WAIT).unwrap();
+        let client = reader.client();
+        // A statement_timeout above the bigint range fails the batch's
+        // second command; the BEGIN in the same batch has already run.
+        let huge = std::time::Duration::from_millis(u64::MAX);
+        let Err(_) = PgTx::begin_read(
+            client,
+            ReadIsolation::ReadCommitted,
+            huge,
+            std::time::Duration::from_secs(30),
+        ) else {
+            panic!("the out-of-range timeout must fail the open");
+        };
+        // The session answers its next holder: no aborted transaction.
+        let one: i32 = client.query("SELECT 1", &[]).unwrap()[0].get(0);
+        assert_eq!(one, 1);
+        client.execute("BEGIN", &[]).unwrap();
+        client.execute("COMMIT", &[]).unwrap();
+    }
+
+    fn pg() -> (MutexGuard<'static, ()>, Pg) {
+        let gate = server_sized_pool();
+        let data = crate::test_support::private_tempdir();
+        // The pool tests hold the whole reader pool: they need the
+        // server's pool size, not the suite's small test pool.
+        let pg = crate::backend::Backend::open_test_with_readers(data.path(), READERS)
+            .unwrap()
+            .into_pg();
+        (gate, pg)
     }
 
     /// A transaction whose connection dies mid-way leaves the worker's
@@ -4476,7 +7682,7 @@ mod pool_tests {
     /// forever.
     #[test]
     fn a_read_whose_connection_died_mid_transaction_recovers() {
-        let Some(pg) = pg() else { return };
+        let (_pool, pg) = pg();
         // One reader client, out of the pool, in a transaction.
         let mut reader = pg.inner.readers.take(READER_WAIT).unwrap();
         let client = reader.client();
@@ -4495,7 +7701,7 @@ mod pool_tests {
         .unwrap();
         let err = client.query_opt("SELECT 1", &[]).unwrap_err();
         assert!(
-            matches!(err, Error::Corrupt(ref m) if m.contains("lost")),
+            matches!(err, Error::Unavailable(ref m) if m.contains("lost")),
             "the lost transaction answered {err}"
         );
         drop(reader);
@@ -4508,7 +7714,7 @@ mod pool_tests {
     /// reader comes back to the pool.
     #[test]
     fn a_read_statement_past_its_bound_is_cancelled() {
-        let Some(pg) = pg() else { return };
+        let (_pool, pg) = pg();
         let err = pg
             .read_bounded(
                 |tx| {
@@ -4521,8 +7727,7 @@ mod pool_tests {
             )
             .unwrap_err();
         // SQLSTATE 57014 is the statement clock, and map_pg_error gives
-        // it the deadline answer, as for a SQLite write past its busy
-        // timeout.
+        // it the deadline answer.
         assert!(
             matches!(err, Error::DeadlineExceeded(_)),
             "the cancelled read came back as {err}"
@@ -4539,7 +7744,7 @@ mod pool_tests {
     /// `Unavailable`, instead of blocking to its deadline.
     #[test]
     fn a_call_that_waits_past_the_pool_bound_is_refused() {
-        let Some(pg) = pg() else { return };
+        let (_pool, pg) = pg();
         let pg = Arc::new(pg);
         let busy = Arc::new(AtomicUsize::new(0));
         let holds: Vec<_> = (0..READERS)
@@ -4595,7 +7800,7 @@ mod pool_tests {
     /// ceiling keeps this a fast failure that names the step.
     #[test]
     fn a_reader_taken_and_given_back_is_taken_again() {
-        let Some(pg) = pg() else { return };
+        let (_pool, pg) = pg();
         let pg = Arc::new(pg);
         let done = Arc::new(AtomicUsize::new(0));
         std::thread::scope(|scope| {
@@ -4635,7 +7840,7 @@ mod pool_tests {
     /// to zero when the reads are done.
     #[test]
     fn the_pool_records_its_waits_and_its_busy_readers() {
-        let Some(pg) = pg() else { return };
+        let (_pool, pg) = pg();
         let metrics = Arc::new(Metrics::default());
         pg.set_metrics(Arc::clone(&metrics));
         let pg = Arc::new(pg);
@@ -4714,7 +7919,7 @@ mod pool_tests {
     /// back to zero when it ends.
     #[test]
     fn the_tx_age_gauge_tracks_the_oldest_open_read() {
-        let Some(pg) = pg() else { return };
+        let (_pool, pg) = pg();
         let pg = Arc::new(pg);
         assert_eq!(pg.tx_age(), Duration::ZERO);
         let hold = {
@@ -4746,7 +7951,7 @@ mod pool_tests {
     /// first one's row and hears the limit's answer.
     #[test]
     fn two_lands_that_record_together_respect_the_pending_cap() {
-        let data = tempfile::tempdir().unwrap();
+        let data = crate::test_support::private_tempdir();
         let a = crate::backend::Backend::open_test(data.path()).unwrap();
         let b = crate::backend::Backend::open_test_shared(data.path()).unwrap();
         let cs = a
@@ -4880,10 +8085,7 @@ mod pool_tests {
     fn a_batch_that_never_flushes_refuses_to_commit() {
         use crate::test_support::meta::{Meta as _, MetaTx as _};
 
-        if !crate::Backend::test_is_postgres() {
-            return;
-        }
-        let dir = tempfile::tempdir().unwrap();
+        let dir = crate::test_support::private_tempdir();
         let store = crate::Backend::open_test(dir.path()).unwrap();
         let repo = store.write(|c| c.create_repo("main")).unwrap();
         let cs = Changeset::new(
@@ -4920,5 +8122,311 @@ mod pool_tests {
         // A normal write after the refusal writes as before.
         let again = store.write(|c| c.insert_changeset(repo, &cs)).unwrap();
         assert_eq!(again, id);
+    }
+
+    /// The lane's admission rule, on its own: a slot holder goes ahead
+    /// of other waiting writers, an other writer goes when no slot
+    /// holder waits or after the bound's run of slot holders, and with
+    /// no slot holder in the lane the rule is today's plain queue.
+    #[test]
+    fn the_write_lane_admits_by_the_bound() {
+        let gate = |holders_waiting: usize, plain_waiting: usize, holders_ahead: usize| {
+            super::WriterGate {
+                taken: false,
+                waiting: holders_waiting + plain_waiting,
+                holders_waiting,
+                plain_waiting,
+                holders_ahead,
+            }
+        };
+        // A slot holder passes queued other writers while the bound is
+        // not reached.
+        assert!(super::lane_admits(&gate(0, 3, 0), true));
+        assert!(super::lane_admits(&gate(0, 3, 3), true));
+        // At the bound, the next other writer goes first.
+        assert!(!super::lane_admits(
+            &gate(0, 1, super::WRITER_LANE_AHEAD),
+            true
+        ));
+        assert!(super::lane_admits(
+            &gate(1, 1, super::WRITER_LANE_AHEAD),
+            false
+        ));
+        // After that writer, the holders go on.
+        assert!(super::lane_admits(&gate(2, 0, 0), true));
+        // An other writer with no slot holder waiting goes at once: the
+        // lane is the plain queue when no land holds a slot.
+        assert!(super::lane_admits(&gate(0, 1, 0), false));
+        // A slot holder with no other writer waiting goes at once.
+        assert!(super::lane_admits(&gate(1, 0, 0), true));
+    }
+
+    /// A slot holder's commit enters ahead of the other writers that
+    /// wait for the write client: the write client is held by a slow
+    /// transaction, five other writers and one slot holder queue behind
+    /// it, and the slot holder's commit completes before any of the
+    /// five.
+    #[test]
+    fn a_slot_holders_commit_enters_ahead_of_the_write_queue() {
+        use crate::test_support::meta::Meta as _;
+        let _slot = super::damage::slot();
+        let dir = crate::test_support::private_tempdir();
+        let store = Arc::new(crate::Backend::open_test(dir.path()).unwrap());
+        let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let holder = {
+            let store = Arc::clone(&store);
+            let hold = Arc::clone(&hold);
+            let release = Arc::clone(&release);
+            std::thread::spawn(move || {
+                store
+                    .write(|_| {
+                        hold.store(true, std::sync::atomic::Ordering::Release);
+                        while !release.load(std::sync::atomic::Ordering::Acquire) {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            })
+        };
+        while !hold.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Five other writers and one slot holder queue; the slot holder
+        // goes first, then the other writers.
+        let order = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let mut threads = Vec::new();
+        for class in ["plain", "plain", "plain", "plain", "plain", "holder"] {
+            let store = Arc::clone(&store);
+            let order = Arc::clone(&order);
+            threads.push(std::thread::spawn(move || {
+                let done = |_c: &mut crate::pg::PgTx<'_>| -> crate::error::Result<()> {
+                    order
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(class);
+                    Ok(())
+                };
+                if class == "holder" {
+                    store.write_slot_holder(done).unwrap();
+                } else {
+                    store.write(done).unwrap();
+                }
+            }));
+        }
+        // All six wait: one slot holder and five other writers.
+        for _ in 0..2_000 {
+            let (holders, plain) = store.writer_lane_waiting();
+            if holders == 1 && plain == 5 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let (holders, plain) = store.writer_lane_waiting();
+        assert_eq!((holders, plain), (1, 5), "the six writers did not queue");
+        release.store(true, std::sync::atomic::Ordering::Release);
+        holder.join().unwrap();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let order = order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        assert_eq!(order.len(), 6, "every writer ran: {order:?}");
+        assert_eq!(order[0], "holder", "the slot holder went first: {order:?}");
+    }
+
+    /// The bound: after four slot holders in a row, the next turn is
+    /// the other writer's, so a stream of settles cannot starve the
+    /// record commits that feed it.
+    #[test]
+    fn a_non_slot_writer_is_admitted_within_the_bound() {
+        use crate::test_support::meta::Meta as _;
+        let _slot = super::damage::slot();
+        let dir = crate::test_support::private_tempdir();
+        let store = Arc::new(crate::Backend::open_test(dir.path()).unwrap());
+        let hold = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let release = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let holder = {
+            let store = Arc::clone(&store);
+            let hold = Arc::clone(&hold);
+            let release = Arc::clone(&release);
+            std::thread::spawn(move || {
+                store
+                    .write(|_| {
+                        hold.store(true, std::sync::atomic::Ordering::Release);
+                        while !release.load(std::sync::atomic::Ordering::Acquire) {
+                            std::thread::sleep(std::time::Duration::from_millis(2));
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            })
+        };
+        while !hold.load(std::sync::atomic::Ordering::Acquire) {
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        // Four slot holders, then one other writer, then one more slot
+        // holder, all queued before the held transaction ends.
+        let order = Arc::new(std::sync::Mutex::new(Vec::<&'static str>::new()));
+        let mut threads = Vec::new();
+        for class in ["holder", "holder", "holder", "holder", "plain", "holder"] {
+            let store = Arc::clone(&store);
+            let order = Arc::clone(&order);
+            threads.push(std::thread::spawn(move || {
+                let done = |_c: &mut crate::pg::PgTx<'_>| -> crate::error::Result<()> {
+                    order
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
+                        .push(class);
+                    Ok(())
+                };
+                if class == "holder" {
+                    store.write_slot_holder(done).unwrap();
+                } else {
+                    store.write(done).unwrap();
+                }
+            }));
+        }
+        for _ in 0..2_000 {
+            let (holders, plain) = store.writer_lane_waiting();
+            if holders == 5 && plain == 1 {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(2));
+        }
+        let (holders, plain) = store.writer_lane_waiting();
+        assert_eq!((holders, plain), (5, 1), "the six writers did not queue");
+        release.store(true, std::sync::atomic::Ordering::Release);
+        holder.join().unwrap();
+        for thread in threads {
+            thread.join().unwrap();
+        }
+        let order = order
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // The first four slot holders go, then the other writer, then
+        // the fifth slot holder: the bound held the fifth back.
+        assert_eq!(
+            order.as_slice(),
+            ["holder", "holder", "holder", "holder", "plain", "holder"],
+            "the lane ran the writers in the bound's order"
+        );
+    }
+
+    /// A read that runs while a write transaction holds the write
+    /// client: the land's outcome check and plan ride it, so a land in
+    /// its slot must not wait for another writer's statements. The
+    /// writer is held here, so a read that queues behind it would hang
+    /// the test.
+    #[test]
+    fn a_read_latest_runs_while_a_write_holds_the_write_client() {
+        let (_pool, pg) = pg();
+        let (held_tx, held_rx) = std::sync::mpsc::channel();
+        let (release_tx, release_rx) = std::sync::mpsc::channel::<()>();
+        let writer = {
+            let pg = pg.clone();
+            std::thread::spawn(move || {
+                pg.commit(|_tx| {
+                    held_tx.send(()).unwrap();
+                    release_rx.recv().unwrap();
+                    Ok(())
+                })
+                .unwrap();
+            })
+        };
+        held_rx.recv().unwrap();
+        // The land's shape: a per-statement read while the writer is
+        // held. It answers.
+        let seen = pg
+            .read_latest(|tx| Ok(tx.c.query_opt("SELECT 1", &[])?.is_some()))
+            .unwrap();
+        assert!(seen);
+        // A read on the write client queues behind it, as it always did:
+        // the same hold keeps `read_unflushed` waiting.
+        let queued = {
+            let pg = pg.clone();
+            std::thread::spawn(move || pg.read_unflushed(|_| Ok(())))
+        };
+        for _ in 0..2_000 {
+            std::thread::yield_now();
+        }
+        assert!(
+            !queued.is_finished(),
+            "the writer-bound read did not queue behind the held writer"
+        );
+        release_tx.send(()).unwrap();
+        queued.join().unwrap().unwrap();
+        writer.join().unwrap();
+    }
+
+    /// A per-statement read sees the newest committed state: a commit
+    /// that lands between its statements is visible to the later one,
+    /// which is the shape of the land's outcome check and plan.
+    #[test]
+    fn a_read_latest_sees_a_commit_that_lands_between_its_statements() {
+        let (_pool, pg) = pg();
+        pg.commit(|tx| tx.c.execute("CREATE TABLE read_latest_watch (n INT)", &[]))
+            .unwrap();
+        pg.commit(|tx| {
+            tx.c.execute("INSERT INTO read_latest_watch VALUES (1)", &[])
+        })
+        .unwrap();
+        let (counted_tx, counted_rx) = std::sync::mpsc::channel();
+        let (commit_tx, commit_rx) = std::sync::mpsc::channel::<()>();
+        let writer = {
+            let pg = pg.clone();
+            std::thread::spawn(move || {
+                counted_rx.recv().unwrap();
+                pg.commit(|tx| {
+                    tx.c.execute("INSERT INTO read_latest_watch VALUES (2)", &[])
+                })
+                .unwrap();
+                commit_tx.send(()).unwrap();
+            })
+        };
+        let seen = pg
+            .read_latest(|tx| {
+                let first: i64 =
+                    tx.c.query("SELECT count(*) FROM read_latest_watch", &[])
+                        .unwrap()[0]
+                        .get(0);
+                assert_eq!(first, 1, "the read started from an empty table");
+                counted_tx.send(()).unwrap();
+                commit_rx.recv().unwrap();
+                let second: i64 =
+                    tx.c.query("SELECT count(*) FROM read_latest_watch", &[])
+                        .unwrap()[0]
+                        .get(0);
+                Ok(second)
+            })
+            .unwrap();
+        assert_eq!(seen, 2, "the read did not see the commit it raced");
+        writer.join().unwrap();
+        pg.commit(|tx| tx.c.execute("DROP TABLE read_latest_watch", &[]))
+            .unwrap();
+    }
+
+    /// A write inside `read_latest` fails: the read is READ ONLY, so a
+    /// write that slips onto this path cannot land outside the writer's
+    /// lock and the collector's key (SQLSTATE 25006,
+    /// `read_only_sql_transaction`).
+    #[test]
+    fn a_write_inside_read_latest_fails() {
+        let (_pool, pg) = pg();
+        let error = pg
+            .read_latest(|tx| {
+                tx.c.execute("CREATE TABLE read_latest_read_only (n INT)", &[])
+                    .map(|_| ())
+            })
+            .unwrap_err();
+        // The cause chain carries the SQLSTATE text only in the debug
+        // form: the storage error's own display names the class, not
+        // the database's message.
+        assert!(
+            format!("{error:?}").contains("read-only transaction"),
+            "{error:?}"
+        );
     }
 }

@@ -3,6 +3,7 @@
 //! node, serves them over a Unix socket, and fetches misses from its upstream,
 //! a `scion-cache`.
 
+use std::io::IsTerminal;
 use std::num::{NonZeroU32, NonZeroU64, NonZeroUsize};
 use std::path::PathBuf;
 use std::time::Instant;
@@ -44,22 +45,13 @@ struct Cli {
     /// The key of `--tls-client-cert` (PEM).
     #[arg(long, requires = "tls_client_cert", value_name = "FILE")]
     tls_client_key: Option<PathBuf>,
-    /// Bearer token that clients must send. Give `--token-file`, or
-    /// `SCION_TOKEN`; the argv form sits in the process list and warns.
-    #[arg(long, value_name = "TOKEN")]
-    token: Option<String>,
-    /// File with the bearer token of `--token`, read like the access
+    /// File with the bearer token for this tier, read like the access
     /// file: the owner alone may read it, and a symlink is refused.
-    #[arg(long, conflicts_with = "token", value_name = "FILE")]
+    #[arg(long, value_name = "FILE")]
     token_file: Option<PathBuf>,
-    /// Bearer token to send upstream. Give `--upstream-token-file`, or
-    /// `SCION_UPSTREAM_TOKEN`; the argv form sits in the process list
-    /// and warns.
-    #[arg(long, value_name = "TOKEN")]
-    upstream_token: Option<String>,
-    /// File with the bearer token of `--upstream-token`, read like the
+    /// File with the bearer token for the upstream, read like the
     /// access file.
-    #[arg(long, conflicts_with = "upstream_token", value_name = "FILE")]
+    #[arg(long, value_name = "FILE")]
     upstream_token_file: Option<PathBuf>,
     /// Most connections served at once. More clients wait until one closes.
     #[arg(long, default_value_t = listen::DEFAULT_CONNECTIONS)]
@@ -85,74 +77,93 @@ struct Cli {
 }
 
 /// The two tokens of a tier: what it asks for, and what it sends
-/// upstream. Each resolves through the checked file, the env, or the
-/// argv form, which warns.
+/// upstream. Each resolves through the checked file or the env.
+/// Refuses a data directory that does not exist, with the server's
+/// message shape: a typo in `--data`, or a run from the wrong folder,
+/// must not make a new empty store and serve from it. The daemon's
+/// `--data` defaults to a working-directory-relative name, so the
+/// refusal runs first, wherever the binary runs.
+///
+/// # Errors
+/// The directory is not a directory, or does not exist.
+fn refuse_missing_data_dir(data: &std::path::Path) -> anyhow::Result<()> {
+    if data.is_dir() {
+        return Ok(());
+    }
+    if data.exists() {
+        return Err(anyhow::anyhow!("{} is not a directory", data.display()));
+    }
+    Err(anyhow::anyhow!(
+        "{} does not exist; create it or pass --data",
+        data.display()
+    ))
+}
+
+/// Fails the run when the command line still names a secret flag the
+/// binary has removed, before any parsing: the parser never sees the
+/// line, so its own errors cannot quote the value either.
+fn refuse_removed_flags() {
+    use scion_proto::runtime::auth::removed::{RemovedFlag, refusal_text, removed_flag_of};
+    if let Some(removed) = removed_flag_of(
+        std::env::args_os().skip(1).collect::<Vec<_>>().as_slice(),
+        &[
+            RemovedFlag {
+                flag: "--token",
+                instead: "pass the token in SCION_TOKEN, or in a file with --token-file FILE",
+            },
+            RemovedFlag {
+                flag: "--upstream-token",
+                instead: "pass the token in SCION_UPSTREAM_TOKEN, or in a file with --upstream-token-file FILE",
+            },
+        ],
+    ) {
+        eprintln!("error: {}", refusal_text(removed));
+        std::process::exit(2);
+    }
+}
+
+/// The two tokens of a tier: what it asks for, and what it sends
+/// upstream. Each resolves through the checked file or the env.
 fn resolve_tokens(cli: &Cli) -> anyhow::Result<(String, String)> {
-    let token = secret_of(
-        cli.token.as_deref(),
-        cli.token_file.as_deref(),
-        "--token",
-        "--token-file",
-        "SCION_TOKEN",
-    )?;
+    let token = secret_of(cli.token_file.as_deref(), "--token-file", "SCION_TOKEN")?;
     let upstream = secret_of(
-        cli.upstream_token.as_deref(),
         cli.upstream_token_file.as_deref(),
-        "--upstream-token",
         "--upstream-token-file",
         "SCION_UPSTREAM_TOKEN",
     )?;
     Ok((token, upstream))
 }
 
-/// A secret that the flags may carry three ways: the checked file, the
-/// env, or the argv form, which warns that the process list shows it.
-/// The warning names the replacement, per the deprecation rule: warn
-/// first, remove in a later minor.
-fn secret_of(
-    token: Option<&str>,
-    file: Option<&std::path::Path>,
-    flag: &str,
-    file_flag: &str,
-    env: &str,
-) -> anyhow::Result<String> {
-    match (token, file) {
-        (Some(_), Some(_)) => unreachable!("clap refuses {flag} with {file_flag}"),
-        (Some(_), None) => {
-            eprintln!(
-                "warning: {flag} put a secret on the command line, which ps and \
-                 /proc/$$/cmdline show to every local account; use {file_flag} \
-                 (or {env}) instead (the argv form is deprecated and goes away \
-                 in a later release)"
-            );
-            Ok(token.expect("the argv form is given").to_owned())
-        }
-        (None, Some(file)) => {
-            let bytes = scion_proto::runtime::auth::read_secret_file(file)
-                .map_err(|why| scion_proto::runtime::auth::checked_read_error(file, why))?;
-            let text = String::from_utf8(bytes)
-                .map_err(|_| anyhow::anyhow!("{} is not UTF-8", file.display()))?;
-            let token = text.trim();
-            anyhow::ensure!(!token.is_empty(), "{} holds no token", file.display());
-            Ok(token.to_owned())
-        }
-        (None, None) => {
-            let from_env = std::env::var(env).unwrap_or_default();
-            anyhow::ensure!(!from_env.is_empty(), "give {flag}, {file_flag} or {env}");
-            Ok(from_env)
-        }
-    }
+/// A secret that arrives two ways: the checked file, or the env.
+fn secret_of(file: Option<&std::path::Path>, file_flag: &str, env: &str) -> anyhow::Result<String> {
+    let Some(file) = file else {
+        let from_env = std::env::var(env).unwrap_or_default();
+        anyhow::ensure!(!from_env.is_empty(), "give {env} or {file_flag} FILE");
+        return Ok(from_env);
+    };
+    let bytes = scion_proto::runtime::auth::read_secret_file(file)
+        .map_err(|why| scion_proto::runtime::auth::checked_read_error(file, why))?;
+    let text =
+        String::from_utf8(bytes).map_err(|_| anyhow::anyhow!("{} is not UTF-8", file.display()))?;
+    let token = text.trim();
+    anyhow::ensure!(!token.is_empty(), "{} holds no token", file.display());
+    Ok(token.to_owned())
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     // Logs go to stderr: stdout may carry command output that callers
     // capture with $(...).
+    // Color only when stderr is a terminal: a file or a pipe is a log
+    // to keep, and escape bytes in it are noise on every line.
     tracing_subscriber::fmt()
         .with_env_filter(EnvFilter::try_from_default_env().unwrap_or_else(|_| "info".into()))
+        .with_ansi(std::io::stderr().is_terminal())
         .with_writer(std::io::stderr)
         .init();
+    refuse_removed_flags();
     let cli = Cli::parse();
+    refuse_missing_data_dir(&cli.data)?;
     let (token, upstream) = resolve_tokens(&cli)?;
     anyhow::ensure!(
         cli.seed.is_empty() || cli.seed_full_repo,
@@ -169,18 +180,23 @@ async fn main() -> anyhow::Result<()> {
         cli.tls_client_cert.as_deref(),
         cli.tls_client_key.as_deref(),
     )?;
+    // Cold once, before the first file: each file's objects make the
+    // store hold objects, and the rest of the files must still be read.
+    let cold = store.is_empty();
     for path in &cli.seed {
-        seed(&store, path);
+        seed(&store, path, cold);
     }
-    let tier = Tier::new(
+    // A daemon checks no ticket and walks nothing: it forwards the
+    // ticket as it came, and the 0600 socket (one OS user, the socket's
+    // owner) and the upstream's checks are the gates. The relay mode is
+    // this constructor's explicit choice, never a fallthrough of an
+    // empty key list.
+    let tier = Tier::new_relay(
         store,
         &cli.upstream,
         &upstream,
         DAEMON_UPSTREAM_TIMEOUT,
         Some(&client_tls),
-        // A daemon does not check tickets: it forwards them, and its
-        // upstream does the checking. Only the walk gates what it serves.
-        Vec::new(),
     )?;
     let socket = cli.socket.unwrap_or_else(|| cli.data.join("daemon.sock"));
     let listener = bind_unix(&socket)
@@ -202,6 +218,7 @@ async fn main() -> anyhow::Result<()> {
         connections: cli.max_connections,
         streams: cli.max_streams,
         stalled_bytes: cli.max_stalled_bytes,
+        ..Limits::default()
     };
     Box::pin(tier.serve(
         &token,
@@ -226,11 +243,12 @@ async fn main() -> anyhow::Result<()> {
     Ok(())
 }
 
-/// Seeds a cold `store` from the snapshot at `path`. A seed only saves
-/// fetches, so a failure is logged, and the daemon starts as it is.
-fn seed(store: &DiskStore, path: &std::path::Path) {
+/// Seeds `store` from the snapshot at `path` if it was `cold`, empty before
+/// the first `--seed` file. A seed only saves fetches, so a failure is
+/// logged, and the daemon starts as it is.
+fn seed(store: &DiskStore, path: &std::path::Path, cold: bool) {
     let started = Instant::now();
-    match snapshot::seed(store, path) {
+    match cold.then(|| snapshot::seed_cold(store, path)).transpose() {
         Ok(Some(seeded)) => {
             let ms = started.elapsed().as_millis();
             let snapshot::Seeded {

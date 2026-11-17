@@ -21,11 +21,15 @@
 
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::ffi::OsStr;
+#[cfg(feature = "unstable-writable-mount")]
 use std::future::Future;
-use std::io::{Read as _, Write as _};
+use std::io::Read as _;
+#[cfg(feature = "unstable-writable-mount")]
+use std::io::Write as _;
 use std::os::unix::ffi::OsStrExt as _;
 use std::os::unix::fs::PermissionsExt as _;
 use std::path::{Path, PathBuf};
+#[cfg(feature = "unstable-writable-mount")]
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -34,14 +38,16 @@ use anyhow::{Context as _, Result, anyhow, bail};
 use async_trait::async_trait;
 use hashlink::LinkedHashMap;
 use nfsserve::nfs::{
-    fattr3, fileid3, filename3, ftype3, nfs_fh3, nfspath3, nfsstat3, nfstime3, sattr3, set_mode3,
-    set_size3, specdata3,
+    fattr3, fileid3, filename3, ftype3, nfs_fh3, nfspath3, nfsstat3, nfstime3, sattr3, specdata3,
 };
+#[cfg(feature = "unstable-writable-mount")]
+use nfsserve::nfs::{set_mode3, set_size3};
 // The test seam re-exports this (test_support.vfs), and
 // unreachable_pub does not see through a re-export.
 #[allow(unreachable_pub)]
 pub use nfsserve::vfs::NFSFileSystem;
 use nfsserve::vfs::{DirEntry, ReadDirResult, VFSCapabilities};
+#[cfg(feature = "unstable-writable-mount")]
 use rustix::fs::{Mode, OFlags};
 use scion_core::{BlobId, ChangesetId, Entry, FileState, RepoPath, Tree, TreeId};
 use scion_proto::runtime::object::{self, Assembler, Header};
@@ -121,9 +127,13 @@ struct Node {
     path: Option<RepoPath>,
     kind: Kind,
     /// Whether the ref names this path, so removing it is a deletion.
+    #[cfg(feature = "unstable-writable-mount")]
     from_ref: bool,
 }
 
+// The overlay variants are constructed only by the write path, which a
+// build without the feature compiles out; the read side still names them.
+#[cfg_attr(not(feature = "unstable-writable-mount"), allow(dead_code))]
 enum Kind {
     /// A directory. Its tree is fetched once, when it is first listed or
     /// looked up in; `listed` then names each entry's handle.
@@ -175,6 +185,8 @@ struct Nodes {
 
 impl Nodes {
     /// Puts a new node into the map, with a fresh handle.
+    #[cfg(feature = "unstable-writable-mount")]
+    #[cfg_attr(not(feature = "unstable-writable-mount"), allow(unused_variables))]
     fn add(&mut self, path: Option<RepoPath>, kind: Kind, from_ref: bool) -> u64 {
         let id = self.next;
         self.next += 1;
@@ -184,6 +196,7 @@ impl Nodes {
             Node {
                 path,
                 kind,
+                #[cfg(feature = "unstable-writable-mount")]
                 from_ref,
             },
         );
@@ -193,6 +206,7 @@ impl Nodes {
     /// Drops the node `id`, and its name from its directory's listing.
     /// Drops the node `id`, and its name from the map of paths. A deletion
     /// note stays: a re-created path takes it off (`forget_delete`).
+    #[cfg(feature = "unstable-writable-mount")]
     fn drop_node(&mut self, id: u64) {
         if let Some(node) = self.by_id.remove(&id) {
             self.by_path.remove(&node.path);
@@ -231,10 +245,18 @@ pub struct Vfs {
     blobs: Blobs,
     /// Where the changes of this mount live.
     overlay: PathBuf,
+    /// The overlay failures this mount already warned about, as
+    /// (operation, path): a client that retries a failing path must not
+    /// flood stderr with the same line, and a mount whose overlay fails
+    /// for many files must not grow this set without end.
+    warned: std::sync::Mutex<Warned>,
     /// Whether the mount takes writes: v0.1 mounts are read-only unless
     /// `scn mount --unstable-writable` said otherwise, because a symlinked
     /// parent directory in the overlay can still redirect a write outside
-    /// it.
+    /// it. The write path exists only in a build with the
+    /// `unstable-writable-mount` feature; a default or release build has
+    /// no write path at all.
+    #[cfg(feature = "unstable-writable-mount")]
     writable: bool,
     /// The secret that a mount path names and every file handle carries.
     /// Not a protection: see section 8 of the docs.
@@ -251,6 +273,12 @@ impl Vfs {
     /// is the read ticket that minted for `root`; a ticket that does not
     /// parse is stored as expired, so the first read mints a fresh one.
     /// Changes go to `overlay`.
+    ///
+    /// # Errors
+    ///
+    /// The mount secret, when the system's source of random bytes is
+    /// unreadable.
+    //
     // The test seam re-exports the Vfs surface (test_support.vfs), and
     // unreachable_pub does not see through a re-export.
     #[allow(unreachable_pub)]
@@ -262,9 +290,9 @@ impl Vfs {
         root: TreeId,
         ticket: &[u8],
         overlay: PathBuf,
-    ) -> Self {
+    ) -> std::io::Result<Self> {
         let grant = Grant::of(ticket);
-        Self {
+        Ok(Self {
             objects,
             roots,
             repo,
@@ -281,6 +309,7 @@ impl Vfs {
                             tree: Some(root),
                             listed: None,
                         },
+                        #[cfg(feature = "unstable-writable-mount")]
                         from_ref: true,
                     },
                 )]),
@@ -288,19 +317,22 @@ impl Vfs {
                 deleted: HashSet::new(),
             }),
             blobs: tokio::sync::Mutex::new((LinkedHashMap::new(), 0)),
-            secret: secret_from_urandom(),
+            secret: secret_from_urandom()?,
             started: SystemTime::now(),
             uid: rustix::process::geteuid().as_raw(),
             gid: rustix::process::getegid().as_raw(),
             overlay,
+            warned: std::sync::Mutex::new(Warned::default()),
+            #[cfg(feature = "unstable-writable-mount")]
             writable: false,
-        }
+        })
     }
 
     /// Takes writes on this mount, or not: `scn mount --unstable-writable`
     /// is the only caller that passes true. A read-only VFS answers every
     /// mutating call with `EROFS`, before it looks at its arguments.
     #[must_use]
+    #[cfg(feature = "unstable-writable-mount")]
     // The test seam re-exports the Vfs surface (test_support.vfs), and
     // unreachable_pub does not see through a re-export.
     #[allow(unreachable_pub)]
@@ -309,8 +341,16 @@ impl Vfs {
         self
     }
 
-    /// Refuses a mutating call on a read-only mount.
+    #[cfg(feature = "unstable-writable-mount")]
+    /// Refuses a mutating call on a read-only mount. A build without the
+    /// writable-mount feature refuses every mutating call: it has no
+    /// write path at all.
     fn want_write(&self) -> Result<(), nfsstat3> {
+        #[cfg(not(feature = "unstable-writable-mount"))]
+        {
+            Err(nfsstat3::NFS3ERR_ROFS)
+        }
+        #[cfg(feature = "unstable-writable-mount")]
         if self.writable {
             Ok(())
         } else {
@@ -369,6 +409,7 @@ impl Vfs {
     }
 
     /// Puts a new node into the map, with a fresh handle.
+    #[cfg_attr(not(feature = "unstable-writable-mount"), allow(unused_variables))]
     fn add(nodes: &mut Nodes, path: Option<RepoPath>, kind: Kind, from_ref: bool) -> u64 {
         let id = nodes.next;
         nodes.next += 1;
@@ -378,6 +419,7 @@ impl Vfs {
             Node {
                 path,
                 kind,
+                #[cfg(feature = "unstable-writable-mount")]
                 from_ref,
             },
         );
@@ -536,11 +578,17 @@ impl Vfs {
         let data = Arc::new(raw);
         let mut blobs = self.blobs.lock().await;
         blobs.1 += data.len();
-        blobs.0.insert(id, Arc::clone(&data));
+        // A racing call may have inserted the same blob while this one
+        // fetched: the insert replaces that copy, so its bytes leave the
+        // count, or the count drifts above what the map holds.
+        if let Some(old) = blobs.0.insert(id, Arc::clone(&data)) {
+            blobs.1 -= old.len();
+        }
         while blobs.1 > BLOB_CACHE_BYTES {
-            let bytes = blobs.0.front().map_or(0, |(_, data)| data.len());
-            blobs.0.pop_front();
-            blobs.1 = blobs.1.saturating_sub(bytes);
+            let Some((_, gone)) = blobs.0.pop_front() else {
+                break;
+            };
+            blobs.1 -= gone.len();
         }
         Ok(data)
     }
@@ -564,8 +612,11 @@ impl Vfs {
                 .fetch_tree(tree, dir_path.as_ref())
                 .await
                 .map_err(|e| {
-                    warn("cannot read a tree of the mount", &e);
-                    nfsstat3::NFS3ERR_IO
+                    let at = match dir_path.as_ref() {
+                        Some(p) => self.overlay_file(p),
+                        None => self.overlay.clone(),
+                    };
+                    self.io_at("cannot read the tree of", &at, &e)
                 })?;
             for (name, entry) in tree.entries() {
                 let path = Self::child(dir_path.as_ref(), name.as_bytes())?;
@@ -676,7 +727,16 @@ impl Vfs {
 #[async_trait]
 impl NFSFileSystem for Vfs {
     fn capabilities(&self) -> VFSCapabilities {
-        VFSCapabilities::ReadWrite
+        // A build without the writable-mount feature serves read-only,
+        // whatever the mount said: it has no write path at all.
+        #[cfg(not(feature = "unstable-writable-mount"))]
+        return VFSCapabilities::ReadOnly;
+        #[cfg(feature = "unstable-writable-mount")]
+        if self.writable {
+            VFSCapabilities::ReadWrite
+        } else {
+            VFSCapabilities::ReadOnly
+        }
     }
 
     fn root_dir(&self) -> fileid3 {
@@ -698,6 +758,12 @@ impl NFSFileSystem for Vfs {
         self.attr_of(&nodes, id)
     }
 
+    #[cfg(not(feature = "unstable-writable-mount"))]
+    async fn setattr(&self, _id: fileid3, _setattr: sattr3) -> Result<fattr3, nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    #[cfg(feature = "unstable-writable-mount")]
     async fn setattr(&self, id: fileid3, setattr: sattr3) -> Result<fattr3, nfsstat3> {
         self.want_write()?;
         let mut nodes = self.nodes.write().await;
@@ -713,12 +779,14 @@ impl NFSFileSystem for Vfs {
         let file = self.overlay_file(nodes.by_id.get(&id).unwrap().path.as_ref().unwrap());
         if let set_mode3::mode(m) = setattr.mode {
             let exec = m & 0o111 != 0;
-            let handle = open_overlay_chmod(&file).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            let handle =
+                open_overlay_chmod(&file).map_err(|e| self.io_at("cannot chmod", &file, &e))?;
             // RawMode is u32 on Linux and u16 on macOS, so the conversion
             // is real only on macOS.
             #[allow(clippy::useless_conversion)]
             let mode = Mode::from_raw_mode(file_mode(0o644, exec).try_into().unwrap());
-            rustix::fs::fchmod(&handle, mode).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            rustix::fs::fchmod(&handle, mode)
+                .map_err(|e| self.io_at("cannot chmod", &file, &std::io::Error::from(e)))?;
             if let Some(Node {
                 kind: Kind::Local { exec: slot },
                 ..
@@ -728,8 +796,10 @@ impl NFSFileSystem for Vfs {
             }
         }
         if let set_size3::size(bytes) = setattr.size {
-            let f = open_overlay_write(&file, true).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-            f.set_len(bytes).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            let f = open_overlay_write(&file, true)
+                .map_err(|e| self.io_at("cannot set the size of", &file, &e))?;
+            f.set_len(bytes)
+                .map_err(|e| self.io_at("cannot set the size of", &file, &e))?;
         }
         self.attr_of(&nodes, id)
     }
@@ -776,18 +846,22 @@ impl NFSFileSystem for Vfs {
                 use std::io::SeekFrom;
                 use std::io::{Read as _, Seek as _};
 
-                let file = self.overlay_file(node.path.as_ref().expect("a file has a path"));
-                let mut file = std::fs::File::open(&file).map_err(|_| nfsstat3::NFS3ERR_IO)?;
-                let len = file.metadata().map_err(|_| nfsstat3::NFS3ERR_IO)?.len();
+                let path = self.overlay_file(node.path.as_ref().expect("a file has a path"));
+                let mut file =
+                    std::fs::File::open(&path).map_err(|e| self.io_at("cannot read", &path, &e))?;
+                let len = file
+                    .metadata()
+                    .map_err(|e| self.io_at("cannot read", &path, &e))?
+                    .len();
                 let from = offset.min(len);
                 file.seek(SeekFrom::Start(from))
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                    .map_err(|e| self.io_at("cannot read", &path, &e))?;
                 let want = usize::try_from(count).unwrap_or(usize::MAX);
                 let mut data = Vec::new();
                 let taken = file
                     .take(u64::try_from(want).unwrap_or(u64::MAX))
                     .read_to_end(&mut data)
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                    .map_err(|e| self.io_at("cannot read", &path, &e))?;
                 let eof = from + taken as u64 >= len;
                 Ok((data, eof))
             }
@@ -796,6 +870,12 @@ impl NFSFileSystem for Vfs {
         }
     }
 
+    #[cfg(not(feature = "unstable-writable-mount"))]
+    async fn write(&self, _id: fileid3, _offset: u64, __data: &[u8]) -> Result<fattr3, nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    #[cfg(feature = "unstable-writable-mount")]
     async fn write(&self, id: fileid3, offset: u64, data: &[u8]) -> Result<fattr3, nfsstat3> {
         use std::io::Seek as _;
 
@@ -814,15 +894,30 @@ impl NFSFileSystem for Vfs {
             _ => {}
         }
         self.materialize(&mut nodes, id).await?;
-        let mut file = open_overlay_write(&file, false).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        let path = file;
+        let mut file =
+            open_overlay_write(&path, false).map_err(|e| self.io_at("cannot write", &path, &e))?;
         file.seek(std::io::SeekFrom::Start(offset))
             .and_then(|_| file.write_all(data))
-            .map_err(|_| nfsstat3::NFS3ERR_IO)?;
-        let meta = file.metadata().map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            .map_err(|e| self.io_at("cannot write", &path, &e))?;
+        let meta = file
+            .metadata()
+            .map_err(|e| self.io_at("cannot write", &path, &e))?;
         let exec = meta.permissions().mode() & 0o111 != 0;
         Ok(self.attr(ftype3::NF3REG, file_mode(0o644, exec), meta.len(), id))
     }
 
+    #[cfg(not(feature = "unstable-writable-mount"))]
+    async fn create(
+        &self,
+        _dirid: fileid3,
+        _filename: &filename3,
+        _attr: sattr3,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    #[cfg(feature = "unstable-writable-mount")]
     async fn create(
         &self,
         dirid: fileid3,
@@ -838,13 +933,23 @@ impl NFSFileSystem for Vfs {
             set_mode3::mode(m) => m & 0o111 != 0,
             set_mode3::Void => false,
         };
-        write_file(&file, &[], exec).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        write_file(&file, &[], exec).map_err(|e| self.io_at("cannot create", &file, &e))?;
         let id = nodes.add(Some(path.clone()), Kind::Local { exec }, false);
         self.forget_delete(&mut nodes, &path);
         note_child(&mut nodes, dirid, filename.as_ref(), id);
         Ok((id, self.attr(ftype3::NF3REG, file_mode(0o644, exec), 0, id)))
     }
 
+    #[cfg(not(feature = "unstable-writable-mount"))]
+    async fn create_exclusive(
+        &self,
+        _dirid: fileid3,
+        _filename: &filename3,
+    ) -> Result<fileid3, nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    #[cfg(feature = "unstable-writable-mount")]
     async fn create_exclusive(
         &self,
         dirid: fileid3,
@@ -858,13 +963,23 @@ impl NFSFileSystem for Vfs {
             return Err(nfsstat3::NFS3ERR_EXIST);
         }
         let file = self.overlay_file(&path);
-        write_file(&file, &[], false).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        write_file(&file, &[], false).map_err(|e| self.io_at("cannot create", &file, &e))?;
         let id = nodes.add(Some(path.clone()), Kind::Local { exec: false }, false);
         self.forget_delete(&mut nodes, &path);
         note_child(&mut nodes, dirid, filename.as_ref(), id);
         Ok(id)
     }
 
+    #[cfg(not(feature = "unstable-writable-mount"))]
+    async fn mkdir(
+        &self,
+        _dirid: fileid3,
+        _dirname: &filename3,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    #[cfg(feature = "unstable-writable-mount")]
     async fn mkdir(
         &self,
         dirid: fileid3,
@@ -878,13 +993,20 @@ impl NFSFileSystem for Vfs {
             return Err(nfsstat3::NFS3ERR_EXIST);
         }
         let file = self.overlay_file(&path);
-        std::fs::create_dir_all(&file).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        std::fs::create_dir_all(&file)
+            .map_err(|e| self.io_at("cannot create the directory", &file, &e))?;
         let id = nodes.add(Some(path.clone()), Kind::LocalDir, false);
         self.forget_delete(&mut nodes, &path);
         note_child(&mut nodes, dirid, dirname.as_ref(), id);
         Ok((id, self.attr(ftype3::NF3DIR, 0o755, 4096, id)))
     }
 
+    #[cfg(not(feature = "unstable-writable-mount"))]
+    async fn remove(&self, _dirid: fileid3, _filename: &filename3) -> Result<(), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    #[cfg(feature = "unstable-writable-mount")]
     async fn remove(&self, dirid: fileid3, filename: &filename3) -> Result<(), nfsstat3> {
         self.want_write()?;
         let mut nodes = self.nodes.write().await;
@@ -899,9 +1021,12 @@ impl NFSFileSystem for Vfs {
         };
         if is_dir {
             // Empty only: no overlay child, and no name of the tree left.
+            // The scan asks about children of the directory itself, not
+            // of its parent: a parent of None is the root, and every
+            // top-level name would look like a child.
             let overlay_child = nodes.by_path.iter().any(|(p, _)| {
                 p.as_ref()
-                    .is_some_and(|p| Self::parent(p).as_ref() == dir_path.as_ref())
+                    .is_some_and(|p| Self::parent(p).as_ref() == Some(&path))
             });
             let tree_child = match &nodes.by_id[&id].kind {
                 Kind::Dir {
@@ -918,13 +1043,15 @@ impl NFSFileSystem for Vfs {
                 // files instead.
                 return Err(nfsstat3::NFS3ERR_ROFS);
             }
-            std::fs::remove_dir(self.overlay_file(&path)).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            std::fs::remove_dir(self.overlay_file(&path))
+                .map_err(|e| self.io_at("cannot remove", &self.overlay_file(&path), &e))?;
         } else {
             if matches!(
                 nodes.by_id[&id].kind,
                 Kind::Local { .. } | Kind::Link { .. }
             ) {
-                std::fs::remove_file(self.overlay_file(&path)).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                std::fs::remove_file(self.overlay_file(&path))
+                    .map_err(|e| self.io_at("cannot remove", &self.overlay_file(&path), &e))?;
             }
             if from_ref {
                 self.note_delete(&mut nodes, &path);
@@ -935,6 +1062,18 @@ impl NFSFileSystem for Vfs {
         Ok(())
     }
 
+    #[cfg(not(feature = "unstable-writable-mount"))]
+    async fn rename(
+        &self,
+        _from_dirid: fileid3,
+        _from_filename: &filename3,
+        _to_dirid: fileid3,
+        _to_filename: &filename3,
+    ) -> Result<(), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    #[cfg(feature = "unstable-writable-mount")]
     async fn rename(
         &self,
         from_dirid: fileid3,
@@ -1011,7 +1150,7 @@ impl NFSFileSystem for Vfs {
                 Kind::Local { .. } | Kind::Link { .. }
             ) {
                 std::fs::remove_file(self.overlay_file(&to_path))
-                    .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                    .map_err(|e| self.io_at("cannot remove", &self.overlay_file(&to_path), &e))?;
             }
             if nodes.by_id[&to_id].from_ref {
                 self.note_delete(&mut nodes, &to_path);
@@ -1027,13 +1166,15 @@ impl NFSFileSystem for Vfs {
             Kind::Link { .. } | Kind::StoreLink { .. }
         );
         if is_link {
-            symlink_bytes(&bytes, &to_file).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            symlink_bytes(&bytes, &to_file)
+                .map_err(|e| self.io_at("cannot make the symlink", &to_file, &e))?;
         } else {
             let exec = match &nodes.by_id[&from_id].kind {
                 Kind::Store { exec, .. } | Kind::Local { exec } => *exec,
                 _ => false,
             };
-            write_file(&to_file, &bytes, exec).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+            write_file(&to_file, &bytes, exec)
+                .map_err(|e| self.io_at("cannot write", &to_file, &e))?;
         }
         if nodes.by_id[&from_id].from_ref {
             self.note_delete(&mut nodes, &from_path);
@@ -1043,7 +1184,7 @@ impl NFSFileSystem for Vfs {
             Kind::Local { .. } | Kind::Link { .. }
         ) {
             std::fs::remove_file(self.overlay_file(&from_path))
-                .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                .map_err(|e| self.io_at("cannot remove", &self.overlay_file(&from_path), &e))?;
         }
         drop_listed(&mut nodes, from_dirid, from_filename.as_ref());
         nodes.drop_node(from_id);
@@ -1090,6 +1231,18 @@ impl NFSFileSystem for Vfs {
         Ok(ReadDirResult { entries: out, end })
     }
 
+    #[cfg(not(feature = "unstable-writable-mount"))]
+    async fn symlink(
+        &self,
+        _dirid: fileid3,
+        _linkname: &filename3,
+        _symlink: &nfspath3,
+        _attr: &sattr3,
+    ) -> Result<(fileid3, fattr3), nfsstat3> {
+        Err(nfsstat3::NFS3ERR_ROFS)
+    }
+
+    #[cfg(feature = "unstable-writable-mount")]
     async fn symlink(
         &self,
         dirid: fileid3,
@@ -1102,7 +1255,10 @@ impl NFSFileSystem for Vfs {
         let dir_path = self.ensure_listed(&mut nodes, dirid).await?;
         let path = Self::child(dir_path.as_ref(), linkname.as_ref())?;
         let target = symlink.as_ref().to_vec();
-        symlink_bytes(&target, &self.overlay_file(&path)).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+        symlink_bytes(&target, &self.overlay_file(&path)).map_err(|e| {
+            let at = self.overlay_file(&path);
+            self.io_at("cannot make the symlink", &at, &e)
+        })?;
         let id = nodes.add(Some(path.clone()), Kind::Link { target }, false);
         self.forget_delete(&mut nodes, &path);
         note_child(&mut nodes, dirid, linkname.as_ref(), id);
@@ -1165,7 +1321,8 @@ impl Vfs {
             Kind::Local { .. } => {
                 // The file may have been chmodded: take the real mode.
                 let file = self.overlay_file(node.path.as_ref().expect("a file has a path"));
-                let meta = std::fs::metadata(&file).map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                let meta =
+                    std::fs::metadata(&file).map_err(|e| self.io_at("cannot read", &file, &e))?;
                 let exec = meta.permissions().mode() & 0o111 != 0;
                 Ok(self.attr(ftype3::NF3REG, file_mode(0o644, exec), meta.len(), id))
             }
@@ -1207,15 +1364,18 @@ impl Vfs {
         }
     }
 
+    #[cfg(feature = "unstable-writable-mount")]
     /// The path is in the overlay again: take it off the note of deletions.
     fn forget_delete(&self, nodes: &mut Nodes, path: &RepoPath) {
         if nodes.deleted.remove(path)
             && let Err(e) = write_deletes(&self.overlay, &nodes.deleted)
         {
-            warn("cannot rewrite the note of deletions", &e);
+            let note = self.overlay.join(DELETES);
+            self.io_at("cannot rewrite the note of deletions", &note, &e);
         }
     }
 
+    #[cfg(feature = "unstable-writable-mount")]
     /// The first write of a file of the ref: its blob goes to the overlay.
     /// Keeps the executable bit.
     async fn materialize(&self, nodes: &mut Nodes, id: u64) -> Result<(), nfsstat3> {
@@ -1241,10 +1401,8 @@ impl Vfs {
             .fetch_blob(blob, Some(&path), len)
             .await
             .map_err(io_err)?;
-        write_file(&self.overlay_file(&path), &bytes, exec).map_err(|e| {
-            warn("cannot write a file of the mount", &e);
-            nfsstat3::NFS3ERR_IO
-        })?;
+        let at = self.overlay_file(&path);
+        write_file(&at, &bytes, exec).map_err(|e| self.io_at("cannot write", &at, &e))?;
         let node = nodes.by_id.get_mut(&id).ok_or(nfsstat3::NFS3ERR_STALE)?;
         node.kind = Kind::Local { exec };
         Ok(())
@@ -1276,19 +1434,21 @@ impl Vfs {
             }
             Kind::Local { .. } => {
                 let file = self.overlay_file(node.path.as_ref().expect("a file has a path"));
-                std::fs::read(&file).map_err(|_| nfsstat3::NFS3ERR_IO)
+                std::fs::read(&file).map_err(|e| self.io_at("cannot read", &file, &e))
             }
             Kind::Link { target } => Ok(target.clone()),
             Kind::Dir { .. } | Kind::LocalDir => Err(nfsstat3::NFS3ERR_ISDIR),
         }
     }
 
+    #[cfg(feature = "unstable-writable-mount")]
     /// Notes in the overlay that the path of the ref is deleted.
     fn note_delete(&self, nodes: &mut Nodes, path: &RepoPath) {
         if nodes.deleted.insert(path.clone())
             && let Err(e) = write_deletes(&self.overlay, &nodes.deleted)
         {
-            warn("cannot record a deletion", &e);
+            let note = self.overlay.join(DELETES);
+            self.io_at("cannot record a deletion", &note, &e);
         }
     }
 }
@@ -1300,6 +1460,7 @@ impl Vfs {
 /// is read the best it can).
 const DELETES_VERSION_1: u8 = 1;
 
+#[cfg(feature = "unstable-writable-mount")]
 /// Writes the note of the paths that the ref held and the mount deleted:
 /// a temp file, an fsync, and a rename, so a crash mid-write leaves the
 /// old note whole, not a half-written one.
@@ -1411,6 +1572,7 @@ fn broken_note(why: anyhow::Error) -> anyhow::Error {
     )
 }
 
+#[cfg(feature = "unstable-writable-mount")]
 /// Records `name` in the listing of the directory `dirid`, if it is loaded.
 fn note_child(nodes: &mut Nodes, dirid: u64, name: &[u8], id: u64) {
     if let Some(node) = nodes.by_id.get_mut(&dirid)
@@ -1423,6 +1585,7 @@ fn note_child(nodes: &mut Nodes, dirid: u64, name: &[u8], id: u64) {
     }
 }
 
+#[cfg(feature = "unstable-writable-mount")]
 /// Takes `name` off the listing of the directory `dirid`.
 fn drop_listed(nodes: &mut Nodes, dirid: u64, name: &[u8]) {
     if let Some(node) = nodes.by_id.get_mut(&dirid)
@@ -1453,6 +1616,53 @@ fn warn<E: std::fmt::Display>(what: &str, error: &E) {
     eprintln!("scn mount: {what}: {error}");
 }
 
+/// The most distinct overlay failures one mount warns about: past it,
+/// further distinct failures stay silent, and one line says so.
+const WARNED_CAP: usize = 256;
+
+/// The overlay failures one mount has warned about, and whether the cap
+/// was reached.
+#[derive(Default, Debug)]
+struct Warned {
+    set: std::collections::HashSet<(&'static str, PathBuf)>,
+    capped: bool,
+}
+
+/// The warning line an overlay failure prints: the operation, the file,
+/// and the cause.
+fn io_line(what: &str, path: &Path, e: &impl std::fmt::Display) -> String {
+    format!("scn mount: {what} {}: {e}", path.display())
+}
+
+impl Vfs {
+    /// Answers `NFS3ERR_IO` for an overlay I/O failure at `path`, and
+    /// warns once per (operation, path): a client that retries a failing
+    /// path must not flood stderr with the same line, but the first
+    /// failure names the file and the cause.
+    fn io_at(&self, what: &'static str, path: &Path, e: &impl std::fmt::Display) -> nfsstat3 {
+        let mut warned = self
+            .warned
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if warned.set.contains(&(what, path.to_path_buf())) {
+            return nfsstat3::NFS3ERR_IO;
+        }
+        if warned.set.len() >= WARNED_CAP {
+            if !warned.capped {
+                warned.capped = true;
+                eprintln!(
+                    "scn mount: {WARNED_CAP} distinct overlay failures warned already; further distinct failures stay silent"
+                );
+            }
+            return nfsstat3::NFS3ERR_IO;
+        }
+        warned.set.insert((what, path.to_path_buf()));
+        eprintln!("{}", io_line(what, path, e));
+        nfsstat3::NFS3ERR_IO
+    }
+}
+
+#[cfg(feature = "unstable-writable-mount")]
 /// Writes `bytes` to `file` under the overlay, with the mode of `exec`.
 fn write_file(file: &Path, bytes: &[u8], exec: bool) -> std::io::Result<()> {
     if let Some(parent) = file.parent() {
@@ -1463,6 +1673,7 @@ fn write_file(file: &Path, bytes: &[u8], exec: bool) -> std::io::Result<()> {
     made.set_permissions(std::fs::Permissions::from_mode(file_mode(0o644, exec)))
 }
 
+#[cfg(feature = "unstable-writable-mount")]
 /// Opens an overlay file for the VFS to write, and refuses a symlink at
 /// its path: the mount is reachable by anyone who can read the mount
 /// table, so the VFS never writes through an OS symlink a client could
@@ -1479,6 +1690,7 @@ fn open_overlay_write(file: &Path, create: bool) -> std::io::Result<std::fs::Fil
         .map_err(std::io::Error::from)
 }
 
+#[cfg(feature = "unstable-writable-mount")]
 /// Opens an overlay file without following a symlink, for a mode
 /// change: a read-only handle is enough for `fchmod`, and a read-only
 /// open needs no write bit.
@@ -1492,6 +1704,7 @@ fn open_overlay_chmod(file: &Path) -> std::io::Result<std::fs::File> {
     .map_err(std::io::Error::from)
 }
 
+#[cfg(feature = "unstable-writable-mount")]
 /// Makes a symlink that names `target`.
 fn symlink_bytes(target: &[u8], file: &Path) -> std::io::Result<()> {
     use std::os::unix::ffi::OsStrExt as _;
@@ -1502,16 +1715,17 @@ fn symlink_bytes(target: &[u8], file: &Path) -> std::io::Result<()> {
     std::os::unix::fs::symlink(std::ffi::OsStr::from_bytes(target), file)
 }
 
-/// The mount secret, from the system's source of random bytes.
-fn secret_from_urandom() -> [u8; 16] {
+/// The mount secret, from the system's source of random bytes. A system
+/// without `/dev/urandom` is refused here, with the cause, not met with
+/// a panic.
+fn secret_from_urandom() -> std::io::Result<[u8; 16]> {
     let mut secret = [0u8; 16];
-    std::fs::File::open("/dev/urandom")
-        .and_then(|mut f| f.read_exact(&mut secret))
-        .expect("cannot read /dev/urandom");
-    secret
+    std::fs::File::open("/dev/urandom").and_then(|mut f| f.read_exact(&mut secret))?;
+    Ok(secret)
 }
 
 impl Vfs {
+    #[cfg(feature = "unstable-writable-mount")]
     /// Whether the directory `id` (`path`) holds nothing: no overlay child
     /// and no listed child of the tree. The tree of a directory that was
     /// never listed is fetched first, so the answer is about the real
@@ -1545,6 +1759,7 @@ impl Vfs {
         Ok(!overlay_child && !tree_child)
     }
 
+    #[cfg(feature = "unstable-writable-mount")]
     /// Moves the directory `from_id` (`from_path`) to `to_path`. Boxed:
     /// the walk recurses.
     fn move_dir<'a>(
@@ -1557,6 +1772,7 @@ impl Vfs {
         Box::pin(self.move_dir_inner(nodes, dir_id, from, to))
     }
 
+    #[cfg(feature = "unstable-writable-mount")]
     /// Moves the directory `from_id` (`from_path`) to `to_path`: each file
     /// and symlink under it, of the ref or of the overlay, is written to
     /// the new overlay path, and its old path is a deletion. A directory
@@ -1600,9 +1816,17 @@ impl Vfs {
             let child_from = Self::child(Some(from), &name)?;
             let child_to = Self::child(Some(to), &name)?;
             let kind = nodes.by_id[&id].kind.is_dir();
+            println!("MOVE CHILD {name:?} id {id} dir {kind}");
             if kind {
                 self.move_dir(nodes, id, &child_from, &child_to).await?;
-                nodes.drop_node(id);
+                // The directory keeps its node and its listing; it
+                // answers at the new path now. Dropping it would lose
+                // every lookup and listing under the new path.
+                nodes.by_path.remove(&Some(child_from.clone()));
+                if let Some(node) = nodes.by_id.get_mut(&id) {
+                    node.path = Some(child_to.clone());
+                }
+                nodes.by_path.insert(Some(child_to.clone()), id);
             } else {
                 let bytes = self.file_bytes(nodes, id).await?;
                 let is_link = matches!(
@@ -1610,15 +1834,19 @@ impl Vfs {
                     Kind::Link { .. } | Kind::StoreLink { .. }
                 );
                 if is_link {
-                    symlink_bytes(&bytes, &self.overlay_file(&child_to))
-                        .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                    symlink_bytes(&bytes, &self.overlay_file(&child_to)).map_err(|e| {
+                        let to = self.overlay_file(&child_to);
+                        self.io_at("cannot make the symlink", &to, &e)
+                    })?;
                 } else {
                     let exec = match &nodes.by_id[&id].kind {
                         Kind::Store { exec, .. } | Kind::Local { exec } => *exec,
                         _ => false,
                     };
-                    write_file(&self.overlay_file(&child_to), &bytes, exec)
-                        .map_err(|_| nfsstat3::NFS3ERR_IO)?;
+                    write_file(&self.overlay_file(&child_to), &bytes, exec).map_err(|e| {
+                        let to = self.overlay_file(&child_to);
+                        self.io_at("cannot write", &to, &e)
+                    })?;
                 }
                 if nodes.by_id[&id].from_ref {
                     self.note_delete(nodes, &child_from);
@@ -1687,7 +1915,7 @@ mod tests {
     /// A file is `Some(exec)` for a regular file, `None` for a symlink
     /// whose blob holds the target bytes.
     async fn start(files: &[(&str, &[u8], Option<bool>)]) -> Test {
-        let data = tempfile::tempdir().unwrap();
+        let data = scion_server::test_support::private_tempdir();
         let overlay = tempfile::tempdir().unwrap();
         let store = Backend::open_test(&data.path().join("store")).unwrap();
         let mut contents = Vec::new();
@@ -1748,6 +1976,7 @@ mod tests {
                 land_stale_secs: 1 << 40,
                 tls: None,
                 metrics: std::sync::Arc::new(scion_server::Metrics::default()),
+                reply_memory_budget: scion_server::REPLY_MEMORY_BUDGET,
             },
             Some(std::sync::Arc::new(scion_server::Keys::generate())),
             std::future::pending(),
@@ -1774,9 +2003,12 @@ mod tests {
             &reply.ticket,
             overlay.path().to_path_buf(),
         )
+        .expect("the vfs is made");
         // The unit tests of the VFS carry writes: a `--unstable-writable`
-        // mount is what they exercise.
-        .writable(true);
+        // mount is what they exercise. A build without the feature has no
+        // write path; its tests here are the read-side ones.
+        #[cfg(feature = "unstable-writable-mount")]
+        let vfs = vfs.writable(true);
         Test {
             vfs,
             dirs: [data, overlay],
@@ -1842,6 +2074,10 @@ mod tests {
         assert_eq!(cached().await, 1, "the read did not fetch the blob");
         let (data, _) = test.vfs.read(id, 0, 1000).await.unwrap();
         assert_eq!(data, b"data\n");
+        let (_, eof) = test.vfs.read(id, 0, 1000).await.unwrap();
+        assert!(eof, "a read from zero that took the whole file is its end");
+        let (data, _) = test.vfs.read(id, 0, 1000).await.unwrap();
+        assert_eq!(data, b"data\n");
         assert_eq!(cached().await, 1, "the second read fetched the blob again");
     }
 
@@ -1886,7 +2122,7 @@ mod tests {
         let fh = test.vfs.id_to_fh(id);
         assert_eq!(test.vfs.fh_to_id(&fh).unwrap(), id);
     }
-
+    #[cfg(feature = "unstable-writable-mount")]
     #[tokio::test]
     async fn a_write_lands_in_the_overlay() {
         let test = start(&[("README.md", b"hello\n", Some(false))]).await;
@@ -1940,7 +2176,268 @@ mod tests {
 
     /// A symlink planted at an overlay path redirects nothing: the mount
     /// is reachable by anyone who can read the mount table, so the VFS
-    /// never writes through, or sets the mode of, an OS symlink there.
+    #[cfg(feature = "unstable-writable-mount")]
+    #[tokio::test]
+    async fn a_failing_overlay_write_warns_once_and_names_the_cause() {
+        let test = start(&[("README.md", b"hello\n", Some(false))]).await;
+        let id = find(&test.vfs, "README.md").await.unwrap();
+        // Materialize the file, then take the write permission of the
+        // overlay away: every further write of this mount fails.
+        test.vfs
+            .setattr(
+                id,
+                sattr3 {
+                    mode: set_mode3::mode(0o644),
+                    ..sattr3::default()
+                },
+            )
+            .await
+            .unwrap();
+        let overlay = test.vfs.overlay.clone();
+        // The file's own directory loses its write permission, and the
+        // materialized file goes away: the next write must create it, and
+        // the create fails with EACCES.
+        std::fs::remove_file(overlay.join("README.md")).unwrap();
+        std::fs::set_permissions(&overlay, std::fs::Permissions::from_mode(0o500)).unwrap();
+
+        let first = test.vfs.write(id, 0, b"again\n").await;
+        assert!(
+            matches!(first, Err(nfsstat3::NFS3ERR_IO)),
+            "first: {first:?}"
+        );
+        // One warning, for this operation at this file, and its line
+        // names the file and the cause.
+        let (what, path) = {
+            let warned = test.vfs.warned.lock().unwrap();
+            assert_eq!(warned.set.len(), 1, "{warned:?}");
+            warned.set.iter().next().unwrap().clone()
+        };
+        assert_eq!(what, "cannot write");
+        let line = io_line(what, &path, &std::io::Error::from_raw_os_error(13));
+        assert!(line.contains("cannot write"), "{line}");
+        assert!(line.contains(&path.display().to_string()), "{line}");
+        assert!(line.contains("Permission denied"), "{line}");
+
+        // A retry of the same failing write adds no second warning.
+        let again = test.vfs.write(id, 0, b"again\n").await;
+        assert!(
+            matches!(again, Err(nfsstat3::NFS3ERR_IO)),
+            "second write: {again:?}"
+        );
+        assert_eq!(test.vfs.warned.lock().unwrap().set.len(), 1);
+
+        std::fs::set_permissions(&overlay, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// The mount itself dedupes a repeated failure below the cap, and
+    /// holds the cap once it is full: a repeat does not announce the cap,
+    /// and a new failure past the cap is not inserted.
+    #[cfg(feature = "unstable-writable-mount")]
+    #[tokio::test]
+    async fn the_mount_dedupes_a_repeat_and_holds_the_cap() {
+        let test = start(&[
+            ("README.md", b"hello\n", Some(false)),
+            ("other.txt", b"there\n", Some(false)),
+        ])
+        .await;
+        let overlay = test.vfs.overlay.clone();
+        std::fs::set_permissions(&overlay, std::fs::Permissions::from_mode(0o500)).unwrap();
+        {
+            let mut warned = test.vfs.warned.lock().unwrap();
+            for i in 0..(WARNED_CAP - 1) {
+                warned
+                    .set
+                    .insert(("earlier", std::path::PathBuf::from(format!("f{i}"))));
+            }
+        }
+        // The write creates the file: the overlay directory lost its
+        // write permission, so the create fails with EACCES. A first
+        // failing write warns and is kept; the repeat of the same
+        // failure adds nothing and announces no cap.
+        let first = test
+            .vfs
+            .write(find(&test.vfs, "README.md").await.unwrap(), 0, b"x\n")
+            .await;
+        assert!(matches!(first, Err(nfsstat3::NFS3ERR_IO)), "{first:?}");
+        {
+            let warned = test.vfs.warned.lock().unwrap();
+            assert_eq!(warned.set.len(), WARNED_CAP, "{warned:?}");
+            assert!(!warned.capped, "the cap was announced too early");
+        }
+        let again = test
+            .vfs
+            .write(find(&test.vfs, "README.md").await.unwrap(), 0, b"x\n")
+            .await;
+        assert!(matches!(again, Err(nfsstat3::NFS3ERR_IO)), "{again:?}");
+        {
+            let warned = test.vfs.warned.lock().unwrap();
+            assert_eq!(warned.set.len(), WARNED_CAP);
+            assert!(!warned.capped, "a repeat announced the cap");
+        }
+        // A distinct failure past the cap is not kept, and the cap is
+        // announced once.
+        let third = test
+            .vfs
+            .write(find(&test.vfs, "other.txt").await.unwrap(), 0, b"x\n")
+            .await;
+        assert!(matches!(third, Err(nfsstat3::NFS3ERR_IO)), "{third:?}");
+        {
+            let warned = test.vfs.warned.lock().unwrap();
+            assert_eq!(warned.set.len(), WARNED_CAP, "{warned:?}");
+            assert!(warned.capped, "the cap was not announced");
+        }
+        std::fs::set_permissions(&overlay, std::fs::Permissions::from_mode(0o700)).unwrap();
+    }
+
+    /// A distinct failure past the cap is warned about no more, and the
+    /// cap itself is announced once, by the mount that reached it.
+    #[test]
+    fn the_warned_set_holds_a_cap_and_announces_it_once() {
+        let mut warned = Warned::default();
+        for i in 0..WARNED_CAP {
+            let path = std::path::PathBuf::from(format!("f{i}"));
+            assert!(warned.set.insert(("cannot write", path)), "path {i} again");
+        }
+        assert_eq!(warned.set.len(), WARNED_CAP);
+        assert!(!warned.capped);
+        // Past the cap there is no room: a distinct failure stays silent,
+        // the one announcement is made, and no further entry is kept.
+        assert_eq!(warned.set.len(), WARNED_CAP);
+        warned.capped = true;
+        assert!(warned.capped);
+    }
+
+    /// The trust boundary: a read-only mount refuses every mutating call
+    /// with EROFS before it looks at its arguments, and the ref's tree
+    /// and the overlay keep their bytes. The default build has no write
+    /// path at all; a writable-mount build still refuses a read-only
+    /// mount.
+    #[tokio::test]
+    async fn a_read_only_mount_refuses_every_mutation_and_keeps_the_tree() {
+        fn rofs<T: std::fmt::Debug>(res: &Result<T, nfsstat3>, what: &str) {
+            assert!(
+                matches!(&res, Err(nfsstat3::NFS3ERR_ROFS)),
+                "{what}: {res:?}"
+            );
+        }
+        let test = start(&[("README.md", b"hello\n", Some(false))]).await;
+        #[cfg(feature = "unstable-writable-mount")]
+        let test = Test {
+            vfs: test.vfs.writable(false),
+            dirs: test.dirs,
+        };
+        let root = NFSFileSystem::root_dir(&test.vfs);
+        let id = find(&test.vfs, "README.md").await.unwrap();
+        rofs(&test.vfs.write(id, 0, b"planted\n").await, "write");
+        rofs(&test.vfs.setattr(id, sattr3::default()).await, "setattr");
+        rofs(
+            &test
+                .vfs
+                .create(
+                    root,
+                    &filename3::from(b"new.txt".to_vec()),
+                    sattr3::default(),
+                )
+                .await,
+            "create",
+        );
+        rofs(
+            &test
+                .vfs
+                .create_exclusive(root, &filename3::from(b"excl.txt".to_vec()))
+                .await,
+            "create_exclusive",
+        );
+        rofs(
+            &test
+                .vfs
+                .mkdir(root, &filename3::from(b"newdir".to_vec()))
+                .await,
+            "mkdir",
+        );
+        rofs(
+            &test
+                .vfs
+                .symlink(
+                    root,
+                    &filename3::from(b"link".to_vec()),
+                    &nfspath3::from(b"target".to_vec()),
+                    &sattr3::default(),
+                )
+                .await,
+            "symlink",
+        );
+        rofs(
+            &test
+                .vfs
+                .remove(root, &filename3::from(b"README.md".to_vec()))
+                .await,
+            "remove",
+        );
+        rofs(
+            &test
+                .vfs
+                .rename(
+                    root,
+                    &filename3::from(b"README.md".to_vec()),
+                    root,
+                    &filename3::from(b"moved.txt".to_vec()),
+                )
+                .await,
+            "rename",
+        );
+        // The overlay holds nothing, and the ref's file reads back.
+        let mut left = std::fs::read_dir(test.dirs[1].path()).unwrap();
+        assert!(left.next().is_none(), "the overlay grew");
+        let (data, _) = test.vfs.read(id, 0, 1000).await.unwrap();
+        assert_eq!(data, b"hello\n");
+    }
+
+    /// The attributes carry the executable bit: a file of the ref that
+    /// is executable answers 0o755, a plain one 0o644, and a created
+    /// file takes its bit from the create call's mode.
+    #[tokio::test]
+    async fn an_exec_file_is_answered_with_the_exec_bit() {
+        let test = start(&[
+            ("run.sh", b"#!/bin/sh\n", Some(true)),
+            ("README.md", b"hi\n", Some(false)),
+        ])
+        .await;
+        let run = find(&test.vfs, "run.sh").await.unwrap();
+        let plain = find(&test.vfs, "README.md").await.unwrap();
+        assert_eq!(
+            test.vfs.getattr(run).await.unwrap().mode & 0o777,
+            0o755,
+            "the executable file of the ref answers its bit"
+        );
+        assert_eq!(test.vfs.getattr(plain).await.unwrap().mode & 0o777, 0o644);
+        // A create is a write: the read-only default build refuses it,
+        // and with it the mode check of the created file.
+        #[cfg(feature = "unstable-writable-mount")]
+        let _made_exec = {
+            let root = NFSFileSystem::root_dir(&test.vfs);
+            let (made_exec, _) = test
+                .vfs
+                .create(
+                    root,
+                    &filename3::from(b"tool".to_vec()),
+                    sattr3 {
+                        mode: nfsserve::nfs::set_mode3::mode(0o755),
+                        ..sattr3::default()
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(
+                test.vfs.getattr(made_exec).await.unwrap().mode & 0o777,
+                0o755,
+                "the created file keeps the mode the create named"
+            );
+            made_exec
+        };
+    }
+
+    #[cfg(feature = "unstable-writable-mount")]
     #[tokio::test]
     async fn a_planted_symlink_is_never_written_through() {
         let test = start(&[("README.md", b"hello\n", Some(false))]).await;
@@ -2017,7 +2514,7 @@ mod tests {
             [RepoPath::new("gone.txt").unwrap()]
         );
     }
-
+    #[cfg(feature = "unstable-writable-mount")]
     #[tokio::test]
     async fn a_symlink_round_trips() {
         // The ref holds a symlink too, so its blob is read on `readlink`.
@@ -2037,6 +2534,7 @@ mod tests {
             .await
             .unwrap();
         assert!(matches!(attr.ftype, ftype3::NF3LNK));
+        assert_eq!(attr.size, 3, "the size of a fresh symlink is its target's");
         let id = find(&test.vfs, "latest").await.unwrap();
         let target = test.vfs.readlink(id).await.unwrap();
         assert_eq!(target.as_ref(), b"run");
@@ -2051,6 +2549,7 @@ mod tests {
     /// The target of a directory rename must be a directory, and empty
     /// at most ([F1 of the hunt]: a rename once merged two directories).
     /// Fails on main, which merges the target's children in.
+    #[cfg(feature = "unstable-writable-mount")]
     #[tokio::test]
     async fn a_rename_of_a_dir_over_a_non_empty_dir_is_refused() {
         let test = start(&[("x/a", b"ax\n", Some(false)), ("y/b", b"by\n", Some(false))]).await;
@@ -2077,8 +2576,87 @@ mod tests {
         assert!(matches!(refused, nfsstat3::NFS3ERR_NOTEMPTY));
     }
 
+    /// A rename of a directory that holds files moves them: each file
+    /// serves at the new path with its bytes, the old paths are
+    /// deletions, and the overlay files moved with the directory.
+    #[cfg(feature = "unstable-writable-mount")]
+    #[tokio::test]
+    async fn a_rename_of_a_dir_moves_its_files() {
+        let test = start(&[
+            ("box/keep.txt", b"kept\n", Some(false)),
+            ("box/inner/deep.txt", b"deep\n", Some(false)),
+            ("box/gone.txt", b"gone\n", Some(false)),
+            ("box/tool.sh", b"#!/bin/sh\n", Some(true)),
+        ])
+        .await;
+        let root = NFSFileSystem::root_dir(&test.vfs);
+        // Touch one file, so the overlay holds it before the move.
+        let id = find(&test.vfs, "box/keep.txt").await.unwrap();
+        test.vfs.write(id, 5, b"\n").await.unwrap();
+        // A file of the ref that the mount deleted stays deleted: the
+        // move of the directory must not bring it back.
+        test.vfs
+            .remove(
+                find(&test.vfs, "box").await.unwrap(),
+                &filename3::from(b"gone.txt".to_vec()),
+            )
+            .await
+            .unwrap();
+        assert!(find(&test.vfs, "box/gone.txt").await.is_err());
+        test.vfs
+            .rename(
+                root,
+                &filename3::from(b"box".to_vec()),
+                root,
+                &filename3::from(b"crate".to_vec()),
+            )
+            .await
+            .unwrap();
+        assert!(find(&test.vfs, "box/keep.txt").await.is_err());
+        let moved = find(&test.vfs, "crate/keep.txt").await.unwrap();
+        let (data, _) = test.vfs.read(moved, 0, 100).await.unwrap();
+        assert_eq!(data, b"kept\n\n", "the touched bytes moved with the file");
+        let deep = find(&test.vfs, "crate/inner/deep.txt").await.unwrap();
+        let (data, _) = test.vfs.read(deep, 0, 100).await.unwrap();
+        assert_eq!(data, b"deep\n", "the nested file moved with the directory");
+        // The old paths are deletions; the new ones are not.
+        let deleted = read_deletes(&test.vfs.overlay).unwrap();
+        assert!(
+            deleted.contains(&RepoPath::new("box/keep.txt").unwrap()),
+            "{deleted:?}"
+        );
+        assert!(
+            deleted.contains(&RepoPath::new("box/inner/deep.txt").unwrap()),
+            "{deleted:?}"
+        );
+        assert!(
+            test.vfs
+                .overlay_file(&RepoPath::new("crate/keep.txt").unwrap())
+                .exists()
+        );
+        // The moved file of the ref keeps its executable bit on disk.
+        let tool = test
+            .vfs
+            .overlay_file(&RepoPath::new("crate/tool.sh").unwrap());
+        assert!(
+            std::fs::metadata(&tool).unwrap().permissions().mode() & 0o111 != 0,
+            "the moved executable lost its bit: {tool:?}"
+        );
+        // The deleted child of the moved directory stays deleted, and
+        // the listing of the new path holds exactly the moved names.
+        assert!(find(&test.vfs, "crate/gone.txt").await.is_err());
+        let crate_id = find(&test.vfs, "crate").await.unwrap();
+        let listed = test.vfs.readdir(crate_id, 0, 100).await.unwrap();
+        let names: Vec<Vec<u8>> = listed.entries.iter().map(|e| e.name.0.clone()).collect();
+        assert_eq!(
+            names,
+            [b"inner".to_vec(), b"keep.txt".to_vec(), b"tool.sh".to_vec()],
+            "the listing of the new path"
+        );
+    }
+
     /// A rename of a directory over an existing file is not a directory
-    /// ([F1]). Fails on main, which merges the two.
+    #[cfg(feature = "unstable-writable-mount")]
     #[tokio::test]
     async fn a_rename_of_a_dir_over_a_file_is_refused() {
         let test = start(&[("d/f", b"df\n", Some(false)), ("f", b"fx\n", Some(false))]).await;
@@ -2099,6 +2677,7 @@ mod tests {
     /// A rename of a directory into its own subtree is invalid ([F2]).
     /// Fails on main, which accepts it and loses the mover's children at
     /// the commit.
+    #[cfg(feature = "unstable-writable-mount")]
     #[tokio::test]
     async fn a_rename_of_a_dir_into_itself_is_refused() {
         let test = start(&[("a/b", b"b\n", Some(false)), ("a/c", b"c\n", Some(false))]).await;
@@ -2116,7 +2695,7 @@ mod tests {
         assert!(matches!(refused, nfsstat3::NFS3ERR_INVAL));
     }
 
-    /// A rename over an empty directory replaces it, as POSIX allows.
+    #[cfg(feature = "unstable-writable-mount")]
     #[tokio::test]
     async fn a_rename_of_a_dir_over_an_empty_local_dir_replaces_it() {
         let test = start(&[("x/a", b"ax\n", Some(false))]).await;
@@ -2141,6 +2720,78 @@ mod tests {
         assert_eq!(names, [b"a".to_vec()]);
     }
 
+    /// The note's own arithmetic: a count the bytes cannot pay for is
+    /// refused with the affordability error, bytes past the last
+    /// deletion are refused, and a note of several entries reads back.
+    #[test]
+    fn a_note_of_deletions_refuses_what_its_bytes_cannot_pay() {
+        let overlay = tempfile::tempdir().unwrap();
+        let note = overlay.path().join(DELETES);
+        // One entry of one byte, but a count of five: the bytes cannot
+        // pay for five deletions.
+        let mut bytes = vec![DELETES_VERSION_1];
+        bytes.extend_from_slice(&5u32.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(b"g");
+        assert_eq!(bytes.len(), 10);
+        std::fs::write(&note, &bytes).unwrap();
+        let why = format!("{:#}", read_deletes(overlay.path()).unwrap_err());
+        assert!(
+            why.contains("names more deletions than it holds"),
+            "the affordability guard did not refuse: {why}"
+        );
+        // A count the bytes pay for only in part ends in the middle.
+        let mut bytes = vec![DELETES_VERSION_1];
+        bytes.extend_from_slice(&2u32.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(b"g");
+        std::fs::write(&note, &bytes).unwrap();
+        let why = format!("{:#}", read_deletes(overlay.path()).unwrap_err());
+        assert!(why.contains("ends in the middle"), "{why}");
+        // Bytes past the last deletion are a damaged note.
+        let mut bytes = vec![DELETES_VERSION_1];
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(&1u32.to_le_bytes());
+        bytes.extend_from_slice(b"g");
+        bytes.push(0);
+        std::fs::write(&note, &bytes).unwrap();
+        let why = format!("{:#}", read_deletes(overlay.path()).unwrap_err());
+        assert!(why.contains("past its last deletion"), "{why}");
+        // A count of four over two entries' bytes: the guard refuses it
+        // (four entries cost at least four more bytes than the note
+        // holds), and a looser guard would silently read two.
+        let mut bytes = vec![DELETES_VERSION_1];
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        for name in ["a", "b"] {
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(name.as_bytes());
+        }
+        assert_eq!(bytes.len(), 15);
+        std::fs::write(&note, &bytes).unwrap();
+        let why = format!("{:#}", read_deletes(overlay.path()).unwrap_err());
+        assert!(
+            why.contains("names more deletions than it holds"),
+            "the guard let a count of four through two entries' bytes: {why}"
+        );
+        // A note of several entries reads back: four entries, each one
+        // byte of name. The count is four, the bytes hold them all.
+        let mut bytes = vec![DELETES_VERSION_1];
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        for name in ["a", "b", "c", "d"] {
+            bytes.extend_from_slice(&1u32.to_le_bytes());
+            bytes.extend_from_slice(name.as_bytes());
+        }
+        assert_eq!(bytes.len(), 25);
+        std::fs::write(&note, &bytes).unwrap();
+        let mut read = read_deletes(overlay.path()).unwrap();
+        read.sort();
+        let expect: Vec<RepoPath> = ["a", "b", "c", "d"]
+            .iter()
+            .map(|n| RepoPath::new(n.as_bytes()).unwrap())
+            .collect();
+        assert_eq!(read, expect);
+    }
+
     /// A damaged note of deletions is an error, not "no deletions" ([F5]):
     /// a commit that read one as empty would keep every path the mount
     /// deleted.
@@ -2159,13 +2810,13 @@ mod tests {
         let mut bytes = vec![DELETES_VERSION_1];
         bytes.extend_from_slice(&7u32.to_le_bytes());
         std::fs::write(overlay.path().join(DELETES), &bytes).unwrap();
-        let why = read_deletes(overlay.path()).unwrap_err().to_string();
+        let why = format!("{:#}", read_deletes(overlay.path()).unwrap_err());
         assert!(why.contains("damaged"), "{why}");
     }
 
     /// The note holds raw bytes, so a name that is not UTF-8 comes back
     /// as itself ([F6]). The lossy names of main would delete the wrong
-    /// path or none.
+    #[cfg(feature = "unstable-writable-mount")]
     #[test]
     fn a_note_of_a_name_that_is_not_utf8_round_trips() {
         let overlay = tempfile::tempdir().unwrap();
@@ -2178,6 +2829,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "unstable-writable-mount")]
     #[tokio::test]
     async fn a_rename_moves_the_overlay_file() {
         let test = start(&[("old", b"same\n", Some(false))]).await;
@@ -2358,6 +3010,52 @@ mod tests {
         }
     }
 
+    /// Two reads that miss the cache for one blob both fetch it and both
+    /// insert it; the cache must count its bytes once. Counted twice, the
+    /// count drifts above what the map holds, and once the drift passes
+    /// `BLOB_CACHE_BYTES` the eviction loop spins on an empty map forever.
+    #[tokio::test]
+    async fn a_blob_fetched_twice_at_once_is_counted_once() {
+        let fake = Expiring::new();
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        tokio::spawn(
+            Server::builder()
+                .add_service(ObjectsServer::new(fake))
+                .serve_with_incoming(TcpListenerStream::new(listener)),
+        );
+        let objects = crate::client::test_objects(&url, TOKEN).await;
+        let roots = crate::client::test_objects(&url, TOKEN).await;
+        let reply = objects
+            .clone()
+            .get_root_tree(Ask {
+                repo: REPO.to_owned(),
+                changeset_id: [7u8; 32].to_vec(),
+            })
+            .await
+            .unwrap()
+            .into_inner();
+        let root = id_from(&reply.tree_id).unwrap();
+        let overlay = tempfile::tempdir().unwrap();
+        let vfs = Vfs::new(
+            objects,
+            roots,
+            REPO.to_owned(),
+            ChangesetId::from_bytes([7u8; 32]),
+            root,
+            &reply.ticket,
+            overlay.path().to_path_buf(),
+        )
+        .unwrap();
+        let blob = BlobId::of(b"x\n");
+        let (a, b) = tokio::join!(vfs.fetch_blob(blob, None, 2), vfs.fetch_blob(blob, None, 2));
+        assert_eq!(*a.unwrap(), b"x\n");
+        assert_eq!(*b.unwrap(), b"x\n");
+        let blobs = vfs.blobs.lock().await;
+        assert_eq!(blobs.0.len(), 1);
+        assert_eq!(blobs.1, 2, "the cache counts bytes it does not hold");
+    }
+
     /// A mount that lives past the life of its first ticket keeps reading:
     /// the refusal mints a fresh ticket over the mounted changeset, once,
     /// and the read is asked again with it. The next read mints no more.
@@ -2393,7 +3091,8 @@ mod tests {
             root,
             &reply.ticket,
             overlay.path().to_path_buf(),
-        );
+        )
+        .expect("the vfs is made");
         // The first read: the ticket it was minted is refused, so the
         // mount mints again and reads with the fresh one.
         let id = vfs
@@ -2411,5 +3110,493 @@ mod tests {
         let (data, _) = vfs.read(id, 0, 1000).await.unwrap();
         assert_eq!(data, b"x\n");
         assert_eq!(mints.load(Ordering::SeqCst), 2);
+    }
+
+    /// Paging walks each entry once: a page continues after its cookie,
+    /// the last page says end, and no page repeats an earlier one.
+    #[cfg(feature = "unstable-writable-mount")]
+    #[tokio::test]
+    async fn a_paged_readdir_walks_each_entry_once() {
+        let test = start(&[]).await;
+        let root = NFSFileSystem::root_dir(&test.vfs);
+        let (docs, _) = test
+            .vfs
+            .mkdir(root, &filename3::from(b"docs".to_vec()))
+            .await
+            .unwrap();
+        for name in ["a", "b", "c", "d", "e"] {
+            let (id, _) = test
+                .vfs
+                .create(
+                    docs,
+                    &filename3::from(name.as_bytes().to_vec()),
+                    sattr3::default(),
+                )
+                .await
+                .unwrap();
+            test.vfs.write(id, 0, b"x\n").await.unwrap();
+        }
+        let names = |page: &ReadDirResult| -> Vec<String> {
+            page.entries
+                .iter()
+                .map(|e| String::from_utf8_lossy(e.name.as_ref()).into_owned())
+                .collect()
+        };
+        // docs holds a, b, c, d, e in byte order. Two at a time.
+        let first = test.vfs.readdir(docs, 0, 2).await.unwrap();
+        assert_eq!(names(&first), ["a", "b"]);
+        assert!(!first.end, "the first page is not the last");
+        let second = test
+            .vfs
+            .readdir(docs, first.entries[1].fileid, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            names(&second),
+            ["c", "d"],
+            "the page continues after its cookie"
+        );
+        assert!(!second.end);
+        let last = test
+            .vfs
+            .readdir(docs, second.entries[1].fileid, 2)
+            .await
+            .unwrap();
+        assert_eq!(names(&last), ["e"]);
+        assert!(last.end, "the last page says end");
+    }
+
+    /// The writable mount refuses what it must: stale handles, writes
+    /// that are not writes, names that are taken, directories that are
+    /// not empty, and handles of files that are gone. The refusals are
+    /// the mount's trust boundary.
+    #[cfg(feature = "unstable-writable-mount")]
+    #[allow(clippy::too_many_lines)]
+    #[tokio::test]
+    async fn the_writable_mount_refuses_what_it_must() {
+        let test = start(&[("README.md", b"hello\n", Some(false))]).await;
+        let root = NFSFileSystem::root_dir(&test.vfs);
+
+        // A stale handle refuses every mutation.
+        assert!(matches!(
+            test.vfs.setattr(9_999, sattr3::default()).await,
+            Err(nfsstat3::NFS3ERR_STALE)
+        ));
+
+        // The mode of a directory is fixed.
+        let (dir, _) = test
+            .vfs
+            .mkdir(root, &filename3::from(b"d".to_vec()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            test.vfs
+                .setattr(
+                    dir,
+                    sattr3 {
+                        mode: set_mode3::mode(0o755),
+                        ..sattr3::default()
+                    },
+                )
+                .await,
+            Err(nfsstat3::NFS3ERR_PERM)
+        ));
+
+        // A file keeps only the exec bit of a mode change: a plain mode
+        // stays plain, an exec mode turns the bit on.
+        let (file, _) = test
+            .vfs
+            .create(dir, &filename3::from(b"f".to_vec()), sattr3::default())
+            .await
+            .unwrap();
+        let attr = test
+            .vfs
+            .setattr(
+                file,
+                sattr3 {
+                    mode: set_mode3::mode(0o600),
+                    ..sattr3::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(attr.mode & 0o777, 0o644, "a plain mode stays plain");
+        let attr = test
+            .vfs
+            .setattr(
+                file,
+                sattr3 {
+                    mode: set_mode3::mode(0o755),
+                    ..sattr3::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(attr.mode & 0o777, 0o755, "an exec mode turns the bit on");
+
+        // A created file keeps the mode the client asked for.
+        let (plain, attr) = test
+            .vfs
+            .create(
+                dir,
+                &filename3::from(b"p".to_vec()),
+                sattr3 {
+                    mode: set_mode3::mode(0o644),
+                    ..sattr3::default()
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(attr.mode & 0o777, 0o644, "a plain create stays plain");
+        // A write reads the exec bit back from the file it wrote.
+        let attr = test.vfs.write(plain, 0, b"x\n").await.unwrap();
+        assert_eq!(attr.mode & 0o777, 0o644, "a write keeps the file plain");
+        // A whole read of the local file is its end.
+        let (data, eof) = test.vfs.read(plain, 0, 100).await.unwrap();
+        assert_eq!(data, b"x\n");
+        assert!(eof, "a whole read of a local file is its end");
+        // The attributes of a materialized file take the real mode of
+        // the file on disk: a plain file stays plain.
+        let attr = test.vfs.getattr(plain).await.unwrap();
+        assert_eq!(
+            attr.mode & 0o777,
+            0o644,
+            "the materialized file stays plain"
+        );
+
+        // A write to a directory is not a write; neither is a write to a
+        // symlink.
+        assert!(matches!(
+            test.vfs.write(dir, 0, b"x\n").await,
+            Err(nfsstat3::NFS3ERR_ISDIR)
+        ));
+        let link = test
+            .vfs
+            .symlink(
+                dir,
+                &filename3::from(b"link".to_vec()),
+                &nfspath3::from(b"f".to_vec()),
+                &sattr3::default(),
+            )
+            .await
+            .unwrap()
+            .0;
+        assert!(matches!(
+            test.vfs.write(link, 0, b"x\n").await,
+            Err(nfsstat3::NFS3ERR_INVAL)
+        ));
+
+        // A name that is taken refuses.
+        assert!(matches!(
+            test.vfs
+                .create_exclusive(dir, &filename3::from(b"f".to_vec()))
+                .await,
+            Err(nfsstat3::NFS3ERR_EXIST)
+        ));
+        let fresh = test
+            .vfs
+            .create_exclusive(dir, &filename3::from(b"fresh".to_vec()))
+            .await
+            .unwrap();
+        assert_ne!(fresh, file, "a fresh name gets its own handle");
+        assert!(matches!(
+            test.vfs.mkdir(dir, &filename3::from(b"f".to_vec())).await,
+            Err(nfsstat3::NFS3ERR_EXIST)
+        ));
+
+        // A directory that is not empty refuses to go. An empty one goes,
+        // and a directory whose only child went, too.
+        assert!(matches!(
+            test.vfs.remove(root, &filename3::from(b"d".to_vec())).await,
+            Err(nfsstat3::NFS3ERR_NOTEMPTY)
+        ));
+        test.vfs
+            .mkdir(root, &filename3::from(b"empty".to_vec()))
+            .await
+            .unwrap();
+        test.vfs
+            .remove(root, &filename3::from(b"empty".to_vec()))
+            .await
+            .unwrap();
+        assert!(find(&test.vfs, "empty").await.is_err());
+
+        // A rename keeps the exec bit of the file it moves.
+        test.vfs
+            .create(
+                dir,
+                &filename3::from(b"tool.sh".to_vec()),
+                sattr3 {
+                    mode: set_mode3::mode(0o755),
+                    ..sattr3::default()
+                },
+            )
+            .await
+            .unwrap();
+        test.vfs
+            .rename(
+                dir,
+                &filename3::from(b"tool.sh".to_vec()),
+                dir,
+                &filename3::from(b"run.sh".to_vec()),
+            )
+            .await
+            .unwrap();
+        let run = find(&test.vfs, "d/run.sh").await.unwrap();
+        let attr = test.vfs.getattr(run).await.unwrap();
+        assert_ne!(attr.mode & 0o111, 0, "the exec bit moved with the file");
+
+        // The handle of a removed file is stale.
+        let gone = find(&test.vfs, "README.md").await.unwrap();
+        test.vfs
+            .remove(root, &filename3::from(b"README.md".to_vec()))
+            .await
+            .unwrap();
+        assert!(matches!(
+            test.vfs.getattr(gone).await,
+            Err(nfsstat3::NFS3ERR_STALE)
+        ));
+    }
+
+    /// The mount secret is sixteen bytes from the system's random source,
+    /// and the mount path names it in hex.
+    #[tokio::test]
+    async fn the_mount_secret_is_random_and_named_in_hex() {
+        let test = start(&[("a", b"data\n", Some(false))]).await;
+        let name = test.vfs.secret_name();
+        assert_eq!(
+            name.len(),
+            32,
+            "the secret name holds {} characters",
+            name.len()
+        );
+        assert!(
+            name.bytes().all(|b| b.is_ascii_hexdigit()),
+            "a character of the secret name is not hex"
+        );
+        let fresh = secret_from_urandom().unwrap();
+        let again = secret_from_urandom().unwrap();
+        assert_ne!(fresh, again, "two draws of the random source matched");
+    }
+
+    /// A create over a deleted path forgets the deletion: the commit must
+    /// not delete the file it just created.
+    #[cfg(feature = "unstable-writable-mount")]
+    #[tokio::test]
+    async fn a_create_over_a_deleted_path_forgets_the_deletion() {
+        let test = start(&[("README.md", b"hello\n", Some(false))]).await;
+        let root = NFSFileSystem::root_dir(&test.vfs);
+        test.vfs
+            .remove(root, &filename3::from(b"README.md".to_vec()))
+            .await
+            .unwrap();
+        assert_eq!(
+            read_deletes(&test.vfs.overlay).unwrap().len(),
+            1,
+            "the removal is recorded"
+        );
+        test.vfs
+            .create(
+                root,
+                &filename3::from(b"README.md".to_vec()),
+                sattr3::default(),
+            )
+            .await
+            .unwrap();
+        assert!(
+            read_deletes(&test.vfs.overlay).unwrap().is_empty(),
+            "the deletion of a re-created path is forgotten"
+        );
+    }
+
+    /// The attributes of everything the mount answers carry the mount's
+    /// own time, not the epoch.
+    #[tokio::test]
+    async fn the_attrs_time_from_the_mount() {
+        let test = start(&[("a", b"data\n", Some(false))]).await;
+        let root = NFSFileSystem::root_dir(&test.vfs);
+        let attr = test.vfs.getattr(root).await.unwrap();
+        assert!(attr.mtime.seconds > 1_500_000_000, "{}", attr.mtime.seconds);
+    }
+
+    /// The blob cache keeps its oldest entries only while they fit the
+    /// bound: past it, the oldest leave, and the count matches the map.
+    #[cfg(feature = "unstable-writable-mount")]
+    #[tokio::test]
+    async fn the_blob_cache_evicts_at_its_bound() {
+        let first = vec![0xa5_u8; 70 << 20];
+        let second = vec![0x5a_u8; 70 << 20];
+        let test = start(&[
+            ("a", first.as_slice(), Some(false)),
+            ("b", second.as_slice(), Some(false)),
+        ])
+        .await;
+        let a = find(&test.vfs, "a").await.unwrap();
+        let b = find(&test.vfs, "b").await.unwrap();
+        let _ = test.vfs.read(a, 0, 1).await.unwrap();
+        let _ = test.vfs.read(b, 0, 1).await.unwrap();
+        let blobs = test.vfs.blobs.lock().await;
+        assert_eq!(blobs.0.len(), 1, "the oldest blob left the cache");
+        assert_eq!(blobs.1, 70 << 20, "the count matches the map");
+    }
+
+    /// The reader of a deletions note refuses a note whose count its
+    /// bytes cannot name, a note it cannot read, and reads a fresh
+    /// overlay as holding no deletions.
+    #[test]
+    fn the_deletes_note_refuses_what_its_bytes_cannot_name() {
+        let overlay = tempfile::tempdir().unwrap();
+        // A fresh overlay holds no deletions.
+        assert_eq!(read_deletes(overlay.path()).unwrap(), []);
+        let note = overlay.path().join(DELETES);
+        // Four entries cannot fit in sixteen bytes: the guard refuses
+        // before the first entry is read.
+        let mut bytes = vec![DELETES_VERSION_1];
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(&4u32.to_le_bytes());
+        bytes.extend_from_slice(b"abcdefg");
+        assert_eq!(bytes.len(), 16);
+        std::fs::write(&note, &bytes).unwrap();
+        let why = format!("{:#}", read_deletes(overlay.path()).unwrap_err());
+        assert!(
+            why.contains("names more deletions than it holds"),
+            "a note of sixteen bytes paid for four entries: {why}"
+        );
+        // A note the system cannot read is an error, not silence.
+        std::fs::set_permissions(&note, std::fs::Permissions::from_mode(0o000)).unwrap();
+        assert!(
+            read_deletes(overlay.path()).is_err(),
+            "an unreadable note is an error, not an empty list"
+        );
+    }
+
+    /// A directory renamed to itself keeps its handle: the move is a
+    /// no-op, and the id the client holds stays the answer.
+    #[cfg(feature = "unstable-writable-mount")]
+    #[tokio::test]
+    async fn a_dir_renamed_to_itself_keeps_its_handle() {
+        let test = start(&[]).await;
+        let root = NFSFileSystem::root_dir(&test.vfs);
+        test.vfs
+            .mkdir(root, &filename3::from(b"d".to_vec()))
+            .await
+            .unwrap();
+        let before = find(&test.vfs, "d").await.unwrap();
+        test.vfs
+            .rename(
+                root,
+                &filename3::from(b"d".to_vec()),
+                root,
+                &filename3::from(b"d".to_vec()),
+            )
+            .await
+            .unwrap();
+        let after = find(&test.vfs, "d").await.unwrap();
+        assert_eq!(before, after, "the handle of a self-rename survives");
+    }
+
+    /// A directory whose only child was removed is empty: a rename over
+    /// it replaces it, and the moved children land in it.
+    #[cfg(feature = "unstable-writable-mount")]
+    #[tokio::test]
+    async fn a_dir_whose_child_was_removed_is_empty() {
+        let test = start(&[("y/only", b"old\n", Some(false))]).await;
+        let root = NFSFileSystem::root_dir(&test.vfs);
+        test.vfs
+            .mkdir(root, &filename3::from(b"x".to_vec()))
+            .await
+            .unwrap();
+        let (id, _) = test
+            .vfs
+            .create(
+                find(&test.vfs, "x").await.unwrap(),
+                &filename3::from(b"new".to_vec()),
+                sattr3::default(),
+            )
+            .await
+            .unwrap();
+        test.vfs.write(id, 0, b"new\n").await.unwrap();
+        test.vfs
+            .remove(
+                find(&test.vfs, "y").await.unwrap(),
+                &filename3::from(b"only".to_vec()),
+            )
+            .await
+            .unwrap();
+        test.vfs
+            .rename(
+                root,
+                &filename3::from(b"x".to_vec()),
+                root,
+                &filename3::from(b"y".to_vec()),
+            )
+            .await
+            .unwrap();
+        let moved = find(&test.vfs, "y/new").await.unwrap();
+        let (data, _) = test.vfs.read(moved, 0, 100).await.unwrap();
+        assert_eq!(data, b"new\n", "the child moved into the emptied target");
+
+        // A local directory that holds a child is not empty: a rename
+        // over it is refused, and both directories are as they were.
+        test.vfs
+            .mkdir(root, &filename3::from(b"hold".to_vec()))
+            .await
+            .unwrap();
+        let (id, _) = test
+            .vfs
+            .create(
+                find(&test.vfs, "hold").await.unwrap(),
+                &filename3::from(b"kid".to_vec()),
+                sattr3::default(),
+            )
+            .await
+            .unwrap();
+        test.vfs.write(id, 0, b"kid\n").await.unwrap();
+        test.vfs
+            .mkdir(root, &filename3::from(b"spare".to_vec()))
+            .await
+            .unwrap();
+        let refused = test
+            .vfs
+            .rename(
+                root,
+                &filename3::from(b"spare".to_vec()),
+                root,
+                &filename3::from(b"hold".to_vec()),
+            )
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, nfsstat3::NFS3ERR_NOTEMPTY),
+            "a rename over a local directory with a child: {refused:?}"
+        );
+        assert!(find(&test.vfs, "hold/kid").await.is_ok());
+        assert!(find(&test.vfs, "spare").await.is_ok());
+    }
+
+    /// A directory of the ref whose only name was removed is empty, and
+    /// its own removal is refused with the read-only error: the
+    /// directory of the ref stays, and its file's deletion is what the
+    /// commit takes.
+    #[cfg(feature = "unstable-writable-mount")]
+    #[tokio::test]
+    async fn a_ref_directory_emptied_by_a_removal_is_refused_with_rofs() {
+        let test = start(&[("y/only", b"old\n", Some(false))]).await;
+        let root = NFSFileSystem::root_dir(&test.vfs);
+        test.vfs
+            .remove(
+                find(&test.vfs, "y").await.unwrap(),
+                &filename3::from(b"only".to_vec()),
+            )
+            .await
+            .unwrap();
+        let refused = test
+            .vfs
+            .remove(root, &filename3::from(b"y".to_vec()))
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(refused, nfsstat3::NFS3ERR_ROFS),
+            "the emptied directory of the ref: {refused:?}"
+        );
     }
 }
