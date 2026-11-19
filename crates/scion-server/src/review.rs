@@ -1392,7 +1392,7 @@ mod tests {
             &rules(1),
         );
         assert!(!g.approved);
-        assert!(g.approved_by.is_empty());
+        assert_eq!(g.approved_by, Vec::<String>::new());
     }
 
     #[test]
