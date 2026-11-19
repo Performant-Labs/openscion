@@ -59,4 +59,21 @@ git -C "$work" add -A
 git -C "$work" commit -qm golden-and-version
 if ! run_check "$base_sha" HEAD; then fail "(c) a golden change with the version line moved must pass"; fi
 
+# (d) a describe-rule change whose doc diff outgrows a pipe buffer: the
+# proto and a long new section of the protocol doc together. The doc's
+# diff is read whole before it is searched; a reader that quit at the
+# first match would leave the diff's writer with a broken pipe, and
+# pipefail would fail the check on a pull request that pairs.
+git -C "$work" checkout -qb d "$base_sha"
+mkdir -p "$work/proto"
+echo 'syntax = "proto3";' >"$work/proto/scion.proto"
+printf '# Scion protocol v1\n' >"$work/docs/protocol-v1.md"
+git -C "$work" add -A
+git -C "$work" commit -qm describe-base
+echo 'service Added {}' >>"$work/proto/scion.proto"
+for i in $(seq 4000); do echo "The added service's line $i is described here."; done >>"$work/docs/protocol-v1.md"
+git -C "$work" add -A
+git -C "$work" commit -qm describe-long-doc
+if ! run_check HEAD^ HEAD; then fail "(d) a proto change with a long doc change must pass"; fi
+
 echo "test-golden-pairing: ok"

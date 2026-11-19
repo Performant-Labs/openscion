@@ -71,8 +71,12 @@ for row in "${table[@]}"; do
     # The pattern may itself start with '^' (a line anchor in the
     # document): anchor it right after the diff marker, so "^[+-]^Version"
     # is not an impossible match and a version line's move in the diff
-    # is seen.
-    if git diff "$base" "$head" -- "$doc" | grep -E "^[+-]${pattern#^}" | grep -q .; then
+    # is seen. The diff is read whole first: piped into a reader that
+    # quits at its first match, a diff longer than a pipe buffer leaves
+    # its writer with a broken pipe, and pipefail fails a pairing pull
+    # request.
+    doc_diff=$(git diff "$base" "$head" -- "$doc")
+    if grep -qE "^[+-]${pattern#^}" <<<"$doc_diff"; then
         continue
     fi
     if [ "$rule" = version ]; then
