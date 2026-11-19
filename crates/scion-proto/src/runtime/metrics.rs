@@ -17,7 +17,7 @@ use tokio::net::TcpListener;
 
 /// The RPCs that can be counted, as `service/method`. A request outside
 /// the list (a bad path) counts nothing.
-const RPCS: [&str; 16] = [
+const RPCS: [&str; 26] = [
     "Scion/PutBlob",
     "Scion/CreateChangeset",
     "Scion/Land",
@@ -34,6 +34,16 @@ const RPCS: [&str; 16] = [
     "Objects/ResolveRef",
     "Objects/GetRootTree",
     "Objects/GetObjects",
+    "Review/CreateProposal",
+    "Review/UpdateProposal",
+    "Review/GetProposal",
+    "Review/ListProposals",
+    "Review/CloseProposal",
+    "Review/GetProposalDiff",
+    "Review/AddComment",
+    "Review/SetThreadResolved",
+    "Review/ListThreads",
+    "Review/SubmitReview",
 ];
 
 /// The gRPC codes a reply can end with, by number, plus the ones that are

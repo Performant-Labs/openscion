@@ -587,6 +587,21 @@ chmod 600 /srv/scion/access.txt
   --ticket-key /srv/scion-keys/ticket.key
 ```
 
+Two more kinds of line put review before landing (`scn proposal`;
+[protocol-v1.md](protocol-v1.md#11-the-review-service), section 11):
+
+- `review PRINCIPAL REPO`: the principal's approvals and requests for
+  changes count in the repo. It needs a whole-repo `read` line.
+- `protect REPO REF [APPROVALS]`: a land on the ref moves it only for the
+  head of an open proposal with APPROVALS approvals of that head (default
+  1, at most 16) from reviewers other than its author, and no reviewer
+  asking for changes. Any other land answers `PERMISSION_DENIED` and
+  records nothing, so the same land succeeds once the proposal passes.
+
+```sh
+printf 'review\tops\tmain\nprotect\tmain\tmain\t1\n' >> /srv/scion/access.txt
+```
+
 With `--access`, the per-principal caps are on by default (64 requests, 512
 MiB upload bytes, 64 pending lands per principal); raise or lower them with
 `--max-principal-requests`, `--max-principal-upload-bytes`,
@@ -677,6 +692,14 @@ An auditor joins an intent to its result across the rotated set by
 ordered by each line's `ts`: a rotation may put the intent in
 `audit.log.1` and the result in the fresh `audit.log`, and the pair is
 still complete.
+
+Review changes (`scion.v1.Review`: opening, updating and closing a
+proposal, a comment, a thread resolved, and an approval or a request for
+changes) record a `review` intent and a `review` result line, each with
+the RPC, the repo, the proposal number (0 on the intent of a proposal not
+yet opened) and a `detail`: the head proposed, the verdict, or the thread
+state. A refused change's result line is `failed`, with the gRPC code in
+`why`.
 
 The lines of concurrent changes can appear in a different order than the
 changes themselves: each job records its result after its change. Each

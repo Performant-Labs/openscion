@@ -352,6 +352,11 @@ reads this block - it keeps no list of its own.
   compiled-in byte slice)
 - tracked by #1060: `crates/scion-server/src/pg.rs` (the Postgres
   backend's run is planned)
+- no mutation run yet, the fork's review work (Performant-Labs#2):
+  `crates/scion-server/src/review.rs`,
+  `crates/scion-server/src/review_service.rs`,
+  `crates/scn/src/cmd/review.rs` (their tests are the review suite and
+  the land gate's unit test; a mutation run is planned)
 
 ## The open list (the v1.0 blockers this audit leaves)
 

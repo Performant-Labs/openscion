@@ -94,6 +94,9 @@ enum Command {
     Commit(open_scion::cmd::commit::CommitArgs),
     /// Rebase a changeset onto a ref and move the ref.
     Land(open_scion::cmd::land::LandArgs),
+    /// Propose a changeset for a ref, review it, and see whether it may
+    /// land: `scn proposal create CHANGESET --title T`.
+    Proposal(open_scion::cmd::review::ProposalArgs),
     /// Many agents commit and land at the same time; print throughput.
     Bench(open_scion::cmd::bench::BenchArgs),
     /// Print the best common ancestors of two revisions, over all parents,
@@ -267,6 +270,7 @@ async fn run(cli: Cli) -> anyhow::Result<ExitCode> {
         Command::Unmount(args) => open_scion::cmd::mount::unmount(&mut ctx, args).await,
         Command::Commit(args) => open_scion::cmd::commit::commit(&mut ctx, args).await,
         Command::Land(args) => open_scion::cmd::land::land(&mut ctx, args).await,
+        Command::Proposal(args) => open_scion::cmd::review::proposal(&mut ctx, args).await,
         Command::Bench(args) => open_scion::cmd::bench::bench(&ctx, args).await,
         Command::MergeBase { a, b } => open_scion::cmd::query::merge_base(&mut ctx, &a, &b).await,
         Command::IsAncestor {

@@ -20,6 +20,14 @@ behind the mappings are in
 | `scn unmount DIR` | none | none | stop the mount |
 | `scn commit --message M --put P=F` | `git add F && git commit -m M` | `gh api -X PUT repos/O/R/contents/P` (single file) | create a changeset; multi-file via the Git Data API chain (blobs, tree, commit), then push |
 | `scn land CHANGESET` | `git fetch && git rebase && git push` | `gh pr create` + `gh pr merge --rebase` | server rebases the changeset onto the ref and moves it; conflicts name paths |
+| `scn proposal create REV --title T` | none | `gh pr create --title T` | propose a changeset for a ref; moves no ref |
+| `scn proposal list` | none | `gh pr list` | proposals and whether each may land |
+| `scn proposal show N` | none | `gh pr view N` | head, reviews, and the gate |
+| `scn proposal diff N` | `git diff BASE HEAD` | `gh pr diff N` | the lines the head changes |
+| `scn proposal update N --head REV` | `git push --force` to the PR branch | (push to the PR's branch) | a new head; approvals start over |
+| `scn proposal comment N --body B` | none | `gh pr comment N` / `gh api .../pulls/N/comments` | general, file or line threads, and replies |
+| `scn proposal review N --approve` | none | `gh pr review N --approve` | approve, request changes, or comment on the head |
+| `scn proposal close N` | none | `gh pr close N` | close without landing |
 | `scn diff OLD NEW` | `git diff --name-status OLD NEW` | `gh api repos/O/R/compare/BASE...HEAD` | changed paths, renames found |
 | `scn merge-base A B` | `git merge-base --all A B` | none | common ancestors |
 | `scn is-ancestor A B` | `git merge-base --is-ancestor A B` | none | exit `0` for yes, `1` for no, same as git |
@@ -38,6 +46,12 @@ changeset changed the same path (or a directory above or below it) after your
 base. `gh` would surface the same situation as a failing merge on the pull
 request; `scn land` prints the paths and exits nonzero, and a retry of the same
 land is safe: the server returns the first result.
+
+**Protected refs take reviewed changes only.** On a ref the server
+protects, `scn land` moves the ref only for the head of an open proposal
+with enough approvals and no request for changes, the way a branch
+protection rule gates a merge button. A new head of the proposal starts
+the approvals over.
 
 **`scn log` is first-parent only**, by design: the history a client walks is the
 landed sequence on the ref, not every parallel branch.

@@ -8,6 +8,13 @@
 # per call (input, output, streaming), per message field (number,
 # label, type, oneof), and per enum value (number).
 
+AddCommentRequest.body:7:string
+AddCommentRequest.line:5:uint32
+AddCommentRequest.number:2:uint64
+AddCommentRequest.old_side:6:bool
+AddCommentRequest.path:4:bytes
+AddCommentRequest.repo:1:string
+AddCommentRequest.thread_id:3:uint64
 BlameChangeset.author_email:3:bytes
 BlameChangeset.author_name:2:bytes
 BlameChangeset.author_tz_offset_minutes:5:int32
@@ -25,15 +32,35 @@ BlameRequest.repo:1:string
 BlameResponse.changesets:2:repeated BlameChangeset
 BlameResponse.next_cursor:7:bytes
 BlameResponse.ranges:1:repeated BlameRange
+CloseProposalRequest.number:2:uint64
+CloseProposalRequest.repo:1:string
 CreateChangesetRequest.changeset:2:bytes
 CreateChangesetRequest.repo:1:string
 CreateChangesetResponse.changeset_id:1:bytes
+CreateProposalRequest.changeset_id:3:bytes
+CreateProposalRequest.description:5:string
+CreateProposalRequest.repo:1:string
+CreateProposalRequest.target_ref:2:string
+CreateProposalRequest.title:4:string
 DiffEntry.new:3:FileState
 DiffEntry.old:2:FileState
 DiffEntry.path:1:bytes
 DiffEntry.rename_from:4:bytes
 DiffEntry.rename_to:5:bytes
 DiffEntry.similarity:6:uint32
+DiffHunk.lines:5:repeated DiffLine
+DiffHunk.new_lines:4:uint32
+DiffHunk.new_start:3:uint32
+DiffHunk.old_lines:2:uint32
+DiffHunk.old_start:1:uint32
+DiffLine.kind:1:DiffLineKind
+DiffLine.new_line:4:uint32
+DiffLine.old_line:3:uint32
+DiffLine.text:2:bytes
+DiffLineKind.DIFF_LINE_KIND_ADDED:2
+DiffLineKind.DIFF_LINE_KIND_CONTEXT:1
+DiffLineKind.DIFF_LINE_KIND_REMOVED:3
+DiffLineKind.DIFF_LINE_KIND_UNSPECIFIED:0
 DiffRequest.after:5:bytes
 DiffRequest.new_changeset_id:3:bytes
 DiffRequest.old_changeset_id:2:bytes
@@ -44,6 +71,10 @@ DiffResponse.next_after:2:bytes
 DiffResponse.renames_incomplete:3:bool
 Encoding.ENCODING_RAW:0
 Encoding.ENCODING_ZSTD:1
+FileDiff.binary:3:bool
+FileDiff.entry:1:DiffEntry
+FileDiff.hunks:2:repeated DiffHunk
+FileDiff.too_large:4:bool
 FileKind.FILE_KIND_GITLINK:3
 FileKind.FILE_KIND_REGULAR:1
 FileKind.FILE_KIND_SYMLINK:2
@@ -59,6 +90,19 @@ GetLandRequest.repo:1:string
 GetObjectsRequest.accept:3:repeated Encoding
 GetObjectsRequest.refs:2:repeated ObjectRef
 GetObjectsRequest.ticket:4:bytes
+GetProposalDiffRequest.after:5:bytes
+GetProposalDiffRequest.changeset_id:3:bytes
+GetProposalDiffRequest.context_lines:6:oneof _context_lines:uint32
+GetProposalDiffRequest.number:2:uint64
+GetProposalDiffRequest.path:4:bytes
+GetProposalDiffRequest.repo:1:string
+GetProposalDiffResponse.base_changeset_id:1:bytes
+GetProposalDiffResponse.files:3:repeated FileDiff
+GetProposalDiffResponse.head_changeset_id:2:bytes
+GetProposalDiffResponse.next_after:4:bytes
+GetProposalDiffResponse.renames_incomplete:5:bool
+GetProposalRequest.number:2:uint64
+GetProposalRequest.repo:1:string
 GetRootTreeRequest.changeset_id:2:bytes
 GetRootTreeRequest.repo:1:string
 GetRootTreeResponse.ticket:2:bytes
@@ -91,6 +135,16 @@ ListDirRequest.changeset_id:2:bytes
 ListDirRequest.path:3:bytes
 ListDirRequest.repo:1:string
 ListDirResponse.tree:1:bytes
+ListProposalsRequest.after_number:4:uint64
+ListProposalsRequest.limit:5:uint32
+ListProposalsRequest.repo:1:string
+ListProposalsRequest.state:2:ProposalState
+ListProposalsRequest.target_ref:3:string
+ListProposalsResponse.next_after_number:2:uint64
+ListProposalsResponse.proposals:1:repeated Proposal
+ListThreadsRequest.number:2:uint64
+ListThreadsRequest.repo:1:string
+ListThreadsResponse.threads:1:repeated ReviewThread
 LogEntry.changeset:2:bytes
 LogEntry.changeset_id:1:bytes
 LogRequest.changeset_id:2:bytes
@@ -118,6 +172,38 @@ ObjectRef.path:3:bytes
 Objects.GetObjects:in=GetObjectsRequest:out=ObjectPart:server_stream
 Objects.GetRootTree:in=GetRootTreeRequest:out=GetRootTreeResponse
 Objects.ResolveRef:in=ResolveRefRequest:out=ResolveRefResponse
+Proposal.author:6:string
+Proposal.created_unix_secs:9:int64
+Proposal.description:5:string
+Proposal.gate:14:ProposalGate
+Proposal.head_changeset_id:7:bytes
+Proposal.heads:12:repeated ProposalHead
+Proposal.merged_changeset_id:11:bytes
+Proposal.number:2:uint64
+Proposal.repo:1:string
+Proposal.reviews:13:repeated ProposalReview
+Proposal.state:8:ProposalState
+Proposal.target_ref:3:string
+Proposal.title:4:string
+Proposal.updated_unix_secs:10:int64
+ProposalGate.approved:5:bool
+ProposalGate.approved_by:3:repeated string
+ProposalGate.changes_requested_by:4:repeated string
+ProposalGate.protected:1:bool
+ProposalGate.reason:6:string
+ProposalGate.required_approvals:2:uint32
+ProposalHead.changeset_id:1:bytes
+ProposalHead.pushed_by:2:string
+ProposalHead.unix_secs:3:int64
+ProposalReview.body:4:string
+ProposalReview.changeset_id:3:bytes
+ProposalReview.reviewer:1:string
+ProposalReview.unix_secs:5:int64
+ProposalReview.verdict:2:Verdict
+ProposalState.PROPOSAL_STATE_CLOSED:3
+ProposalState.PROPOSAL_STATE_MERGED:2
+ProposalState.PROPOSAL_STATE_OPEN:1
+ProposalState.PROPOSAL_STATE_UNSPECIFIED:0
 PutBlobRequest.data:2:bytes
 PutBlobRequest.repo:1:string
 PutBlobResponse.blob_id:1:bytes
@@ -128,6 +214,28 @@ ReadFileResponse.data:1:bytes
 ResolveRefRequest.name:2:string
 ResolveRefRequest.repo:1:string
 ResolveRefResponse.changeset_id:1:bytes
+Review.AddComment:in=AddCommentRequest:out=ReviewThread
+Review.CloseProposal:in=CloseProposalRequest:out=Proposal
+Review.CreateProposal:in=CreateProposalRequest:out=Proposal
+Review.GetProposal:in=GetProposalRequest:out=Proposal
+Review.GetProposalDiff:in=GetProposalDiffRequest:out=GetProposalDiffResponse
+Review.ListProposals:in=ListProposalsRequest:out=ListProposalsResponse
+Review.ListThreads:in=ListThreadsRequest:out=ListThreadsResponse
+Review.SetThreadResolved:in=SetThreadResolvedRequest:out=ReviewThread
+Review.SubmitReview:in=SubmitReviewRequest:out=Proposal
+Review.UpdateProposal:in=UpdateProposalRequest:out=Proposal
+ReviewComment.author:2:string
+ReviewComment.body:3:string
+ReviewComment.id:1:uint64
+ReviewComment.unix_secs:4:int64
+ReviewThread.changeset_id:5:bytes
+ReviewThread.comments:8:repeated ReviewComment
+ReviewThread.id:1:uint64
+ReviewThread.line:3:uint32
+ReviewThread.old_side:4:bool
+ReviewThread.outdated:7:bool
+ReviewThread.path:2:bytes
+ReviewThread.resolved:6:bool
 Scion.Blame:in=BlameRequest:out=BlameResponse:server_stream
 Scion.CreateChangeset:in=CreateChangesetRequest:out=CreateChangesetResponse
 Scion.Diff:in=DiffRequest:out=DiffResponse
@@ -141,3 +249,21 @@ Scion.MergeBase:in=MergeBaseRequest:out=MergeBaseResponse
 Scion.PutBlob:in=PutBlobRequest:out=PutBlobResponse:client_stream
 Scion.ReadFile:in=ReadFileRequest:out=ReadFileResponse:server_stream
 Scion.ResolveRef:in=ResolveRefRequest:out=ResolveRefResponse
+SetThreadResolvedRequest.number:2:uint64
+SetThreadResolvedRequest.repo:1:string
+SetThreadResolvedRequest.resolved:4:bool
+SetThreadResolvedRequest.thread_id:3:uint64
+SubmitReviewRequest.body:5:string
+SubmitReviewRequest.changeset_id:4:bytes
+SubmitReviewRequest.number:2:uint64
+SubmitReviewRequest.repo:1:string
+SubmitReviewRequest.verdict:3:Verdict
+UpdateProposalRequest.changeset_id:3:bytes
+UpdateProposalRequest.description:5:oneof _description:string
+UpdateProposalRequest.number:2:uint64
+UpdateProposalRequest.repo:1:string
+UpdateProposalRequest.title:4:oneof _title:string
+Verdict.VERDICT_APPROVE:1
+Verdict.VERDICT_COMMENT:3
+Verdict.VERDICT_REQUEST_CHANGES:2
+Verdict.VERDICT_UNSPECIFIED:0

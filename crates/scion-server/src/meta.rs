@@ -816,6 +816,187 @@ pub trait MetaTx {
     ///
     /// A database error.
     fn clear_restore_mark(&mut self) -> Result<()>;
+
+    // Proposals and their review (review.rs).
+
+    /// Inserts a proposal with the next number of its repo, and its first
+    /// head; returns the number. `row.number` is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn insert_proposal(&mut self, repo: RepoId, row: &crate::review::ProposalRow) -> Result<i64>;
+
+    /// One proposal, or `None`.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn proposal(&mut self, repo: RepoId, number: i64)
+    -> Result<Option<crate::review::ProposalRow>>;
+
+    /// Proposals with a number above `after`, lowest first, at most `limit`,
+    /// in `state` and on `target_ref` when given.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn proposals(
+        &mut self,
+        repo: RepoId,
+        state: Option<crate::review::ProposalStatus>,
+        target_ref: Option<&str>,
+        after: i64,
+        limit: usize,
+    ) -> Result<Vec<crate::review::ProposalRow>>;
+
+    /// Writes a proposal's title, description, head, state, merged
+    /// changeset and update time.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn put_proposal(&mut self, repo: RepoId, row: &crate::review::ProposalRow) -> Result<()>;
+
+    /// The lowest-numbered open proposal of `target_ref` whose head is
+    /// `head`.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn open_proposal_with_head(
+        &mut self,
+        repo: RepoId,
+        target_ref: &str,
+        head: ChangesetId,
+    ) -> Result<Option<i64>>;
+
+    /// Appends a head to a proposal's heads. `row.seq` is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn add_proposal_head(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        row: &crate::review::HeadRow,
+    ) -> Result<()>;
+
+    /// Every head of a proposal, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn proposal_heads(&mut self, repo: RepoId, number: i64) -> Result<Vec<crate::review::HeadRow>>;
+
+    /// Appends a review. `row.seq` is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn add_proposal_review(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        row: &crate::review::ReviewRow,
+    ) -> Result<()>;
+
+    /// Every review of a proposal, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn proposal_reviews(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+    ) -> Result<Vec<crate::review::ReviewRow>>;
+
+    /// Starts a thread with the next number of its proposal; returns it.
+    /// `row.thread` is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn add_review_thread(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        row: &crate::review::ThreadRow,
+    ) -> Result<i64>;
+
+    /// Marks a thread resolved or active; `false` if it does not exist.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn set_review_thread_resolved(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        thread: i64,
+        resolved: bool,
+    ) -> Result<bool>;
+
+    /// Every thread of a proposal, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn review_threads(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+    ) -> Result<Vec<crate::review::ThreadRow>>;
+
+    /// Adds a comment with the next number of its proposal; returns it.
+    /// `row.comment` is ignored.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn add_review_comment(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+        row: &crate::review::CommentRow,
+    ) -> Result<i64>;
+
+    /// Every comment of a proposal, oldest first.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn review_comments(
+        &mut self,
+        repo: RepoId,
+        number: i64,
+    ) -> Result<Vec<crate::review::CommentRow>>;
+
+    /// Marks every open proposal of `target_ref` whose head is `head`
+    /// merged into `merged`, in one statement: the land that moves the ref
+    /// runs it, so a land without proposals pays one indexed statement.
+    /// Returns how many it marked.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn merge_open_proposals(
+        &mut self,
+        repo: RepoId,
+        target_ref: &str,
+        head: ChangesetId,
+        merged: ChangesetId,
+        at: i64,
+    ) -> Result<u64>;
+
+    /// How many comments a proposal holds.
+    ///
+    /// # Errors
+    ///
+    /// Database errors.
+    fn review_comment_count(&mut self, repo: RepoId, number: i64) -> Result<i64>;
 }
 
 /// The row ID of a repository, private to the backend.

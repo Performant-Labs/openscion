@@ -1,8 +1,8 @@
 # Scion protocol v1
 
-This file is the contract of the two gRPC services in
-[`proto/scion.proto`](../proto/scion.proto): `scion.v1.Scion` and
-`scion.v1.Objects`. It is written so that someone can build an independent
+This file is the contract of the gRPC services in
+[`proto/scion.proto`](../proto/scion.proto): `scion.v1.Scion`,
+`scion.v1.Objects`, and `scion.v1.Review` (section 11). It is written so that someone can build an independent
 client, cache tier or server from it. It describes the code on `main`. The
 bytes of changesets and trees, and how IDs are computed, are in
 [`format-v1.md`](format-v1.md). [`architecture.md`](architecture.md) explains
@@ -23,6 +23,7 @@ this file says so. Every other rule is this project's choice.
 |---|---|---|
 | `Scion` | Writes (`PutBlob`, `CreateChangeset`, `Land`, `GetLand`), path reads (`ResolveRef`, `GetChangeset`, `ReadFile`, `ListDir`, `Log`, `Blame`) and queries (`MergeBase`, `IsAncestor`, `Diff`) | The server only |
 | `Objects` | `ResolveRef`, `GetRootTree`, `GetObjects` | The server answers all three; a cache tier answers only `GetObjects` (section 8) |
+| `Review` | Proposals (`CreateProposal`, `UpdateProposal`, `GetProposal`, `ListProposals`, `CloseProposal`, `GetProposalDiff`) and their review (`AddComment`, `SetThreadResolved`, `ListThreads`, `SubmitReview`) | The server only (section 11) |
 
 Both services are on one address. Every read except `ResolveRef` and
 `GetLand` names an immutable object by ID, never a ref, so its answer never
@@ -371,6 +372,19 @@ the land against every path that the changeset changes, by the rules of
 the write rights too: whoever lands it moves the ref. A denied land fails
 with `PERMISSION_DENIED` and records nothing.
 
+**Protected refs.** On a ref that the server's access rules protect
+(section 11.1), a land moves the ref only while an open proposal for that
+ref has the changeset as its head and the proposal passes its gate. The
+check runs in the transaction that records the land, after a retry with
+the same key has found a finished land (which returns its stored outcome
+as for any ref): a refused land fails with `PERMISSION_DENIED`, the
+message says why, and nothing is recorded, so a retry with the same key
+lands once the proposal passes. The check runs again in the transaction
+that moves the ref; a review that blocked the proposal in between fails
+the call with `PERMISSION_DENIED` and leaves the land `PENDING`. The land
+that moves the ref marks every open proposal of that ref with that head
+`MERGED`, in the same transaction, protected ref or not.
+
 The changeset's first parent is its *base*. The
 server checks, in order:
 
@@ -450,7 +464,7 @@ A client that names a `reject_reason` must still read `detail`: a server older t
 |---|---|
 | `INVALID_ARGUMENT` | A bad name or ID; a request key already used for a different changeset or ref. |
 | `NOT_FOUND` | The repo does not exist, or the caller may not read it, or the repo does not have the changeset. |
-| `PERMISSION_DENIED` | A changed path is outside the caller's write prefixes. The message names the first denied path. |
+| `PERMISSION_DENIED` | A changed path is outside the caller's write prefixes. The message names the first denied path. Or the ref is protected and the changeset is not the head of an open proposal that passes its gate (section 11.1). |
 | `ABORTED` | The ref kept moving. The land stays `PENDING`. Retry with the same key. |
 | `CANCELLED`, `DEADLINE_EXCEEDED` | The call ran past 600 s, or the client cancelled it. The land stays `PENDING`. Retry with the same key. |
 
@@ -1122,3 +1136,125 @@ version, a server stops serving its package; its clients then get
 - `Blame` without per-call bounds
   ([#61](https://github.com/bnsd55/openscion/issues/61)), and `Log` that
   follows renames.
+
+## 11. The `Review` service
+
+`Review` holds *proposals*: a changeset (the proposal's *head*) and the
+ref it should land on, with a title and a description. A proposal moves
+no ref; `Scion.Land` does. Every call needs a token and a caller that
+reads the whole repo (a partial reader gets `UNIMPLEMENTED`, as for the
+history reads). A server that does not serve the service answers
+`UNIMPLEMENTED`; a cache tier never serves it. The service was added
+within v1 under the compatibility rules of section 9: new calls, and no
+change to any existing call, field or enum value.
+
+Proposals are numbered from 1 in their repo, never reused. A head is a
+changeset of the repo with exactly one parent: its first parent is the
+*base* its diff is against, and a land rebases it from there. Two open
+proposals of one ref never share a head, so the gate's lookup names one
+proposal (`FAILED_PRECONDITION` names the other one).
+
+### 11.1 Protected refs and the gate
+
+The access file names reviewers and protected refs (a deployment matter;
+[operations.md](operations.md#tokens-one-or-an-access-file) describes the
+lines):
+
+- `review PRINCIPAL REPO`: the principal's approvals and requests for
+  changes count in the repo. It needs a whole-repo read rule.
+- `protect REPO REF [APPROVALS]`: lands on the ref go through proposals
+  and need APPROVALS approvals (default 1, at most 16). A server started
+  with `--token` protects no ref, and its one principal reviews every
+  repo.
+
+The *gate* of a proposal is the decision `Land` makes about its head.
+Each reviewer's latest review that approves or asks for changes counts;
+comment reviews, reviews by the proposal's author, and reviews by a
+principal without a `review` rule count for nothing. The gate passes when
+the proposal is open, no counted reviewer's latest review asks for
+changes, and at least APPROVALS counted reviewers' latest review approves
+the current head. An approval of an older head does not count: a new
+head starts the approvals over. On a ref that is not protected the gate
+asks for no approval, and `Land` does not look at proposals.
+
+`Proposal.gate` (a `ProposalGate`) reports the gate as the server would
+decide it at the time of the reply: `protected`, `required_approvals`,
+`approved_by`, `changes_requested_by`, `approved`, and `reason` for
+people when it does not pass.
+
+### 11.2 CreateProposal
+
+Opens a proposal. The author is the caller. Title 1 to 256 bytes,
+description at most 64 KiB. `NOT_FOUND` for a missing ref or changeset;
+`INVALID_ARGUMENT` for a head without exactly one parent.
+
+### 11.3 UpdateProposal
+
+Gives an open proposal a new head (empty keeps it), title or description
+(unset keeps them). Only its author or a reviewer may. Each head is kept
+in `Proposal.heads`, at most 1000.
+
+### 11.4 GetProposal
+
+One proposal, with its heads, its reviews and its gate.
+
+### 11.5 ListProposals
+
+Proposals by number, lowest first, after `after_number`, filtered by state
+and ref; 1 to 100 a page (0 means 50). `next_after_number` continues, 0 at
+the end. The entries carry no heads or reviews, and do carry the gate.
+
+### 11.6 CloseProposal
+
+Closes an open proposal. Only its author or a reviewer may.
+
+### 11.7 GetProposalDiff
+
+The paths a head changes against its base, as `Scion.Diff` returns them,
+each with line hunks for a text file. A side over 1 MiB gets `too_large`
+and a side with a NUL byte `binary`, both without hunks. The deleting half
+of a rename carries no hunks; its adding half diffs against the renamed
+file. A page holds at most 16 MiB of hunk text, and `next_after` continues
+as in `Diff`. `context_lines` is 0 to 100, 3 when unset.
+
+### 11.8 AddComment
+
+Starts a thread (`thread_id` 0), general (no path), on a file (line 0) or
+on a line (`old_side` for a line of the base), or replies to one. The
+thread is anchored to the proposal's head at that time, and reports
+`outdated` once the head moves. A body is 1 byte to 16 KiB; a proposal
+holds at most 2000 comments.
+
+### 11.9 SetThreadResolved
+
+Marks a thread resolved or active.
+
+### 11.10 ListThreads
+
+Every thread with its comments, oldest first.
+
+### 11.11 SubmitReview
+
+Records `APPROVE`, `REQUEST_CHANGES` or `COMMENT` of `changeset_id`, which
+MUST be the proposal's head: a review never approves a head its reviewer
+did not see (`FAILED_PRECONDITION` otherwise). The proposal must be open.
+Its author may not approve or ask for changes (`FAILED_PRECONDITION`); a
+principal without a `review` rule may not either (`PERMISSION_DENIED`).
+
+### 11.12 Audit and errors
+
+Each call that changes review state records an audit `review` intent
+before it runs and a result line after
+([operations.md](operations.md#the-audit-log)).
+
+| Error | When |
+|---|---|
+| `INVALID_ARGUMENT` | A bad name, ID, path, number, verdict or text size. |
+| `NOT_FOUND` | The repo does not exist or the caller may not read it; a missing ref, changeset, proposal, head or thread. |
+| `PERMISSION_DENIED` | The caller may not change the proposal, or may not approve or block it. |
+| `FAILED_PRECONDITION` | The proposal is not open; the review is not of the head; the author reviews its own proposal; another open proposal of the ref has this head. |
+| `RESOURCE_EXHAUSTED` | A proposal's cap of heads, reviews or comments. |
+| `UNIMPLEMENTED` | A partial reader, or a server without the service. |
+
+Review state lives in the server's metadata store (Postgres schema 7,
+`0007_review`). A `scion-archive-1` export does not carry it yet.

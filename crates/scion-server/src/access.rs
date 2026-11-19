@@ -167,6 +167,7 @@ pub(crate) fn rule_set_digest(canonical: Option<&[RepoPath]>) -> [u8; 32] {
 fn check_write_needs_read(
     access: &Access,
     writes: &[(usize, String, String)],
+    what: &str,
 ) -> Result<(), String> {
     for (n, principal, repo) in writes {
         let whole_read = access
@@ -175,8 +176,8 @@ fn check_write_needs_read(
             .is_some_and(|grant| grant.read_all);
         if !whole_read {
             return Err(format!(
-                "line {n}: a write rule needs a read rule without a prefix, so principal \
-                 {principal:?} may read {repo:?} whole: partial readers cannot write in \
+                "line {n}: a {what} rule needs a read rule without a prefix, so principal \
+                 {principal:?} may read {repo:?} whole: partial readers cannot write or review in \
                  v0.1 ([#183](https://github.com/bnsd55/openscion/issues/183))"
             ));
         }
@@ -223,7 +224,15 @@ pub struct Access {
     /// The one principal of the single-principal mode, which may read
     /// and write every repo.
     everything: Option<String>,
+    /// By repo: the principals whose reviews count (`review` lines).
+    reviewers: HashMap<String, BTreeSet<String>>,
+    /// By repo: the protected refs and the approvals each needs
+    /// (`protect` lines).
+    protected: HashMap<String, std::collections::BTreeMap<String, u32>>,
 }
+
+/// The most approvals a `protect` rule may ask for.
+pub(crate) const MAX_REQUIRED_APPROVALS: u32 = 16;
 
 impl Access {
     /// How many tokens the access carries: one per line of an access
@@ -242,6 +251,8 @@ impl Access {
             tokens: vec![(token_digest(token), DEFAULT_PRINCIPAL.into())],
             grants: HashMap::new(),
             everything: Some(DEFAULT_PRINCIPAL.into()),
+            reviewers: HashMap::new(),
+            protected: HashMap::new(),
         }
     }
 
@@ -254,17 +265,22 @@ impl Access {
     /// two digests for one principal, a rule for a principal with no token,
     /// a whole-repo write rule without a whole-repo read rule, or a file
     /// over the rule-set caps.
+    #[allow(clippy::too_many_lines)] // one arm per kind of line
     pub fn parse(text: &str) -> Result<Self, String> {
         let mut access = Self {
             tokens: Vec::new(),
             grants: HashMap::new(),
             everything: None,
+            reviewers: HashMap::new(),
+            protected: HashMap::new(),
         };
         // Each principal that a rule names, and the line, for the error.
         let mut named = Vec::new();
         // Each write rule, with its line, for the check that its principal
         // reads the whole repo: a partial reader cannot write in v0.1.
         let mut writes = Vec::new();
+        // Each review rule, with its line, for the same check.
+        let mut reviews = Vec::new();
         for (n, line) in (1..).zip(text.lines()) {
             if line.is_empty() || line.starts_with('#') {
                 continue;
@@ -320,9 +336,47 @@ impl Access {
                     writes.push((n, (*principal).to_owned(), (*repo).to_owned()));
                     named.push((n, (*principal).to_owned()));
                 }
+                ["review", principal, repo] => {
+                    check_principal(principal).map_err(at)?;
+                    scion_proto::runtime::check::name("repo", repo).map_err(at)?;
+                    access
+                        .reviewers
+                        .entry((*repo).to_owned())
+                        .or_default()
+                        .insert((*principal).to_owned());
+                    // A reviewer reads what it approves: the same rule as a
+                    // writer's, checked at the end of the file.
+                    reviews.push((n, (*principal).to_owned(), (*repo).to_owned()));
+                    named.push((n, (*principal).to_owned()));
+                }
+                ["protect", repo, target_ref, rest @ ..] if rest.len() <= 1 => {
+                    scion_proto::runtime::check::name("repo", repo).map_err(at)?;
+                    scion_proto::runtime::check::name("ref", target_ref).map_err(at)?;
+                    let approvals = match rest {
+                        [] => 1,
+                        [count] => count
+                            .parse::<u32>()
+                            .ok()
+                            .filter(|c| *c <= MAX_REQUIRED_APPROVALS)
+                            .ok_or_else(|| {
+                                at(format!(
+                                    "the approvals of a protect rule are 0 to \
+                                     {MAX_REQUIRED_APPROVALS}, not {count:?}"
+                                ))
+                            })?,
+                        _ => unreachable!("matched at most one count"),
+                    };
+                    let refs = access.protected.entry((*repo).to_owned()).or_default();
+                    if refs.insert((*target_ref).to_owned(), approvals).is_some() {
+                        return Err(at(format!(
+                            "ref {target_ref:?} of repo {repo:?} is protected twice"
+                        )));
+                    }
+                }
                 _ => {
                     return Err(at(
-                        "expected `token`, `read` or `write` and its fields, separated by tabs"
+                        "expected `token`, `read` or `write` (or `review`, `protect`) and its \
+                         fields, separated by tabs"
                             .into(),
                     ));
                 }
@@ -333,9 +387,25 @@ impl Access {
                 return Err(format!("line {n}: principal {principal:?} has no token"));
             }
         }
-        check_write_needs_read(&access, &writes)?;
+        check_write_needs_read(&access, &writes, "write")?;
+        check_write_needs_read(&access, &reviews, "review")?;
         check_caps(&access)?;
         Ok(access)
+    }
+
+    /// The review rules of `repo`: its reviewers and its protected refs.
+    /// The one principal of `--token` reviews every repo; no ref of such a
+    /// server is protected, since there is no file to say so.
+    #[must_use]
+    pub fn review_rules(&self, repo: &str) -> crate::review::RepoRules {
+        let mut reviewers = self.reviewers.get(repo).cloned().unwrap_or_default();
+        if let Some(everything) = &self.everything {
+            reviewers.insert(everything.clone());
+        }
+        crate::review::RepoRules {
+            reviewers,
+            protected: self.protected.get(repo).cloned().unwrap_or_default(),
+        }
     }
 
     /// Whether `caller` reads `repo` through folder rules, not whole. A

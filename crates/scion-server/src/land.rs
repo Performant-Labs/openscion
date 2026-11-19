@@ -266,6 +266,10 @@ pub struct Lands {
     /// The metrics that count lands by outcome, when the process exports
     /// any.
     metrics: Option<Arc<crate::metrics::Metrics>>,
+    /// The access rules, whose `protect` and `review` lines gate a land
+    /// on a protected ref (`crate::review`). Unset: no ref is protected,
+    /// as in the tests that build a `Lands` without a server.
+    access: std::sync::OnceLock<Arc<crate::access::Access>>,
     /// A step the tests run between a plan and its settle, once: a test
     /// that moves the ref at exactly that moment makes the land replan
     /// for certain, where a timed race depends on the machine.
@@ -299,11 +303,23 @@ impl Lands {
             used: Arc::default(),
             evicted: Mutex::default(),
             metrics,
+            access: std::sync::OnceLock::new(),
             #[cfg(test)]
             before_settle: Mutex::new(None),
             #[cfg(test)]
             after_record: Mutex::new(None),
         }
+    }
+
+    /// Gives the lands the access rules that protect refs. Once: a second
+    /// call keeps the first rules.
+    pub fn set_access(&self, access: Arc<crate::access::Access>) {
+        let _ = self.access.set(access);
+    }
+
+    /// The review rules of `repo`, or `None` when no access rules are set.
+    fn review_rules(&self, repo: &str) -> Option<crate::review::RepoRules> {
+        self.access.get().map(|access| access.review_rules(repo))
     }
 
     /// Sets the step the next plan runs before its settle, once.
@@ -470,7 +486,21 @@ impl Lands {
         // already settled this land, and what the land must do now, is
         // one read that `finish` runs on the row. The record's answer is
         // the state of the row it saw, never a second read of it.
-        let (repo, recorded) = store.commit(|c| c.record_land(caller, req, self.pending_limit))?;
+        let rules = self.review_rules(&req.repo);
+        // A protected ref's gate runs in the transaction that records the
+        // land, and only for a land still to do: a refusal rolls the new
+        // pending row back, so it records nothing and a retry with the
+        // same key lands once the proposal passes; a finished land's
+        // retry gets its stored outcome, as for any ref.
+        let (repo, recorded) = store.commit(|c| {
+            let (repo, recorded) = c.record_land(caller, req, self.pending_limit)?;
+            if recorded.state == LandState::Pending
+                && let Some(rules) = &rules
+            {
+                crate::review::check_land(c, repo, &req.target_ref, req.changeset, rules)?;
+            }
+            Ok((repo, recorded))
+        })?;
         if recorded.state != LandState::Pending {
             return Ok(recorded);
         }
@@ -990,6 +1020,9 @@ fn settle(
                 "ref {target:?} moved during the land; retry with the same request key"
             )));
         }
+        // Review's gate again, and the land's proposals merged (review.rs).
+        let rules = lands.review_rules(&req.repo);
+        crate::review::settle(c, repo, target, req.changeset, id, rules.as_ref())?;
         let generation = c.generation(repo, id)?;
         let mut outcome = c.set_land_state(
             repo,
@@ -2501,6 +2534,70 @@ mod tests {
         // A retry with the same key returns the same verdict.
         let again = lands.land(&f.store, &caller(), &req(cs, "hook")).unwrap();
         assert_eq!(stored(&again), stored(&out));
+    }
+
+    /// A review that blocks a protected ref's proposal after its land was
+    /// recorded stops the move: the gate runs again in the transaction that
+    /// moves the ref, the land stays pending, and the same request key
+    /// lands once the reviewer approves again, marking the proposal merged.
+    #[test]
+    fn a_block_between_record_and_move_stops_the_move() {
+        use crate::review::{self, NewProposal, ProposalStatus, VerdictKind};
+        let f = fixture();
+        let digest = |token: &str| {
+            blake3::Hash::from(scion_proto::runtime::auth::token_digest(token))
+                .to_hex()
+                .to_string()
+        };
+        let access = crate::access::Access::parse(&format!(
+            "token\tt\t{}\ntoken\tbob\t{}\nread\tt\tr\nwrite\tt\tr\n\
+             read\tbob\tr\nreview\tbob\tr\nprotect\tr\tmain\t1\n",
+            digest("t"),
+            digest("bob"),
+        ))
+        .unwrap();
+        let rules = access.review_rules("r");
+        let lands = Lands::new(None, None);
+        lands.set_access(Arc::new(access));
+        let bob = Caller("bob".into());
+        let cs = f.commit(f.root, &[put("a/x", "new")]);
+        let new = NewProposal {
+            target_ref: "main".into(),
+            head: cs,
+            title: "t".into(),
+            description: String::new(),
+        };
+        let number = review::create(&f.store, &caller(), "r", new).unwrap();
+        let verdict =
+            |v| review::submit_review(&f.store, &bob, "r", &rules, number, v, cs, String::new());
+        verdict(VerdictKind::Approve).unwrap();
+        let (hook_store, hook_rules, hook_bob) = (f.store.clone(), rules.clone(), bob.clone());
+        lands.set_before_settle(Box::new(move || {
+            review::submit_review(
+                &hook_store,
+                &hook_bob,
+                "r",
+                &hook_rules,
+                number,
+                VerdictKind::RequestChanges,
+                cs,
+                String::new(),
+            )
+            .unwrap();
+        }));
+        let err = lands.land(&f.store, &caller(), &req(cs, "k")).unwrap_err();
+        assert!(
+            matches!(&err, Error::PermissionDenied(m) if m.contains("changes requested by bob")),
+            "{err:?}"
+        );
+        assert_eq!(f.main().target, f.root, "the ref did not move");
+
+        verdict(VerdictKind::Approve).unwrap();
+        let out = lands.land(&f.store, &caller(), &req(cs, "k")).unwrap();
+        assert_eq!(out.state, LandState::Landed, "{}", out.detail);
+        let view = review::view(&f.store, "r", &rules, number).unwrap();
+        assert_eq!(view.row.state, ProposalStatus::Merged);
+        assert_eq!(view.row.merged, out.result);
     }
 
     #[test]

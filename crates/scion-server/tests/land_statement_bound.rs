@@ -347,7 +347,7 @@ fn a_record_costs_five_statements() {
 #[test]
 fn a_land_costs_a_constant_more_over_a_hundred_paths_and_stays_under_its_bound() {
     const BOUND: u64 = 30;
-    const EXACT: u64 = 18;
+    const EXACT: u64 = 19;
     let _log = LOG_LOCK
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -391,7 +391,12 @@ fn a_land_costs_a_constant_more_over_a_hundred_paths_and_stays_under_its_bound()
     // count stays 18. The record with a pending limit pays one more
     // for the quota
     // column's answer; the land's own record passes none (measured
-    // with the named test binary on main 506051c).
+    // with the named test binary on main 506051c). Review (the fork's
+    // #2) adds one: the settle's transaction marks the open proposals
+    // whose head the land moved merged, one indexed UPDATE of
+    // `proposals` that matches no row on a ref without proposals, and
+    // the land costs 19. A protected ref's gate reads more, and only
+    // there; this shape has no protect rule.
 
     //
     // This run has no rival writer, so the land settles in one attempt;
@@ -502,10 +507,12 @@ fn the_lands_trim_runs_inside_the_verdicts_transaction() {
     let outcome = land_once(&store, &lands, cs);
     assert_eq!(outcome.state, LandState::Landed, "{}", outcome.detail);
     let count = Backend::test_statement_count();
+    // 19: the folded 18, plus review's one UPDATE that marks the land's
+    // proposals merged (see EXACT above).
     assert_eq!(
         count,
-        18,
-        "a land cost {count} statements, not the folded 18:\n{:#?}",
+        19,
+        "a land cost {count} statements, not the folded 19:\n{:#?}",
         Backend::test_statement_log()
     );
     assert_eq!(

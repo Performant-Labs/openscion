@@ -35,7 +35,7 @@ fn url_for(url: &str, schema: &str) -> String {
     format!("{url}{sep}options=--search_path%3D{schema}")
 }
 
-/// Seeds a store at schema version 5: the first five migration files,
+/// Seeds a store at schema version 6: the first six migration files,
 /// applied by hand, with the ledger the open's runner makes. The
 /// database is behind this build by exactly one step, which is the
 /// state the next upgrade starts from.
@@ -43,7 +43,7 @@ fn seed_behind_store(url: &str, schema: &str) {
     let mut client = postgres::Client::connect(&url_for(url, schema), postgres::NoTls)
         .expect("the test database connects");
     // A rerun of the suite meets the last run's tables: the seed is the
-    // version-5 state, so the schema starts empty.
+    // version-6 state, so the schema starts empty.
     client
         .batch_execute(&format!("DROP SCHEMA IF EXISTS {schema} CASCADE"))
         .unwrap();
@@ -59,6 +59,7 @@ fn seed_behind_store(url: &str, schema: &str) {
         include_str!("../migrations/postgres/0003_view_trees.sql"),
         include_str!("../migrations/postgres/0004_store_uuid.sql"),
         include_str!("../migrations/postgres/0005_parent_numbering.sql"),
+        include_str!("../migrations/postgres/0006_land_reason.sql"),
     ]
     .into_iter()
     .enumerate()
@@ -93,6 +94,7 @@ fn a_check_on_a_fresh_database_prints_the_steps_and_exits_3() {
     assert!(out.contains("schema version 0, this build ships"), "{out}");
     assert!(out.contains("would run: 0001_init"), "{out}");
     assert!(out.contains("would run: 0006_land_reason"), "{out}");
+    assert!(out.contains("would run: 0007_review"), "{out}");
 }
 
 /// A database one version behind: the check names the pending step and
@@ -115,10 +117,10 @@ fn a_migrate_applies_the_pending_steps_and_the_check_is_clean() {
     assert_eq!(run.status.code(), Some(3), "the store is one step behind");
     let out = String::from_utf8_lossy(&run.stdout);
     assert!(
-        out.contains("schema version 5, this build ships 6"),
+        out.contains("schema version 6, this build ships 7"),
         "{out}"
     );
-    assert!(out.contains("would run: 0006_land_reason"), "{out}");
+    assert!(out.contains("would run: 0007_review"), "{out}");
 
     let moved = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
         .args(["--data", data.to_str().unwrap()])
@@ -129,7 +131,7 @@ fn a_migrate_applies_the_pending_steps_and_the_check_is_clean() {
         .expect("the migrate runs");
     assert!(moved.status.success(), "the migrate runs: {moved:?}");
     assert!(
-        String::from_utf8_lossy(&moved.stdout).contains("from version 5 to 6"),
+        String::from_utf8_lossy(&moved.stdout).contains("from version 6 to 7"),
         "{}",
         String::from_utf8_lossy(&moved.stdout)
     );
@@ -353,7 +355,7 @@ fn a_migrate_beside_a_live_server_refuses_and_moves_nothing() {
             .map(|row| row.get::<_, String>(0))
             .unwrap_or_default()
     };
-    assert_eq!(version(), "6", "the serve migrated the store");
+    assert_eq!(version(), "7", "the serve migrated the store");
     let refused = std::process::Command::new(env!("CARGO_BIN_EXE_scion-server"))
         .args(["--data", data.to_str().unwrap()])
         .env("SCION_POSTGRES_URL", &url)
@@ -368,7 +370,7 @@ fn a_migrate_beside_a_live_server_refuses_and_moves_nothing() {
     let why = String::from_utf8_lossy(&refused.stderr);
     assert!(why.contains("another server holds this store"), "{why}");
     assert!(why.contains("stop the server first"), "{why}");
-    assert_eq!(version(), "6", "the refusal moved no version");
+    assert_eq!(version(), "7", "the refusal moved no version");
     child.kill().unwrap();
     child.wait().unwrap();
     // Stopped, the same migrate runs: nothing is pending.
@@ -444,7 +446,7 @@ fn a_migration_statement_outlives_the_base_statement_budget() {
         String::from_utf8_lossy(&run.stderr)
     );
     let out = String::from_utf8_lossy(&run.stdout);
-    assert!(out.contains("from version 5 to 6"), "{out}");
+    assert!(out.contains("from version 6 to 7"), "{out}");
 }
 
 /// A refusing open of a behind database writes nothing to the catalog:
@@ -619,6 +621,6 @@ fn a_migrating_serve_records_the_move_in_its_audit_log() {
             .cloned()
             .unwrap_or_else(|| panic!("the line names {name}: {moved}"))
     };
-    assert_eq!(field("from"), 5, "the line names the old version");
-    assert_eq!(field("to"), 6, "the line names the new version");
+    assert_eq!(field("from"), 6, "the line names the old version");
+    assert_eq!(field("to"), 7, "the line names the new version");
 }

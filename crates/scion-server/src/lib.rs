@@ -91,6 +91,8 @@ pub mod preflight;
 pub(crate) mod quotas;
 pub(crate) mod read;
 pub(crate) mod reply;
+pub(crate) mod review;
+pub(crate) mod review_service;
 #[cfg(any(test, feature = "test-hooks"))]
 pub(crate) mod seed;
 pub(crate) mod service;
@@ -352,6 +354,10 @@ pub mod test_support {
     /// The read operations behind the read RPCs, and their limits.
     pub mod read {
         pub use crate::read::*;
+    }
+    /// Proposals and their review: the gate, the hunks, the rows.
+    pub mod review {
+        pub use crate::review::*;
     }
     /// The gRPC front end, so tests and fuzz targets serve on a port.
     pub mod service {
